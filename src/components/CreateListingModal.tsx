@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { X, Tag, Phone, DollarSign, Clock, FileText, Image as ImageIcon, AlertCircle, Trash2, Upload } from 'lucide-react';
+import { X, Tag, Phone, PoundSterling, Clock, FileText, Image as ImageIcon, AlertCircle, Trash2, Upload } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import { User, AuctionItem } from '../types';
 
@@ -162,7 +162,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
 
     const priceNum = Number(startingPrice);
     if (!Number.isFinite(priceNum) || priceNum <= 0) {
-      setError('Starting price must be greater than $0.');
+      setError('Starting price must be greater than £0.');
       return;
     }
 
@@ -297,10 +297,10 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-bold text-[#1e293b] mb-1">
-                Starting Price ($) *
+                Starting Price (£) *
               </label>
               <div className="relative">
-                <DollarSign className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-[#1e293b]/50" />
+                <PoundSterling className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-[#1e293b]/50" />
                 <input
                   id="listing-starting-price-input"
                   type="number"
@@ -313,7 +313,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
                   className="w-full pl-9 pr-3.5 py-2.5 text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-bold"
                 />
               </div>
-              <p className="text-[11px] text-[#1e293b]/60 mt-1">Must be greater than $0</p>
+              <p className="text-[11px] text-[#1e293b]/60 mt-1">Must be greater than £0</p>
             </div>
 
             <div>

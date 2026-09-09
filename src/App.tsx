@@ -11,6 +11,15 @@ import {
   PlusCircle,
   AlertCircle,
   RefreshCw,
+  Star,
+  Layers,
+  Laptop,
+  Car,
+  Gem,
+  Palette,
+  BookOpen,
+  Shirt,
+  Box,
 } from 'lucide-react';
 import { AuctionItem, User } from './types';
 import { Header } from './components/Header';
@@ -21,6 +30,17 @@ import { AuthModal } from './components/AuthModal';
 import { apiFetch } from './lib/api';
 import { getSocket } from './lib/socket';
 
+const CATEGORIES = [
+  { id: 'All', label: 'All Categories', icon: Layers },
+  { id: 'Electronics', label: 'Electronics', icon: Laptop },
+  { id: 'Vehicles', label: 'Vehicles', icon: Car },
+  { id: 'Collectibles', label: 'Collectibles', icon: Gem },
+  { id: 'Art & Antiques', label: 'Art & Antiques', icon: Palette },
+  { id: 'Books & Media', label: 'Books & Media', icon: BookOpen },
+  { id: 'Fashion', label: 'Fashion', icon: Shirt },
+  { id: 'General', label: 'General', icon: Box },
+];
+
 export default function App() {
   // --- Application State ---
   const [auctions, setAuctions] = useState<AuctionItem[]>([]);
@@ -28,6 +48,7 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [isConnected, setIsConnected] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [watchlistIds, setWatchlistIds] = useState<string[]>([]);
 
   // Modals
   const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
@@ -35,20 +56,33 @@ export default function App() {
 
   // Search & Filter state
   const [searchQuery, setSearchQuery] = useState<string>('');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'ending_soon' | 'ended'>('all');
+  const [selectedCategory, setSelectedCategory] = useState<string>('All');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'ending_soon' | 'ended' | 'watchlist'>('all');
   const [sortBy, setSortBy] = useState<'ending_soonest' | 'price_high' | 'price_low' | 'most_bids'>('ending_soonest');
 
-  // Load user session from localStorage on start
+  // Load user session & watchlist from localStorage on start
   useEffect(() => {
     try {
-      const saved = localStorage.getItem('msa_auction_user');
-      if (saved) {
-        setUser(JSON.parse(saved));
+      const savedUser = localStorage.getItem('msa_auction_user');
+      if (savedUser) {
+        setUser(JSON.parse(savedUser));
+      }
+      const savedWatchlist = localStorage.getItem('msa_watchlist_ids');
+      if (savedWatchlist) {
+        setWatchlistIds(JSON.parse(savedWatchlist));
       }
     } catch {
       // ignore
     }
   }, []);
+
+  const handleToggleWatchlist = (auctionId: string) => {
+    setWatchlistIds((prev) => {
+      const next = prev.includes(auctionId) ? prev.filter((id) => id !== auctionId) : [...prev, auctionId];
+      localStorage.setItem('msa_watchlist_ids', JSON.stringify(next));
+      return next;
+    });
+  };
 
   const handleAuthSuccess = (authUser: User) => {
     setUser(authUser);
@@ -126,6 +160,15 @@ export default function App() {
 
     return auctions
       .filter((item) => {
+        // Category Filter
+        if (selectedCategory !== 'All') {
+          const itemCat = item.category?.toLowerCase() || 'general';
+          const targetCat = selectedCategory.toLowerCase();
+          if (!itemCat.includes(targetCat) && targetCat !== itemCat) {
+            return false;
+          }
+        }
+
         // Search query
         if (searchQuery.trim()) {
           const q = searchQuery.toLowerCase();
@@ -150,6 +193,9 @@ export default function App() {
         }
         if (statusFilter === 'ended') {
           return isEnded;
+        }
+        if (statusFilter === 'watchlist') {
+          return watchlistIds.includes(item.id);
         }
 
         return true;
@@ -180,7 +226,7 @@ export default function App() {
 
         return 0;
       });
-  }, [auctions, searchQuery, statusFilter, sortBy]);
+  }, [auctions, searchQuery, selectedCategory, statusFilter, sortBy, watchlistIds]);
 
   // Aggregate stats
   const activeCount = auctions.filter((a) => a.status === 'active' && a.endTime > Date.now()).length;
@@ -218,7 +264,7 @@ export default function App() {
                 </span>
               </div>
               <p className="text-xs sm:text-sm text-[#1e293b]/75 mt-1">
-                Participate in real-time auctions with instant bi-directional price broadcasts.
+                Participate in real-time auctions with instant bi-directional price broadcasts (£ / GBP).
               </p>
             </div>
 
@@ -255,6 +301,38 @@ export default function App() {
           </div>
         </div>
 
+        {/* Horizontal Category Navigation Bar */}
+        <div className="bg-[#e2eafc] border border-[#ccdbfd] rounded-2xl p-3 shadow-xs">
+          <div className="flex items-center gap-2 overflow-x-auto no-scrollbar scroll-smooth py-1 px-1">
+            {CATEGORIES.map((cat) => {
+              const IconComponent = cat.icon;
+              const isSelected = selectedCategory === cat.id;
+              const count = cat.id === 'All'
+                ? auctions.length
+                : auctions.filter((a) => a.category?.toLowerCase() === cat.id.toLowerCase()).length;
+
+              return (
+                <button
+                  key={cat.id}
+                  id={`category-btn-${cat.id.toLowerCase().replace(/\s+/g, '-')}`}
+                  onClick={() => setSelectedCategory(cat.id)}
+                  className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all shrink-0 flex items-center gap-2 cursor-pointer min-h-[40px] ${
+                    isSelected
+                      ? 'bg-[#abc4ff] text-[#1e293b] border border-[#c1d3fe] shadow-xs'
+                      : 'bg-[#d7e3fc] text-[#1e293b]/80 border border-[#ccdbfd] hover:bg-[#c1d3fe]'
+                  }`}
+                >
+                  <IconComponent className="w-4 h-4 shrink-0" />
+                  <span>{cat.label}</span>
+                  <span className={`px-1.5 py-0.2 rounded-md text-[10px] ${isSelected ? 'bg-[#b6ccfe]' : 'bg-[#e2eafc]'}`}>
+                    {count}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
         {/* Search, Status Tabs & Sorting Filter Controls */}
         <div className="bg-[#e2eafc] border border-[#ccdbfd] rounded-2xl p-4 shadow-xs space-y-3">
           <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3">
@@ -265,10 +343,10 @@ export default function App() {
               <input
                 id="search-auctions-input"
                 type="text"
-                placeholder="Search items by title, description, or seller..."
+                placeholder="Search items by title, description, category, or seller..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full pl-10 pr-4 py-2.5 rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-sm text-[#1e293b] placeholder-[#1e293b]/45 font-medium"
+                className="w-full pl-10 pr-4 py-2.5 rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-sm text-[#1e293b] placeholder-[#1e293b]/45 font-medium min-h-[44px]"
               />
             </div>
 
@@ -279,7 +357,7 @@ export default function App() {
                 id="sort-auctions-select"
                 value={sortBy}
                 onChange={(e: any) => setSortBy(e.target.value)}
-                className="px-3 py-2.5 rounded-xl bg-[#edf2fb] border border-[#ccdbfd] text-xs font-bold text-[#1e293b] focus:border-[#abc4ff] focus:outline-hidden cursor-pointer"
+                className="px-3 py-2.5 rounded-xl bg-[#edf2fb] border border-[#ccdbfd] text-xs font-bold text-[#1e293b] focus:border-[#abc4ff] focus:outline-hidden cursor-pointer min-h-[44px]"
               >
                 <option value="ending_soonest">Ending Soonest</option>
                 <option value="price_high">Highest Price</option>
@@ -291,35 +369,40 @@ export default function App() {
           </div>
 
           {/* Filter Tabs */}
-          <div className="flex items-center gap-2 overflow-x-auto pt-1 pb-0.5">
+          <div className="flex items-center gap-2 overflow-x-auto pt-1 pb-0.5 no-scrollbar">
             {[
               { id: 'all', label: 'All Listings', count: auctions.length },
               { id: 'active', label: 'Active Live', count: activeCount },
               { id: 'ending_soon', label: 'Ending Soon (<15m)', count: auctions.filter((a) => a.status === 'active' && a.endTime - Date.now() <= 15 * 60 * 1000 && a.endTime > Date.now()).length },
               { id: 'ended', label: 'Concluded', count: auctions.filter((a) => a.status === 'ended' || a.endTime <= Date.now()).length },
-            ].map((tab) => (
-              <button
-                key={tab.id}
-                id={`filter-tab-${tab.id}`}
-                onClick={() => setStatusFilter(tab.id as any)}
-                className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 ${
-                  statusFilter === tab.id
-                    ? 'bg-[#abc4ff] border border-[#c1d3fe] text-[#1e293b] shadow-xs'
-                    : 'bg-[#d7e3fc] border border-[#ccdbfd] text-[#1e293b]/75 hover:bg-[#c1d3fe]'
-                }`}
-              >
-                <span>{tab.label}</span>
-                <span className={`px-1.5 py-0.2 rounded-md text-[10px] ${
-                  statusFilter === tab.id ? 'bg-[#b6ccfe]' : 'bg-[#e2eafc]'
-                }`}>
-                  {tab.count}
-                </span>
-              </button>
-            ))}
+              { id: 'watchlist', label: 'Watchlist', count: watchlistIds.length, icon: Star },
+            ].map((tab) => {
+              const TabIcon = tab.icon;
+              return (
+                <button
+                  key={tab.id}
+                  id={`filter-tab-${tab.id}`}
+                  onClick={() => setStatusFilter(tab.id as any)}
+                  className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 min-h-[38px] ${
+                    statusFilter === tab.id
+                      ? 'bg-[#abc4ff] border border-[#c1d3fe] text-[#1e293b] shadow-xs'
+                      : 'bg-[#d7e3fc] border border-[#ccdbfd] text-[#1e293b]/75 hover:bg-[#c1d3fe]'
+                  }`}
+                >
+                  {TabIcon && <TabIcon className="w-3.5 h-3.5 text-amber-500 fill-amber-400" />}
+                  <span>{tab.label}</span>
+                  <span className={`px-1.5 py-0.2 rounded-md text-[10px] ${
+                    statusFilter === tab.id ? 'bg-[#b6ccfe]' : 'bg-[#e2eafc]'
+                  }`}>
+                    {tab.count}
+                  </span>
+                </button>
+              );
+            })}
           </div>
         </div>
 
-        {/* Auctions Grid Layout */}
+        {/* Auctions Grid Layout: Fully Responsive (1 col -> 2 col -> 3 col -> 4 col) */}
         {isLoading && auctions.length === 0 ? (
           <div className="py-20 text-center bg-[#e2eafc] rounded-2xl border border-[#ccdbfd]">
             <RefreshCw className="w-8 h-8 mx-auto animate-spin text-[#abc4ff] mb-3" />
@@ -330,21 +413,24 @@ export default function App() {
             <AlertCircle className="w-10 h-10 mx-auto text-[#1e293b]/50 mb-3" />
             <h3 className="text-base font-bold text-[#1e293b]">No auctions match your filters</h3>
             <p className="text-xs text-[#1e293b]/70 mt-1 max-w-sm mx-auto">
-              Try adjusting your search terms or view all active auctions to place bids.
+              Try adjusting your category, search terms, or view all active auctions.
             </p>
             <button
-              onClick={() => { setSearchQuery(''); setStatusFilter('all'); }}
-              className="mt-4 px-4 py-2 rounded-xl bg-[#abc4ff] hover:bg-[#b6ccfe] text-xs font-bold text-[#1e293b]"
+              onClick={() => { setSearchQuery(''); setSelectedCategory('All'); setStatusFilter('all'); }}
+              className="mt-4 px-4 py-2.5 rounded-xl bg-[#abc4ff] hover:bg-[#b6ccfe] text-xs font-bold text-[#1e293b] min-h-[44px]"
             >
-              Reset Filters
+              Reset All Filters
             </button>
           </div>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5 sm:gap-6">
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-4 sm:gap-6">
             {filteredAuctions.map((auction) => (
               <AuctionCard
                 key={auction.id}
                 auction={auction}
+                user={user}
+                isWatchlisted={watchlistIds.includes(auction.id)}
+                onToggleWatchlist={handleToggleWatchlist}
                 onSelect={(selected) => setSelectedAuction(selected)}
               />
             ))}
@@ -359,7 +445,7 @@ export default function App() {
           <div className="flex items-center gap-2">
             <Gavel className="w-4 h-4 text-[#1e293b]" />
             <span className="font-extrabold text-[#1e293b]">MSA Auction</span>
-            <span>— Bi-directional Real-Time Bidding</span>
+            <span>— Bi-directional Real-Time Bidding (£ / GBP)</span>
           </div>
           <p className="text-[11px]">
             Built by <a href="https://github.com/dragonfisher29">dragonfisher29</a>

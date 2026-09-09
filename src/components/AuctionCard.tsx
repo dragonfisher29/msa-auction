@@ -1,14 +1,23 @@
 import React, { useState, useEffect } from 'react';
-import { Clock, TrendingUp, User as UserIcon, Phone, ArrowUpRight, Trophy } from 'lucide-react';
-import { AuctionItem } from '../types';
+import { Clock, TrendingUp, User as UserIcon, Phone, ArrowUpRight, Trophy, Star, ShieldAlert, CheckCircle2 } from 'lucide-react';
+import { AuctionItem, User } from '../types';
 import { formatCurrency, formatTimeRemaining } from '../lib/formatters';
 
 interface AuctionCardProps {
   auction: AuctionItem;
+  user?: User | null;
+  isWatchlisted?: boolean;
+  onToggleWatchlist?: (auctionId: string) => void;
   onSelect: (auction: AuctionItem) => void;
 }
 
-export const AuctionCard: React.FC<AuctionCardProps> = ({ auction, onSelect }) => {
+export const AuctionCard: React.FC<AuctionCardProps> = ({
+  auction,
+  user,
+  isWatchlisted = false,
+  onToggleWatchlist,
+  onSelect,
+}) => {
   const [timeInfo, setTimeInfo] = useState(() => formatTimeRemaining(auction.endTime));
 
   // Dynamic live countdown updates every second
@@ -22,11 +31,14 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({ auction, onSelect }) =
   }, [auction.endTime]);
 
   const isEnded = auction.status === 'ended' || timeInfo.isEnded;
+  const isHighestBidder = Boolean(user && auction.highestBidderId === user.id);
+  const hasUserBid = Boolean(user && auction.bids.some((b) => b.userId === user.id));
+  const isOutbid = hasUserBid && !isHighestBidder && !isEnded;
 
   return (
     <div
       id={`auction-card-${auction.id}`}
-      className="group flex flex-col bg-[#e2eafc] hover:bg-[#d7e3fc] border border-[#ccdbfd] hover:border-[#b6ccfe] rounded-2xl overflow-hidden shadow-xs hover:shadow-md transition-all duration-200 text-[#1e293b]"
+      className="group flex flex-col bg-[#e2eafc] hover:bg-[#d7e3fc] border border-[#ccdbfd] hover:border-[#b6ccfe] rounded-2xl overflow-hidden shadow-xs hover:shadow-md transition-all duration-200 text-[#1e293b] relative"
     >
       {/* Card Image Banner */}
       <div className="relative h-48 w-full overflow-hidden bg-[#d7e3fc]">
@@ -37,28 +49,58 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({ auction, onSelect }) =
           className="w-full h-full object-cover group-hover:scale-103 transition-transform duration-300"
         />
 
-        {/* Top Status & Category Badges */}
-        <div className="absolute top-3 left-3 flex items-center gap-1.5">
-          {isEnded ? (
-            <span className="px-2.5 py-1 rounded-full text-xs font-extrabold bg-slate-700 text-slate-100 shadow-xs flex items-center gap-1">
-              <Trophy className="w-3.5 h-3.5 text-amber-300" />
-              Ended
-            </span>
-          ) : timeInfo.isUrgent ? (
-            <span className="px-2.5 py-1 rounded-full text-xs font-extrabold bg-rose-500 text-white shadow-xs animate-pulse flex items-center gap-1">
-              <Clock className="w-3.5 h-3.5" />
-              Ending Soon
-            </span>
-          ) : (
-            <span className="px-2.5 py-1 rounded-full text-xs font-extrabold bg-[#abc4ff] text-[#1e293b] border border-[#c1d3fe] shadow-xs flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
-              Live Auction
-            </span>
-          )}
-          {auction.category && (
-            <span className="px-2 py-1 rounded-full text-[11px] font-semibold bg-[#e2eafc]/90 text-[#1e293b] backdrop-blur-xs border border-[#ccdbfd]">
-              {auction.category}
-            </span>
+        {/* Top Badges (Status, Category, User Bid Status) */}
+        <div className="absolute top-3 left-3 right-3 flex items-center justify-between gap-1.5 pointer-events-none">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {isEnded ? (
+              <span className="px-2.5 py-1 rounded-full text-xs font-extrabold bg-slate-800 text-slate-100 shadow-xs flex items-center gap-1">
+                <Trophy className="w-3.5 h-3.5 text-amber-300" />
+                Ended
+              </span>
+            ) : timeInfo.isUrgent ? (
+              <span className="px-2.5 py-1 rounded-full text-xs font-extrabold bg-rose-500 text-white shadow-xs animate-pulse flex items-center gap-1">
+                <Clock className="w-3.5 h-3.5" />
+                Ending Soon
+              </span>
+            ) : (
+              <span className="px-2.5 py-1 rounded-full text-xs font-extrabold bg-[#abc4ff] text-[#1e293b] border border-[#c1d3fe] shadow-xs flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
+                Live
+              </span>
+            )}
+
+            {isHighestBidder && (
+              <span className="px-2.5 py-1 rounded-full text-[11px] font-extrabold bg-emerald-600 text-white shadow-xs flex items-center gap-1">
+                <CheckCircle2 className="w-3 h-3" />
+                Winning
+              </span>
+            )}
+
+            {isOutbid && (
+              <span className="px-2.5 py-1 rounded-full text-[11px] font-extrabold bg-amber-600 text-white shadow-xs flex items-center gap-1 animate-bounce">
+                <ShieldAlert className="w-3 h-3" />
+                Outbid!
+              </span>
+            )}
+          </div>
+
+          {/* Watchlist Toggle Button */}
+          {onToggleWatchlist && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleWatchlist(auction.id);
+              }}
+              title={isWatchlisted ? 'Remove from Watchlist' : 'Add to Watchlist'}
+              className={`pointer-events-auto p-1.5 rounded-full backdrop-blur-md transition-all shadow-xs cursor-pointer ${
+                isWatchlisted
+                  ? 'bg-amber-400 text-slate-900 hover:bg-amber-300'
+                  : 'bg-[#1e293b]/60 text-white hover:bg-[#1e293b]/80'
+              }`}
+            >
+              <Star className={`w-4 h-4 ${isWatchlisted ? 'fill-slate-900' : ''}`} />
+            </button>
           )}
         </div>
 
@@ -72,9 +114,16 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({ auction, onSelect }) =
       {/* Card Content */}
       <div className="p-4 flex-1 flex flex-col justify-between">
         <div>
-          <h3 className="font-bold text-base text-[#1e293b] line-clamp-1 group-hover:text-black transition-colors" title={auction.title}>
-            {auction.title}
-          </h3>
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="font-bold text-base text-[#1e293b] line-clamp-1 group-hover:text-black transition-colors flex-1" title={auction.title}>
+              {auction.title}
+            </h3>
+            {auction.category && (
+              <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-[#b6ccfe] text-[#1e293b] shrink-0 uppercase tracking-wider">
+                {auction.category}
+              </span>
+            )}
+          </div>
           <p className="text-xs text-[#1e293b]/75 line-clamp-2 mt-1 min-h-[32px] leading-relaxed">
             {auction.description}
           </p>
@@ -82,13 +131,13 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({ auction, onSelect }) =
 
         {/* Pricing & Highest Bid Info */}
         <div className="mt-4 pt-3 border-t border-[#ccdbfd]/80 space-y-2.5">
-          <div className="flex items-end justify-between">
+          <div className="flex items-end justify-between gap-2 flex-wrap sm:flex-nowrap">
             <div>
               <p className="text-[11px] font-semibold uppercase tracking-wider text-[#1e293b]/65">
                 {isEnded ? 'Winning / Final Bid' : 'Current Highest Bid'}
               </p>
-              <div className="flex items-center gap-1.5">
-                <span className="text-xl font-extrabold text-[#1e293b]">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-xl font-extrabold text-[#1e293b] tracking-tight">
                   {formatCurrency(auction.currentPrice)}
                 </span>
                 {auction.bids.length > 0 && (
@@ -99,7 +148,7 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({ auction, onSelect }) =
               </div>
             </div>
 
-            <div className="text-right">
+            <div className="text-right shrink-0">
               <span className="text-[11px] text-[#1e293b]/65 block">Starting</span>
               <span className="text-xs font-semibold text-[#1e293b]/85">
                 {formatCurrency(auction.startingPrice)}
@@ -134,7 +183,7 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({ auction, onSelect }) =
           <button
             id={`view-auction-btn-${auction.id}`}
             onClick={() => onSelect(auction)}
-            className="w-full py-2.5 px-4 rounded-xl bg-[#abc4ff] hover:bg-[#b6ccfe] border border-[#c1d3fe] text-xs font-extrabold text-[#1e293b] shadow-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer mt-1"
+            className="w-full min-h-[44px] py-2.5 px-4 rounded-xl bg-[#abc4ff] hover:bg-[#b6ccfe] border border-[#c1d3fe] text-xs font-extrabold text-[#1e293b] shadow-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer mt-1 active:scale-98"
           >
             <span>{isEnded ? 'View Result & Logs' : 'View & Place Bid'}</span>
             <ArrowUpRight className="w-4 h-4" />

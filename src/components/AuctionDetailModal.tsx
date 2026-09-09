@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   X,
   Clock,
-  DollarSign,
+  PoundSterling,
   TrendingUp,
   User as UserIcon,
   Phone,
@@ -439,14 +439,14 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
                   <form onSubmit={handlePlaceBid} className="space-y-3">
                     {/* Quick increment pills */}
                     <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
-                      {[5, 25, 50, 100].map((inc) => (
+                      {[5, 10, 25, 50, 100].map((inc) => (
                         <button
                           key={inc}
                           type="button"
                           onClick={() => handleIncrement(inc)}
                           className="px-2.5 py-1 rounded-lg bg-[#edf2fb] hover:bg-[#b6ccfe] border border-[#ccdbfd] text-xs font-bold text-[#1e293b] transition-colors shrink-0"
                         >
-                          +${inc}
+                          +£{inc}
                         </button>
                       ))}
                       <span className="text-[10px] text-[#1e293b]/60 ml-auto whitespace-nowrap">
@@ -456,7 +456,7 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
 
                     <div className="flex items-center gap-2">
                       <div className="relative flex-1">
-                        <DollarSign className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-[#1e293b]/60" />
+                        <PoundSterling className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-[#1e293b]/60" />
                         <input
                           id="place-bid-amount-input"
                           type="number"

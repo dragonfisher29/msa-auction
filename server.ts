@@ -224,7 +224,7 @@ function validateAuctionInput(raw: any) {
 
   const parsedPrice = Number(raw.startingPrice);
   if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
-    return makeError('Starting price must be greater than $0.', 'INVALID_PRICE');
+    return makeError('Starting price must be greater than £0.', 'INVALID_PRICE');
   }
 
   const parsedDuration = Number(raw.durationMinutes);
@@ -321,6 +321,41 @@ async function updateEndedAuctions(io: SocketIOServer) {
   }
 }
 
+async function cleanupStaleImages(): Promise<number> {
+  try {
+    const ninetyDaysAgo = Date.now() - (90 * 24 * 60 * 60 * 1000);
+    const { data, error } = await supabase
+      .from('auctions')
+      .select('id, created_at, image_url, image_urls')
+      .lt('created_at', ninetyDaysAgo);
+
+    if (error || !data) return 0;
+
+    let cleanedCount = 0;
+    for (const row of data) {
+      const hasMainImage = typeof row.image_url === 'string' && row.image_url.trim().length > 0;
+      const imageUrls = parseJsonArray<string>(row.image_urls);
+      if (hasMainImage || imageUrls.length > 0) {
+        await supabase
+          .from('auctions')
+          .update({
+            image_url: null,
+            image_urls: '[]',
+          })
+          .eq('id', row.id);
+        cleanedCount++;
+      }
+    }
+    if (cleanedCount > 0) {
+      console.log(`[Maintenance] Cleaned stale images for ${cleanedCount} auction(s) older than 90 days.`);
+    }
+    return cleanedCount;
+  } catch (err) {
+    console.error('Failed to clean up stale images:', err);
+    return 0;
+  }
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -338,6 +373,12 @@ async function startServer() {
   setInterval(() => {
     void updateEndedAuctions(io);
   }, 1000);
+
+  // Run stale image cleanup on startup and every 6 hours
+  void cleanupStaleImages();
+  setInterval(() => {
+    void cleanupStaleImages();
+  }, 6 * 60 * 60 * 1000);
 
   io.on('connection', (socket) => {
     socket.on('join_auction', async ({ auctionId }: { auctionId: string }) => {
@@ -380,12 +421,12 @@ async function startServer() {
         if (auction.bids.length === 0) {
           if (numericAmount < auction.startingPrice) {
             return socket.emit('bid_error', {
-              message: `Starting bid must be at least $${auction.startingPrice.toLocaleString()}.`,
+              message: `Starting bid must be at least £${auction.startingPrice.toLocaleString()}.`,
             });
           }
         } else if (numericAmount <= auction.currentPrice) {
           return socket.emit('bid_error', {
-            message: `Bid must be strictly higher than current bid of $${auction.currentPrice.toLocaleString()}.`,
+            message: `Bid must be strictly higher than current bid of £${auction.currentPrice.toLocaleString()}.`,
           });
         }
 

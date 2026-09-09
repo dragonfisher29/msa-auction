@@ -106,7 +106,7 @@ function validateAuctionInput(raw: any) {
 
   const parsedPrice = Number(raw.startingPrice);
   if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
-    return makeError('Starting price must be greater than $0.', 'INVALID_PRICE');
+    return makeError('Starting price must be greater than £0.', 'INVALID_PRICE');
   }
 
   const parsedDuration = Number(raw.durationMinutes);
@@ -523,10 +523,10 @@ export default {
 
         if (bids.length === 0) {
           if (numericAmount < startingPrice) {
-            return jsonResponse(makeError(`Starting bid must be at least $${startingPrice.toLocaleString()}.`, 'BID_TOO_LOW'), { status: 400 });
+            return jsonResponse(makeError(`Starting bid must be at least £${startingPrice.toLocaleString()}.`, 'BID_TOO_LOW'), { status: 400 });
           }
         } else if (numericAmount <= currentPrice) {
-          return jsonResponse(makeError(`Bid must be strictly higher than current bid of $${currentPrice.toLocaleString()}.`, 'BID_TOO_LOW'), { status: 400 });
+          return jsonResponse(makeError(`Bid must be strictly higher than current bid of £${currentPrice.toLocaleString()}.`, 'BID_TOO_LOW'), { status: 400 });
         }
 
         const newBid = {
