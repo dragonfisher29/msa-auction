@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { X, Tag, Phone, DollarSign, Clock, FileText, Image as ImageIcon, AlertCircle } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { X, Tag, Phone, DollarSign, Clock, FileText, Image as ImageIcon, AlertCircle, Trash2, Upload } from 'lucide-react';
 import { User, AuctionItem } from '../types';
 
 interface CreateListingModalProps {
@@ -13,19 +13,61 @@ interface CreateListingModalProps {
 const PRESET_DURATIONS = [
   { label: '2 Mins (Fast Test)', minutes: 2 },
   { label: '5 Mins', minutes: 5 },
-  { label: '15 Mins', minutes: 15 },
-  { label: '1 Hour', minutes: 60 },
   { label: '6 Hours', minutes: 360 },
   { label: '24 Hours', minutes: 1440 },
+  { label: '3 Days', minutes: 4320 },
+  { label: '7 Days', minutes: 10080 },
 ];
 
-const PRESET_IMAGES = [
-  { label: 'Camera', url: 'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?auto=format&fit=crop&w=800&q=80' },
-  { label: 'Headphones', url: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?auto=format&fit=crop&w=800&q=80' },
-  { label: 'Watch', url: 'https://images.unsplash.com/photo-1522335789203-aabd1fc54bc9?auto=format&fit=crop&w=800&q=80' },
-  { label: 'Laptop', url: 'https://images.unsplash.com/photo-1517336714731-489689fd1ca8?auto=format&fit=crop&w=800&q=80' },
-  { label: 'Guitar', url: 'https://images.unsplash.com/photo-1550291652-6ea9114a47b1?auto=format&fit=crop&w=800&q=80' },
-];
+const MAX_IMAGES = 3;
+const MAX_IMAGE_DIMENSION = 1600;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+const readFileAsDataUrl = (file: File) => new Promise<string>((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => resolve(String(reader.result));
+  reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
+  reader.readAsDataURL(file);
+});
+
+const compressImage = async (file: File): Promise<string> => {
+  if (!file.type.startsWith('image/')) {
+    throw new Error(`${file.name} is not a valid image file.`);
+  }
+
+  if (file.size > MAX_IMAGE_BYTES) {
+    throw new Error(`${file.name} is too large. Please upload images up to 5 MB each.`);
+  }
+
+  const source = await readFileAsDataUrl(file);
+
+  const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error(`Could not process ${file.name}.`));
+    img.src = source;
+  });
+
+  const canvas = document.createElement('canvas');
+  const scale = Math.min(1, MAX_IMAGE_DIMENSION / Math.max(image.width, image.height));
+  const targetWidth = Math.max(1, Math.round(image.width * scale));
+  const targetHeight = Math.max(1, Math.round(image.height * scale));
+
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
+
+  const context = canvas.getContext('2d');
+  if (!context) {
+    throw new Error(`Could not create a preview for ${file.name}.`);
+  }
+
+  context.drawImage(image, 0, 0, targetWidth, targetHeight);
+
+  const mimeType = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
+  const quality = file.size > 1_000_000 ? 0.72 : 0.85;
+
+  return canvas.toDataURL(mimeType, quality);
+};
 
 export const CreateListingModal: React.FC<CreateListingModalProps> = ({
   isOpen,
@@ -36,16 +78,63 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
 }) => {
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
-  const [phoneNumber, setPhoneNumber] = useState('+1 (555) 382-9012');
+  const [phoneNumber, setPhoneNumber] = useState('');
   const [startingPrice, setStartingPrice] = useState<string>('150');
   const [durationMinutes, setDurationMinutes] = useState<number>(5);
   const [customDuration, setCustomDuration] = useState<string>('');
-  const [imageUrl, setImageUrl] = useState<string>(PRESET_IMAGES[0].url);
   const [category, setCategory] = useState('Electronics');
+  const [imagePreviews, setImagePreviews] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  const resetForm = () => {
+    setTitle('');
+    setDescription('');
+    setPhoneNumber('');
+    setStartingPrice('150');
+    setDurationMinutes(5);
+    setCustomDuration('');
+    setCategory('Electronics');
+    setImagePreviews([]);
+    setError(null);
+    setIsSubmitting(false);
+  };
+
+  useEffect(() => {
+    if (isOpen) {
+      resetForm();
+    }
+  }, [isOpen]);
+
   if (!isOpen) return null;
+
+  const handleImageSelection = async (evt: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(evt.target.files ?? []).filter((entry): entry is File => entry instanceof File);
+    evt.target.value = '';
+
+    if (files.length === 0) {
+      return;
+    }
+
+    const remainingSlots = MAX_IMAGES - imagePreviews.length;
+    if (files.length > remainingSlots) {
+      setError(`You can upload up to ${MAX_IMAGES} images total. Please choose ${remainingSlots} or fewer file(s).`);
+      return;
+    }
+
+    try {
+      setError(null);
+      const compressed = await Promise.all(files.map((file) => compressImage(file)));
+      setImagePreviews((current) => [...current, ...compressed]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to process the selected images.');
+    }
+  };
+
+  const removeImage = (indexToRemove: number) => {
+    setImagePreviews((current) => current.filter((_, index) => index !== indexToRemove));
+    setError(null);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -56,14 +145,28 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
       return;
     }
 
-    const priceNum = parseFloat(startingPrice);
-    if (isNaN(priceNum) || priceNum <= 0) {
+    const trimmedTitle = title.trim();
+    const trimmedDescription = description.trim();
+    const trimmedPhoneNumber = phoneNumber.trim();
+
+    if (!trimmedTitle || !trimmedDescription || !trimmedPhoneNumber) {
+      setError('Please complete the title, description, and phone number fields.');
+      return;
+    }
+
+    if (imagePreviews.length === 0) {
+      setError('Please upload at least one image before publishing the listing.');
+      return;
+    }
+
+    const priceNum = Number(startingPrice);
+    if (!Number.isFinite(priceNum) || priceNum <= 0) {
       setError('Starting price must be greater than $0.');
       return;
     }
 
     const finalDuration = customDuration ? parseInt(customDuration, 10) : durationMinutes;
-    if (isNaN(finalDuration) || finalDuration <= 0) {
+    if (!Number.isInteger(finalDuration) || finalDuration <= 0) {
       setError('Duration must be at least 1 minute.');
       return;
     }
@@ -78,27 +181,34 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
           Authorization: `Bearer ${user.token}`,
         },
         body: JSON.stringify({
-          title,
-          description,
-          phoneNumber,
+          title: trimmedTitle,
+          description: trimmedDescription,
+          phoneNumber: trimmedPhoneNumber,
           startingPrice: priceNum,
           durationMinutes: finalDuration,
           sellerId: user.id,
           sellerName: user.name,
-          imageUrl,
-          category,
+          imageUrls: imagePreviews,
+          imageUrl: imagePreviews[0],
+          category: category.trim() || 'General',
         }),
       });
 
-      const data = await res.json();
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch {
+        data = null;
+      }
+
       if (!res.ok) {
-        throw new Error(data.error || 'Failed to create listing');
+        throw new Error(data?.error || `Request failed with status ${res.status}.`);
       }
 
       onCreated(data.auction);
       onClose();
-    } catch (err: any) {
-      setError(err.message || 'An error occurred while creating the listing.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'An error occurred while creating the listing.');
     } finally {
       setIsSubmitting(false);
     }
@@ -107,8 +217,6 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#1e293b]/40 backdrop-blur-xs overflow-y-auto">
       <div className="relative w-full max-w-xl bg-[#e2eafc] border border-[#ccdbfd] rounded-2xl shadow-xl overflow-hidden text-[#1e293b] my-8">
-        
-        {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-[#ccdbfd] bg-[#d7e3fc]">
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-lg bg-[#b6ccfe] flex items-center justify-center text-[#1e293b]">
@@ -128,7 +236,6 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
           </button>
         </div>
 
-        {/* Warning if not logged in */}
         {!user && (
           <div className="m-6 p-4 rounded-xl bg-[#d7e3fc] border border-[#ccdbfd] flex items-start gap-3">
             <AlertCircle className="w-5 h-5 text-[#1e293b] shrink-0 mt-0.5" />
@@ -142,13 +249,12 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
                 onClick={onPromptAuth}
                 className="mt-2 px-3 py-1 rounded-lg bg-[#abc4ff] hover:bg-[#b6ccfe] font-bold text-[#1e293b] text-xs shadow-xs"
               >
-                Sign In or Choose Demo User
+                Sign In to Create a Listing
               </button>
             </div>
           </div>
         )}
 
-        {/* Form */}
         <form onSubmit={handleSubmit} className="p-6 space-y-4">
           {error && (
             <div className="p-3 rounded-xl bg-red-100/90 border border-red-200 text-red-800 text-xs flex items-center gap-2">
@@ -157,7 +263,6 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
             </div>
           )}
 
-          {/* Item Title */}
           <div>
             <label className="block text-xs font-bold text-[#1e293b] mb-1">
               Item Title *
@@ -173,7 +278,6 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
             />
           </div>
 
-          {/* Description */}
           <div>
             <label className="block text-xs font-bold text-[#1e293b] mb-1">
               Item Description *
@@ -189,7 +293,6 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
             />
           </div>
 
-          {/* 2-Column Row: Starting Price & Phone Number */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-bold text-[#1e293b] mb-1">
@@ -232,7 +335,6 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
             </div>
           </div>
 
-          {/* Auction Duration */}
           <div>
             <label className="block text-xs font-bold text-[#1e293b] mb-1.5 flex items-center justify-between">
               <span>Auction Duration *</span>
@@ -259,43 +361,81 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
                 </button>
               ))}
             </div>
+            <input
+              id="listing-custom-duration-input"
+              type="number"
+              min="1"
+              step="1"
+              placeholder="Or enter custom minutes"
+              value={customDuration}
+              onChange={(e) => setCustomDuration(e.target.value)}
+              className="mt-2 w-full px-3.5 py-2 text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b]"
+            />
           </div>
 
-          {/* Image Presets or Custom URL */}
           <div>
             <label className="block text-xs font-bold text-[#1e293b] mb-1.5">
-              Item Image Preview
+              Item Images (Up to 3) *
             </label>
-            <div className="flex items-center gap-2 mb-2 overflow-x-auto pb-1">
-              {PRESET_IMAGES.map((img) => (
-                <button
-                  key={img.label}
-                  type="button"
-                  onClick={() => setImageUrl(img.url)}
-                  className={`px-2.5 py-1 text-xs font-medium rounded-lg border transition-all ${
-                    imageUrl === img.url
-                      ? 'bg-[#b6ccfe] border-[#abc4ff] text-[#1e293b] font-bold'
-                      : 'bg-[#edf2fb] border-[#ccdbfd] text-[#1e293b]/70 hover:bg-[#d7e3fc]'
-                  }`}
-                >
-                  {img.label}
-                </button>
-              ))}
+            <div className="mb-2 text-[11px] text-[#1e293b]/65">
+              Upload up to 3 images. Files are compressed automatically before they are stored.
             </div>
+
+            {imagePreviews.length > 0 && (
+              <div className="mb-3 grid grid-cols-3 gap-2">
+                {imagePreviews.map((preview, index) => (
+                  <div key={`${preview.slice(0, 20)}-${index}`} className="relative rounded-xl overflow-hidden border border-[#ccdbfd] bg-[#edf2fb]">
+                    <img src={preview} alt={`Uploaded preview ${index + 1}`} className="h-20 w-full object-cover" />
+                    <button
+                      type="button"
+                      onClick={() => removeImage(index)}
+                      className="absolute top-1 right-1 rounded-md bg-[#1e293b]/70 p-1 text-white hover:bg-[#1e293b]"
+                      aria-label={`Remove image ${index + 1}`}
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {imagePreviews.length < MAX_IMAGES && (
+              <label
+                htmlFor="listing-images-input"
+                className="flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-[#abc4ff] bg-[#edf2fb] px-3 py-3 text-xs font-semibold text-[#1e293b] transition-colors hover:bg-[#d7e3fc]"
+              >
+                <Upload className="w-4 h-4" />
+                <span>Add Image{imagePreviews.length > 0 ? 's' : ''}</span>
+              </label>
+            )}
+
+            <input
+              id="listing-images-input"
+              type="file"
+              accept="image/*"
+              multiple
+              onChange={handleImageSelection}
+              className="hidden"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-bold text-[#1e293b] mb-1">
+              Category
+            </label>
             <div className="relative">
-              <ImageIcon className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-[#1e293b]/50" />
+              <FileText className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-[#1e293b]/50" />
               <input
-                id="listing-image-url-input"
-                type="url"
-                placeholder="Or paste custom image URL (https://...)"
-                value={imageUrl}
-                onChange={(e) => setImageUrl(e.target.value)}
-                className="w-full pl-9 pr-3.5 py-2 text-xs rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b]"
+                id="listing-category-input"
+                type="text"
+                placeholder="e.g. Electronics"
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+                className="w-full pl-9 pr-3.5 py-2.5 text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-medium placeholder-[#1e293b]/40"
               />
             </div>
           </div>
 
-          {/* Action Buttons */}
           <div className="pt-3 flex items-center justify-end gap-3 border-t border-[#ccdbfd]">
             <button
               type="button"
@@ -315,7 +455,6 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
             </button>
           </div>
         </form>
-
       </div>
     </div>
   );

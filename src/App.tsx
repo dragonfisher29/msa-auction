@@ -43,15 +43,6 @@ export default function App() {
       const saved = localStorage.getItem('msa_auction_user');
       if (saved) {
         setUser(JSON.parse(saved));
-      } else {
-        // Default to demo user "Alex Rivera" for immediate interactive testing if desired
-        setUser({
-          id: 'usr_demo_1',
-          name: 'Alex Rivera',
-          username: 'alex_r',
-          token: 'tok_usr_demo_1',
-          createdAt: Date.now(),
-        });
       }
     } catch {
       // ignore
@@ -370,7 +361,7 @@ export default function App() {
             <span>— Bi-directional Real-Time Bidding</span>
           </div>
           <p className="text-[11px]">
-            Powered by Node.js, Express, and Socket.io
+            Built by <a href="https://github.com/dragonfisher29">dragonfisher29</a>
           </p>
         </div>
       </footer>

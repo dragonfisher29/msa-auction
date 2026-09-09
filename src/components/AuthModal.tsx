@@ -53,26 +53,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
   };
 
-  const handleDemoLogin = async (demoUsername: string) => {
-    setError(null);
-    setIsLoading(true);
-    try {
-      const res = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: demoUsername, password: 'password123' }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
-      onAuthSuccess(data.user);
-      onClose();
-    } catch (err: any) {
-      setError(err.message || 'Demo login failed');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#1e293b]/40 backdrop-blur-xs">
       <div className="relative w-full max-w-md bg-[#e2eafc] border border-[#ccdbfd] rounded-2xl shadow-xl overflow-hidden text-[#1e293b]">
@@ -200,31 +180,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               <ArrowRight className="w-4 h-4" />
             </button>
           </form>
-
-          {/* 1-Click Demo Profiles for Quick Testing */}
-          <div className="mt-6 pt-5 border-t border-[#ccdbfd]">
-            <p className="text-[11px] font-bold uppercase tracking-wider text-[#1e293b]/60 mb-2.5 text-center">
-              Quick 1-Click Demo Bidders (for live testing)
-            </p>
-            <div className="grid grid-cols-2 gap-2">
-              {[
-                { name: 'Alex Rivera', u: 'alex_r' },
-                { name: 'Sarah Miller', u: 'sarah_m' },
-                { name: 'David Kim', u: 'david_k' },
-                { name: 'Elena Vance', u: 'elena_v' },
-              ].map((demo) => (
-                <button
-                  key={demo.u}
-                  type="button"
-                  onClick={() => handleDemoLogin(demo.u)}
-                  className="px-2.5 py-1.5 rounded-lg bg-[#d7e3fc] hover:bg-[#c1d3fe] border border-[#ccdbfd] text-xs font-semibold text-[#1e293b] transition-colors text-left flex items-center justify-between"
-                >
-                  <span className="truncate">{demo.name}</span>
-                  <span className="text-[10px] opacity-60">@{demo.u}</span>
-                </button>
-              ))}
-            </div>
-          </div>
 
         </div>
       </div>

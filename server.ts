@@ -1,10 +1,10 @@
-import express from 'express';
+﻿import express from 'express';
 import http from 'http';
 import path from 'path';
+import Database from 'better-sqlite3';
 import { Server as SocketIOServer } from 'socket.io';
 import { createServer as createViteServer } from 'vite';
 
-// --- Types & Interfaces ---
 interface User {
   id: string;
   name: string;
@@ -40,6 +40,7 @@ interface AuctionItem {
   status: 'active' | 'ended';
   category?: string;
   imageUrl?: string;
+  imageUrls?: string[];
   bids: Bid[];
   winnerId?: string | null;
   winnerName?: string | null;
@@ -47,200 +48,184 @@ interface AuctionItem {
   createdAt: number;
 }
 
-// --- In-Memory Database Storage ---
-// Stores active user sessions, auction listings, and live bid histories.
-const users: Map<string, User> = new Map();
-const tokens: Map<string, string> = new Map(); // token -> userId
-const auctions: Map<string, AuctionItem> = new Map();
+const DB_PATH = process.env.DB_PATH ?? path.join(process.cwd(), 'auction.db');
+const db = new Database(DB_PATH);
 
-// Helper to seed demo users
-function seedUsers() {
-  const demoUsers = [
-    { id: 'usr_demo_1', username: 'alex_r', name: 'Alex Rivera', password: 'password123' },
-    { id: 'usr_demo_2', username: 'sarah_m', name: 'Sarah Miller', password: 'password123' },
-    { id: 'usr_demo_3', username: 'david_k', name: 'David Kim', password: 'password123' },
-    { id: 'usr_demo_4', username: 'elena_v', name: 'Elena Vance', password: 'password123' },
-  ];
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
 
-  for (const u of demoUsers) {
-    const token = `tok_${u.id}_${Date.now()}`;
-    const user: User = {
-      id: u.id,
-      name: u.name,
-      username: u.username,
-      passwordHash: u.password,
-      token,
-      createdAt: Date.now(),
-    };
-    users.set(u.id, user);
-    tokens.set(token, u.id);
+function parseJsonArray<T>(value: string | null | undefined): T[] {
+  if (!value) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
   }
 }
 
-// Helper to seed initial realistic auction items
-function seedAuctions() {
-  const now = Date.now();
-
-  const demoItems: Partial<AuctionItem>[] = [
-    {
-      id: 'auc_1',
-      title: 'Vintage Leica M3 Rangefinder Camera (1956)',
-      description: 'Single stroke original chrome finish in pristine cosmetic condition. Fully tested shutter speeds, clear rangefinder patch, and original leather case included. Collector grade.',
-      phoneNumber: '+1 (555) 234-8901',
-      startingPrice: 850,
-      currentPrice: 1250,
-      sellerId: 'usr_demo_1',
-      sellerName: 'Alex Rivera',
-      highestBidderId: 'usr_demo_2',
-      highestBidderName: 'Sarah Miller',
-      durationMinutes: 15,
-      startTime: now - 5 * 60 * 1000,
-      endTime: now + 10 * 60 * 1000, // 10 mins remaining
-      status: 'active',
-      category: 'Photography',
-      imageUrl: 'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?auto=format&fit=crop&w=800&q=80',
-      bids: [
-        { id: 'bid_1_1', auctionId: 'auc_1', userId: 'usr_demo_3', userName: 'David Kim', amount: 950, timestamp: now - 4 * 60 * 1000 },
-        { id: 'bid_1_2', auctionId: 'auc_1', userId: 'usr_demo_4', userName: 'Elena Vance', amount: 1100, timestamp: now - 3 * 60 * 1000 },
-        { id: 'bid_1_3', auctionId: 'auc_1', userId: 'usr_demo_2', userName: 'Sarah Miller', amount: 1250, timestamp: now - 1 * 60 * 1000 },
-      ],
-      createdAt: now - 5 * 60 * 1000,
-    },
-    {
-      id: 'auc_2',
-      title: 'Apple MacBook Pro 16" M3 Max (36GB / 1TB SSD)',
-      description: 'Space Black edition with 16-core CPU and 40-core GPU. Battery health is at 99%, only 14 cycles. Comes in original factory packaging with 140W MagSafe 3 power adapter.',
-      phoneNumber: '+1 (555) 789-4321',
-      startingPrice: 1800,
-      currentPrice: 2450,
-      sellerId: 'usr_demo_3',
-      sellerName: 'David Kim',
-      highestBidderId: 'usr_demo_1',
-      highestBidderName: 'Alex Rivera',
-      durationMinutes: 45,
-      startTime: now - 15 * 60 * 1000,
-      endTime: now + 30 * 60 * 1000, // 30 mins remaining
-      status: 'active',
-      category: 'Electronics',
-      imageUrl: 'https://images.unsplash.com/photo-1517336714731-489689fd1ca8?auto=format&fit=crop&w=800&q=80',
-      bids: [
-        { id: 'bid_2_1', auctionId: 'auc_2', userId: 'usr_demo_4', userName: 'Elena Vance', amount: 2000, timestamp: now - 12 * 60 * 1000 },
-        { id: 'bid_2_2', auctionId: 'auc_2', userId: 'usr_demo_2', userName: 'Sarah Miller', amount: 2200, timestamp: now - 8 * 60 * 1000 },
-        { id: 'bid_2_3', auctionId: 'auc_2', userId: 'usr_demo_1', userName: 'Alex Rivera', amount: 2450, timestamp: now - 2 * 60 * 1000 },
-      ],
-      createdAt: now - 15 * 60 * 1000,
-    },
-    {
-      id: 'auc_3',
-      title: 'Gibson Custom 1959 Les Paul Standard Reissue',
-      description: 'Custom Shop Historic Select in Washed Cherry VOS. Solid lightweight mahogany body, hand-picked flame maple top, and CustomBucker Alnico III pickups. Hardcase & COA included.',
-      phoneNumber: '+1 (555) 456-1122',
-      startingPrice: 2400,
-      currentPrice: 3200,
-      sellerId: 'usr_demo_2',
-      sellerName: 'Sarah Miller',
-      highestBidderId: 'usr_demo_4',
-      highestBidderName: 'Elena Vance',
-      durationMinutes: 120,
-      startTime: now - 30 * 60 * 1000,
-      endTime: now + 90 * 60 * 1000, // 90 mins remaining
-      status: 'active',
-      category: 'Instruments',
-      imageUrl: 'https://images.unsplash.com/photo-1550291652-6ea9114a47b1?auto=format&fit=crop&w=800&q=80',
-      bids: [
-        { id: 'bid_3_1', auctionId: 'auc_3', userId: 'usr_demo_1', userName: 'Alex Rivera', amount: 2700, timestamp: now - 20 * 60 * 1000 },
-        { id: 'bid_3_2', auctionId: 'auc_3', userId: 'usr_demo_4', userName: 'Elena Vance', amount: 3200, timestamp: now - 10 * 60 * 1000 },
-      ],
-      createdAt: now - 30 * 60 * 1000,
-    },
-    {
-      id: 'auc_4',
-      title: 'Rolex Submariner Date 41mm (Ref. 126610LN)',
-      description: 'Oystersteel with black Cerachrom ceramic bezel and black dial. Complete collector set with green box, warranty card dated late 2023, white tag, and manuals. Unpolished.',
-      phoneNumber: '+1 (555) 998-3344',
-      startingPrice: 6500,
-      currentPrice: 8900,
-      sellerId: 'usr_demo_4',
-      sellerName: 'Elena Vance',
-      highestBidderId: 'usr_demo_3',
-      highestBidderName: 'David Kim',
-      durationMinutes: 6,
-      startTime: now - 4 * 60 * 1000,
-      endTime: now + 2 * 60 * 1000, // Ending very soon (2 mins)
-      status: 'active',
-      category: 'Luxury Watches',
-      imageUrl: 'https://images.unsplash.com/photo-1522335789203-aabd1fc54bc9?auto=format&fit=crop&w=800&q=80',
-      bids: [
-        { id: 'bid_4_1', auctionId: 'auc_4', userId: 'usr_demo_2', userName: 'Sarah Miller', amount: 7200, timestamp: now - 3 * 60 * 1000 },
-        { id: 'bid_4_2', auctionId: 'auc_4', userId: 'usr_demo_3', userName: 'David Kim', amount: 8900, timestamp: now - 1 * 60 * 1000 },
-      ],
-      createdAt: now - 4 * 60 * 1000,
-    },
-    {
-      id: 'auc_5',
-      title: 'Sony FX3 Cinema Line Full-Frame Camera Kit',
-      description: 'Features 4K 120p recording, 15+ stops dynamic range, S-Cinetone, XLR top audio handle unit, 2x Sony Tough 160GB CFexpress Type A cards, and 3x NP-FZ100 batteries.',
-      phoneNumber: '+1 (555) 345-6789',
-      startingPrice: 1500,
-      currentPrice: 1500,
-      sellerId: 'usr_demo_1',
-      sellerName: 'Alex Rivera',
-      highestBidderId: null,
-      highestBidderName: null,
-      durationMinutes: 60,
-      startTime: now - 2 * 60 * 1000,
-      endTime: now + 58 * 60 * 1000,
-      status: 'active',
-      category: 'Photography',
-      imageUrl: 'https://images.unsplash.com/photo-1516035069371-29a1b244cc32?auto=format&fit=crop&w=800&q=80',
-      bids: [],
-      createdAt: now - 2 * 60 * 1000,
-    },
-    {
-      id: 'auc_6',
-      title: 'Herman Miller Eames Lounge Chair & Ottoman',
-      description: 'Authentic Palisander santos rosewood veneer with premium black MCL leather. Manufactured in Michigan, certified authentic with embossed medal badge on underside.',
-      phoneNumber: '+1 (555) 654-3210',
-      startingPrice: 3200,
-      currentPrice: 4850,
-      sellerId: 'usr_demo_2',
-      sellerName: 'Sarah Miller',
-      highestBidderId: 'usr_demo_1',
-      highestBidderName: 'Alex Rivera',
-      durationMinutes: 60,
-      startTime: now - 70 * 60 * 1000,
-      endTime: now - 10 * 60 * 1000, // Completed auction example
-      status: 'ended',
-      winnerId: 'usr_demo_1',
-      winnerName: 'Alex Rivera',
-      winningBid: 4850,
-      category: 'Furniture & Design',
-      imageUrl: 'https://images.unsplash.com/photo-1580481077195-c3a821a58875?auto=format&fit=crop&w=800&q=80',
-      bids: [
-        { id: 'bid_6_1', auctionId: 'auc_6', userId: 'usr_demo_4', userName: 'Elena Vance', amount: 3700, timestamp: now - 50 * 60 * 1000 },
-        { id: 'bid_6_2', auctionId: 'auc_6', userId: 'usr_demo_3', userName: 'David Kim', amount: 4300, timestamp: now - 35 * 60 * 1000 },
-        { id: 'bid_6_3', auctionId: 'auc_6', userId: 'usr_demo_1', userName: 'Alex Rivera', amount: 4850, timestamp: now - 15 * 60 * 1000 },
-      ],
-      createdAt: now - 70 * 60 * 1000,
-    },
-  ];
-
-  for (const item of demoItems) {
-    auctions.set(item.id!, item as AuctionItem);
-  }
+function stringifyJson(value: unknown): string {
+  return JSON.stringify(value ?? []);
 }
 
-seedUsers();
-seedAuctions();
+function sanitizeUser(row: any): User {
+  return {
+    id: row.id,
+    name: row.name,
+    username: row.username,
+    passwordHash: row.passwordHash,
+    token: row.token,
+    createdAt: row.createdAt,
+  };
+}
+
+function sanitizeAuction(row: any): AuctionItem {
+  const imageUrls = parseJsonArray<string>(row.imageUrls);
+
+  return {
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    phoneNumber: row.phoneNumber,
+    startingPrice: Number(row.startingPrice),
+    currentPrice: Number(row.currentPrice),
+    sellerId: row.sellerId,
+    sellerName: row.sellerName,
+    highestBidderId: row.highestBidderId ?? null,
+    highestBidderName: row.highestBidderName ?? null,
+    durationMinutes: Number(row.durationMinutes),
+    startTime: Number(row.startTime),
+    endTime: Number(row.endTime),
+    status: row.status,
+    category: row.category ?? 'General',
+    imageUrl: row.imageUrl || imageUrls[0],
+    imageUrls,
+    bids: parseJsonArray<Bid>(row.bids),
+    winnerId: row.winnerId ?? null,
+    winnerName: row.winnerName ?? null,
+    winningBid: row.winningBid ?? null,
+    createdAt: Number(row.createdAt),
+  };
+}
+
+function createTables() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      username TEXT NOT NULL UNIQUE,
+      passwordHash TEXT NOT NULL,
+      token TEXT,
+      createdAt INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS auctions (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      phoneNumber TEXT NOT NULL,
+      startingPrice REAL NOT NULL,
+      currentPrice REAL NOT NULL,
+      sellerId TEXT NOT NULL,
+      sellerName TEXT NOT NULL,
+      highestBidderId TEXT,
+      highestBidderName TEXT,
+      durationMinutes INTEGER NOT NULL,
+      startTime INTEGER NOT NULL,
+      endTime INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      category TEXT,
+      imageUrl TEXT,
+      imageUrls TEXT NOT NULL DEFAULT '[]',
+      bids TEXT NOT NULL DEFAULT '[]',
+      winnerId TEXT,
+      winnerName TEXT,
+      winningBid REAL,
+      createdAt INTEGER NOT NULL
+    );
+  `);
+}
+
+createTables();
+
+function getAuthenticatedUser(token: string): User | null {
+  const row = db.prepare('SELECT * FROM users WHERE token = ?').get(token);
+  return row ? sanitizeUser(row) : null;
+}
+
+function getAuctionById(id: string): AuctionItem | null {
+  const row = db.prepare('SELECT * FROM auctions WHERE id = ?').get(id);
+  return row ? sanitizeAuction(row) : null;
+}
+
+function getAuctions(): AuctionItem[] {
+  const rows = db.prepare('SELECT * FROM auctions ORDER BY CASE WHEN status = "active" THEN 0 ELSE 1 END, endTime ASC').all();
+  return rows.map((row: any) => sanitizeAuction(row));
+}
+
+function validateAuctionInput(raw: any) {
+  if (!raw || typeof raw !== 'object') {
+    return { error: 'Invalid auction payload.' };
+  }
+
+  const title = typeof raw.title === 'string' ? raw.title.trim() : '';
+  const description = typeof raw.description === 'string' ? raw.description.trim() : '';
+  const phoneNumber = typeof raw.phoneNumber === 'string' ? raw.phoneNumber.trim() : '';
+
+  if (!title || !description || !phoneNumber) {
+    return { error: 'Title, description, and phone number are required.' };
+  }
+
+  const parsedPrice = Number(raw.startingPrice);
+  if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
+    return { error: 'Starting price must be greater than $0.' };
+  }
+
+  const parsedDuration = Number(raw.durationMinutes);
+  if (!Number.isInteger(parsedDuration) || parsedDuration <= 0) {
+    return { error: 'Auction duration must be at least 1 minute.' };
+  }
+
+  const normalizedImageUrls = Array.isArray(raw.imageUrls)
+    ? raw.imageUrls
+        .filter((value: unknown): value is string => typeof value === 'string')
+        .map((value: string) => value.trim())
+        .filter((value: string) => value.length > 0)
+    : [];
+
+  const fallbackImage = typeof raw.imageUrl === 'string' ? raw.imageUrl.trim() : '';
+  if (fallbackImage && normalizedImageUrls.length === 0) {
+    normalizedImageUrls.push(fallbackImage);
+  }
+
+  if (normalizedImageUrls.length === 0) {
+    return { error: 'Please upload at least one image for the listing.' };
+  }
+
+  if (normalizedImageUrls.length > 3) {
+    return { error: 'You can upload up to 3 images per listing.' };
+  }
+
+  return {
+    title,
+    description,
+    phoneNumber,
+    parsedPrice,
+    parsedDuration,
+    imageUrls: normalizedImageUrls,
+    category: typeof raw.category === 'string' && raw.category.trim() ? raw.category.trim() : 'General',
+  };
+}
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // Middleware
-  app.use(express.json());
+  app.use(express.json({ limit: '20mb' }));
 
-  // Create HTTP server & Socket.io server
   const server = http.createServer(app);
   const io = new SocketIOServer(server, {
     cors: {
@@ -249,107 +234,91 @@ async function startServer() {
     },
   });
 
-  // --- Background Countdown & Auction Expiration Checker ---
-  // Runs every 1000ms to check if any active auction has expired.
-  // When an auction ends, marks it as ended, declares the winner, and emits real-time events.
   setInterval(() => {
     const now = Date.now();
-    for (const auction of auctions.values()) {
-      if (auction.status === 'active' && now >= auction.endTime) {
-        auction.status = 'ended';
-        if (auction.highestBidderId) {
-          auction.winnerId = auction.highestBidderId;
-          auction.winnerName = auction.highestBidderName;
-          auction.winningBid = auction.currentPrice;
-        } else {
-          auction.winnerId = null;
-          auction.winnerName = null;
-          auction.winningBid = null;
-        }
+    const rows = db.prepare('SELECT * FROM auctions WHERE status = ?').all('active');
 
-        // Notify all clients in the auction room
+    for (const row of rows) {
+      const auction = sanitizeAuction(row);
+
+      if (auction.endTime <= now) {
+        const winnerId = auction.highestBidderId ?? null;
+        const winnerName = auction.highestBidderName ?? null;
+        const winningBid = auction.highestBidderId ? auction.currentPrice : null;
+
+        db.prepare(`
+          UPDATE auctions
+          SET status = ?, winnerId = ?, winnerName = ?, winningBid = ?
+          WHERE id = ?
+        `).run('ended', winnerId, winnerName, winningBid, auction.id);
+
+        const updatedAuction = getAuctionById(auction.id)!;
+
         io.to(`auction:${auction.id}`).emit('auction_ended', {
           auctionId: auction.id,
-          winnerId: auction.winnerId,
-          winnerName: auction.winnerName,
-          winningBid: auction.winningBid,
-          auction,
+          winnerId,
+          winnerName,
+          winningBid,
+          auction: updatedAuction,
         });
 
-        // Broadcast general update so dashboard listing cards reflect the ended state
         io.emit('auction_list_updated', {
           type: 'ended',
-          auction,
+          auction: updatedAuction,
         });
       }
     }
   }, 1000);
 
-  // --- Real-Time Socket.io Event Handling ---
   io.on('connection', (socket) => {
-    // 1. Client joins a specific auction listing room
-    socket.on('join_auction', ({ auctionId }) => {
+    socket.on('join_auction', ({ auctionId }: { auctionId: string }) => {
       if (!auctionId) return;
-      const room = `auction:${auctionId}`;
-      socket.join(room);
 
-      const auction = auctions.get(auctionId);
+      socket.join(`auction:${auctionId}`);
+      const auction = getAuctionById(auctionId);
       if (auction) {
-        // Send current auction snapshot directly to this socket
         socket.emit('auction_snapshot', auction);
       }
     });
 
-    // 2. Client leaves an auction room
-    socket.on('leave_auction', ({ auctionId }) => {
+    socket.on('leave_auction', ({ auctionId }: { auctionId: string }) => {
       if (!auctionId) return;
       socket.leave(`auction:${auctionId}`);
     });
 
-    // 3. User places a bid
     socket.on('place_bid', ({ auctionId, userId, userName, amount }: { auctionId: string; userId: string; userName: string; amount: number }) => {
-      const auction = auctions.get(auctionId);
+      const auction = getAuctionById(auctionId);
 
-      // Validation 1: Auction exists
       if (!auction) {
         return socket.emit('bid_error', { message: 'Auction listing was not found.' });
       }
 
-      // Validation 2: Auction is active
       if (auction.status === 'ended' || Date.now() >= auction.endTime) {
-        auction.status = 'ended';
         return socket.emit('bid_error', { message: 'This auction has already ended.' });
       }
 
-      // Validation 3: Prevent users from bidding on their own listings
       if (auction.sellerId === userId) {
         return socket.emit('bid_error', { message: 'You cannot place a bid on your own listing.' });
       }
 
-      // Validation 4: Bid amount must be greater than current highest bid (or starting price if no bids)
-      const minRequired = auction.bids.length === 0 ? auction.startingPrice : auction.currentPrice;
       const numericAmount = Number(amount);
-
-      if (isNaN(numericAmount) || numericAmount <= 0) {
+      if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
         return socket.emit('bid_error', { message: 'Please enter a valid bid amount.' });
       }
 
-      // If no bids placed yet, bid must be >= startingPrice; if bids exist, strictly > currentPrice
+      const minRequired = auction.bids.length === 0 ? auction.startingPrice : auction.currentPrice;
       if (auction.bids.length === 0) {
         if (numericAmount < auction.startingPrice) {
           return socket.emit('bid_error', {
             message: `Starting bid must be at least $${auction.startingPrice.toLocaleString()}.`,
           });
         }
-      } else {
-        if (numericAmount <= auction.currentPrice) {
-          return socket.emit('bid_error', {
-            message: `Bid must be strictly higher than current bid of $${auction.currentPrice.toLocaleString()}.`,
-          });
-        }
+      } else if (numericAmount <= auction.currentPrice) {
+        return socket.emit('bid_error', {
+          message: `Bid must be strictly higher than current bid of $${auction.currentPrice.toLocaleString()}.`,
+        });
       }
 
-      // Record new bid
       const newBid: Bid = {
         id: `bid_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
         auctionId,
@@ -359,114 +328,100 @@ async function startServer() {
         timestamp: Date.now(),
       };
 
-      auction.bids.unshift(newBid); // Most recent bid first
-      auction.currentPrice = numericAmount;
-      auction.highestBidderId = userId;
-      auction.highestBidderName = userName;
+      const updatedBids = [newBid, ...auction.bids];
 
-      // Real-Time Broadcast to all clients viewing this specific auction room
+      db.prepare(`
+        UPDATE auctions
+        SET bids = ?, currentPrice = ?, highestBidderId = ?, highestBidderName = ?
+        WHERE id = ?
+      `).run(stringifyJson(updatedBids), numericAmount, userId, userName, auctionId);
+
+      const updatedAuction = getAuctionById(auctionId)!;
+
       io.to(`auction:${auctionId}`).emit('bid_updated', {
         auctionId,
-        currentPrice: auction.currentPrice,
-        highestBidderId: auction.highestBidderId,
-        highestBidderName: auction.highestBidderName,
+        currentPrice: updatedAuction.currentPrice,
+        highestBidderId: updatedAuction.highestBidderId,
+        highestBidderName: updatedAuction.highestBidderName,
         bid: newBid,
-        auction,
+        auction: updatedAuction,
       });
 
-      // Broadcast update to all dashboard listing cards
       io.emit('auction_list_updated', {
         type: 'bid',
-        auction,
+        auction: updatedAuction,
       });
     });
-
-    socket.on('disconnect', () => {
-      // Clean disconnect
-    });
   });
 
-  // --- REST API Endpoints ---
-
-  // Health check
   app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', serverTime: Date.now(), activeAuctions: auctions.size });
+    res.json({ status: 'ok', serverTime: Date.now(), activeAuctions: getAuctions().length });
   });
 
-  // Auth: Register
   app.post('/api/auth/register', (req, res) => {
     const { username, name, password } = req.body;
+
     if (!username || !name || !password) {
       return res.status(400).json({ error: 'Username, name, and password are required.' });
     }
 
-    const trimmedUsername = username.trim().toLowerCase();
-    for (const u of users.values()) {
-      if (u.username.toLowerCase() === trimmedUsername) {
-        return res.status(409).json({ error: 'Username is already taken. Please choose another.' });
-      }
+    const trimmedUsername = String(username).trim().toLowerCase();
+    const trimmedName = String(name).trim();
+
+    if (!trimmedUsername || !trimmedName || !String(password).trim()) {
+      return res.status(400).json({ error: 'Username, name, and password are required.' });
+    }
+
+    const existing = db.prepare('SELECT id FROM users WHERE LOWER(username) = ?').get(trimmedUsername);
+    if (existing) {
+      return res.status(409).json({ error: 'Username is already taken. Please choose another.' });
     }
 
     const id = `usr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const token = `tok_${id}_${Date.now()}`;
-    const newUser: User = {
-      id,
-      name: name.trim(),
-      username: trimmedUsername,
-      passwordHash: password,
-      token,
-      createdAt: Date.now(),
-    };
 
-    users.set(id, newUser);
-    tokens.set(token, id);
+    db.prepare(`
+      INSERT INTO users (id, name, username, passwordHash, token, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(id, trimmedName, trimmedUsername, String(password), token, Date.now());
 
     res.status(201).json({
       user: {
-        id: newUser.id,
-        name: newUser.name,
-        username: newUser.username,
-        token: newUser.token,
+        id,
+        name: trimmedName,
+        username: trimmedUsername,
+        token,
       },
     });
   });
 
-  // Auth: Login
   app.post('/api/auth/login', (req, res) => {
     const { username, password } = req.body;
+
     if (!username || !password) {
       return res.status(400).json({ error: 'Username and password are required.' });
     }
 
-    const trimmedUsername = username.trim().toLowerCase();
-    let foundUser: User | null = null;
+    const trimmedUsername = String(username).trim().toLowerCase();
+    const storedUser = db.prepare('SELECT * FROM users WHERE LOWER(username) = ?').get(trimmedUsername);
 
-    for (const u of users.values()) {
-      if (u.username.toLowerCase() === trimmedUsername) {
-        foundUser = u;
-        break;
-      }
-    }
-
-    if (!foundUser || foundUser.passwordHash !== password) {
+    if (!storedUser || storedUser.passwordHash !== String(password)) {
       return res.status(401).json({ error: 'Invalid username or password.' });
     }
 
-    const token = `tok_${foundUser.id}_${Date.now()}`;
-    foundUser.token = token;
-    tokens.set(token, foundUser.id);
+    const token = `tok_${storedUser.id}_${Date.now()}`;
+    db.prepare('UPDATE users SET token = ? WHERE id = ?').run(token, storedUser.id);
 
     res.json({
       user: {
-        id: foundUser.id,
-        name: foundUser.name,
-        username: foundUser.username,
-        token: foundUser.token,
+        id: storedUser.id,
+        name: storedUser.name,
+        username: storedUser.username,
+        token,
       },
     });
   });
 
-  // Auth: Verify current session
   app.get('/api/auth/me', (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -474,12 +429,12 @@ async function startServer() {
     }
 
     const token = authHeader.replace('Bearer ', '').trim();
-    const userId = tokens.get(token);
-    if (!userId || !users.has(userId)) {
+    const user = getAuthenticatedUser(token);
+
+    if (!user) {
       return res.status(401).json({ error: 'Session expired or invalid' });
     }
 
-    const user = users.get(userId)!;
     res.json({
       user: {
         id: user.id,
@@ -490,88 +445,58 @@ async function startServer() {
     });
   });
 
-  // Get Demo Users (for instant 1-click test login)
-  app.get('/api/auth/demo-users', (req, res) => {
-    const list = Array.from(users.values()).slice(0, 4).map((u) => ({
-      id: u.id,
-      name: u.name,
-      username: u.username,
-      password: u.passwordHash,
-    }));
-    res.json({ demoUsers: list });
-  });
-
-  // Auctions: List all
   app.get('/api/auctions', (req, res) => {
-    const list = Array.from(auctions.values()).sort((a, b) => {
-      // Active first, then by closest end time
-      if (a.status === 'active' && b.status === 'ended') return -1;
-      if (a.status === 'ended' && b.status === 'active') return 1;
-      return a.endTime - b.endTime;
-    });
+    const list = getAuctions();
     res.json({ auctions: list });
   });
 
-  // Auctions: Get single by ID
   app.get('/api/auctions/:id', (req, res) => {
-    const auction = auctions.get(req.params.id);
+    const auction = getAuctionById(req.params.id);
     if (!auction) {
       return res.status(404).json({ error: 'Auction not found' });
     }
+
     res.json({ auction });
   });
 
-  // Auctions: Create new listing
   app.post('/api/auctions', (req, res) => {
-    const { title, description, phoneNumber, startingPrice, durationMinutes, sellerId, sellerName, imageUrl, category } = req.body;
-
-    if (!title || !description || !phoneNumber || startingPrice === undefined || !durationMinutes) {
-      return res.status(400).json({ error: 'All listing fields are required.' });
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Authentication required to create a listing.' });
     }
 
-    const parsedPrice = parseFloat(startingPrice);
-    if (isNaN(parsedPrice) || parsedPrice <= 0) {
-      return res.status(400).json({ error: 'Starting price must be greater than $0.' });
+    const token = authHeader.replace('Bearer ', '').trim();
+    const user = getAuthenticatedUser(token);
+    if (!user) {
+      return res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
     }
 
-    const parsedDuration = parseInt(durationMinutes, 10);
-    if (isNaN(parsedDuration) || parsedDuration <= 0) {
-      return res.status(400).json({ error: 'Auction duration must be at least 1 minute.' });
+    const validated = validateAuctionInput(req.body);
+    if ('error' in validated) {
+      return res.status(400).json({ error: validated.error });
     }
 
     const now = Date.now();
-    const durationMs = parsedDuration * 60 * 1000;
     const id = `auc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
-    // Fallback image if none provided
-    const defaultImages = [
-      'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?auto=format&fit=crop&w=800&q=80',
-      'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?auto=format&fit=crop&w=800&q=80',
-      'https://images.unsplash.com/photo-1523275335684-37898b6baf30?auto=format&fit=crop&w=800&q=80',
-      'https://images.unsplash.com/photo-1546868871-7041f2a55e12?auto=format&fit=crop&w=800&q=80',
-      'https://images.unsplash.com/photo-1584917865442-de89df76afd3?auto=format&fit=crop&w=800&q=80',
-    ];
-    const finalImage = imageUrl && imageUrl.trim().length > 5
-      ? imageUrl.trim()
-      : defaultImages[Math.floor(Math.random() * defaultImages.length)];
-
-    const newAuction: AuctionItem = {
+    const auction: AuctionItem = {
       id,
-      title: title.trim(),
-      description: description.trim(),
-      phoneNumber: phoneNumber.trim(),
-      startingPrice: parsedPrice,
-      currentPrice: parsedPrice,
-      sellerId: sellerId || 'usr_anonymous',
-      sellerName: sellerName || 'Auction Seller',
+      title: validated.title,
+      description: validated.description,
+      phoneNumber: validated.phoneNumber,
+      startingPrice: validated.parsedPrice,
+      currentPrice: validated.parsedPrice,
+      sellerId: user.id,
+      sellerName: user.name,
       highestBidderId: null,
       highestBidderName: null,
-      durationMinutes: parsedDuration,
+      durationMinutes: validated.parsedDuration,
       startTime: now,
-      endTime: now + durationMs,
+      endTime: now + validated.parsedDuration * 60 * 1000,
       status: 'active',
-      category: category || 'General',
-      imageUrl: finalImage,
+      category: validated.category,
+      imageUrl: validated.imageUrls[0],
+      imageUrls: validated.imageUrls,
       bids: [],
       winnerId: null,
       winnerName: null,
@@ -579,18 +504,46 @@ async function startServer() {
       createdAt: now,
     };
 
-    auctions.set(id, newAuction);
+    db.prepare(`
+      INSERT INTO auctions (
+        id, title, description, phoneNumber, startingPrice, currentPrice,
+        sellerId, sellerName, highestBidderId, highestBidderName,
+        durationMinutes, startTime, endTime, status, category,
+        imageUrl, imageUrls, bids, winnerId, winnerName, winningBid, createdAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      auction.id,
+      auction.title,
+      auction.description,
+      auction.phoneNumber,
+      auction.startingPrice,
+      auction.currentPrice,
+      auction.sellerId,
+      auction.sellerName,
+      auction.highestBidderId,
+      auction.highestBidderName,
+      auction.durationMinutes,
+      auction.startTime,
+      auction.endTime,
+      auction.status,
+      auction.category,
+      auction.imageUrl,
+      stringifyJson(auction.imageUrls),
+      stringifyJson(auction.bids),
+      auction.winnerId,
+      auction.winnerName,
+      auction.winningBid,
+      auction.createdAt,
+    );
 
-    // Broadcast new listing to all clients
     io.emit('auction_list_updated', {
       type: 'created',
-      auction: newAuction,
+      auction,
     });
 
-    res.status(201).json({ auction: newAuction });
+    res.status(201).json({ auction });
   });
 
-  // --- Vite Dev & Production Static Middleware ---
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -605,7 +558,6 @@ async function startServer() {
     });
   }
 
-  // Bind to port 3000 and 0.0.0.0
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`[MSA Auction] Full-Stack server running on http://0.0.0.0:${PORT}`);
   });

@@ -32,6 +32,7 @@ export interface AuctionItem {
   status: 'active' | 'ended';
   category?: string;
   imageUrl?: string;
+  imageUrls?: string[];
   bids: Bid[];
   winnerId?: string | null;
   winnerName?: string | null;
