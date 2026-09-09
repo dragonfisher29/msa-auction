@@ -7,7 +7,8 @@ directory = "./dist"
 not_found_handling = "single-page-application"
 
 [vars]
-SUPABASE_URL = "https://your-project.supabase.co"
+SUPABASE_URL = "https://ygyvsowniuoszlsahrvl.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlneXZzb3duaXVvc3psc2FocnZsIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4ODk3MDQxMiwiZXhwIjoyMTA0NTQ2NDEyfQ.rCx6xx9OIvLeReok4FBwmp9OXi1GSXHCWd_MZ_zeP7E"
 MAX_LISTINGS_PER_USER = "20"
 
 [observability]
