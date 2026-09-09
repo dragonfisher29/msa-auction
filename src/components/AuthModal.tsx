@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { X, Lock, User as UserIcon, UserCheck, AlertCircle, ArrowRight } from 'lucide-react';
+import { apiFetch } from '../lib/api';
 import { User } from '../types';
 
 interface AuthModalProps {
@@ -33,7 +34,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       : { username, name, password };
 
     try {
-      const res = await fetch(endpoint, {
+      const res = await apiFetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),

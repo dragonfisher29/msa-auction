@@ -18,6 +18,7 @@ import { AuctionCard } from './components/AuctionCard';
 import { AuctionDetailModal } from './components/AuctionDetailModal';
 import { CreateListingModal } from './components/CreateListingModal';
 import { AuthModal } from './components/AuthModal';
+import { apiFetch } from './lib/api';
 import { getSocket } from './lib/socket';
 
 export default function App() {
@@ -63,7 +64,7 @@ export default function App() {
   const fetchAuctions = async () => {
     try {
       setIsLoading(true);
-      const res = await fetch('/api/auctions');
+      const res = await apiFetch('/api/auctions');
       if (res.ok) {
         const data = await res.json();
         setAuctions(data.auctions || []);

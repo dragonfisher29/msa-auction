@@ -112,13 +112,13 @@ For deployment, keep the Supabase service-role key on the backend only. Do not e
 3. Use these build settings:
    - Build command: `npm run build`
    - Output directory: `dist`
-4. If you want the frontend to reach a hosted backend, add a frontend environment variable such as:
+4. If the frontend is served from Cloudflare Pages and the API is hosted separately, add a frontend environment variable such as:
 
 ```bash
-VITE_API_BASE_URL="https://your-backend-domain.com"
+VITE_API_BASE_URL="https://your-worker-domain.com"
 ```
 
-> The current frontend code uses relative API paths (`/api/...`), so the built frontend will work correctly when served together with the Express backend locally.
+> The app now supports both relative local API paths and a configured external API base via `VITE_API_BASE_URL`.
 
 ### 4. Deploy the backend separately
 

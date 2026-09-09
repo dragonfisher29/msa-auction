@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { X, Tag, Phone, DollarSign, Clock, FileText, Image as ImageIcon, AlertCircle, Trash2, Upload } from 'lucide-react';
+import { apiFetch } from '../lib/api';
 import { User, AuctionItem } from '../types';
 
 interface CreateListingModalProps {
@@ -174,7 +175,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
     setIsSubmitting(true);
 
     try {
-      const res = await fetch('/api/auctions', {
+      const res = await apiFetch('/api/auctions', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
