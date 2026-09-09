@@ -2,9 +2,14 @@ name = "msa-auction-api"
 main = "./workers/index.ts"
 compatibility_date = "2026-09-09"
 
+[assets]
+directory = "./dist"
+not_found_handling = "single-page-app"
+
 [vars]
 SUPABASE_URL = "https://your-project.supabase.co"
 MAX_LISTINGS_PER_USER = "20"
 
 [observability]
 enabled = true
+
