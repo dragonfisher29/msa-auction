@@ -1,4 +1,5 @@
-﻿import express from 'express';
+import 'dotenv/config';
+import express from 'express';
 import http from 'http';
 import path from 'path';
 import { createClient } from '@supabase/supabase-js';
@@ -49,15 +50,15 @@ interface AuctionItem {
 }
 
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabaseSecretKey = process.env.SUPABASE_SECRET_KEY ?? process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!supabaseUrl || !supabaseServiceRoleKey) {
+if (!supabaseUrl || !supabaseSecretKey) {
   throw new Error(
-    'Missing Supabase environment variables. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY before running the app.',
+    'Missing Supabase environment variables. Set SUPABASE_URL and SUPABASE_SECRET_KEY (or legacy SUPABASE_SERVICE_ROLE_KEY) before running the app.',
   );
 }
 
-const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
+const supabase = createClient(supabaseUrl, supabaseSecretKey, {
   auth: {
     persistSession: false,
     autoRefreshToken: false,
@@ -178,9 +179,39 @@ async function getAuctionById(id: string): Promise<AuctionItem | null> {
   return data ? sanitizeAuction(data) : null;
 }
 
+function getErrorMessageAndCode(fallbackMessage: string, defaultCode: string, error?: unknown): { error: string; code: string } {
+  if (typeof error === 'object' && error !== null) {
+    const errObj = error as Record<string, any>;
+    const code = String(errObj.code || defaultCode);
+    const detailMsg = errObj.message || errObj.details || errObj.error_description;
+    const baseMsg = detailMsg ? String(detailMsg) : (error instanceof Error ? error.message : fallbackMessage);
+    return {
+      error: `${baseMsg} [Code: ${code}]`,
+      code,
+    };
+  }
+  if (error instanceof Error) {
+    return {
+      error: `${error.message} [Code: ${defaultCode}]`,
+      code: defaultCode,
+    };
+  }
+  return {
+    error: `${fallbackMessage} [Code: ${defaultCode}]`,
+    code: defaultCode,
+  };
+}
+
+function makeError(message: string, code: string): { error: string; code: string } {
+  return {
+    error: `${message} [Code: ${code}]`,
+    code,
+  };
+}
+
 function validateAuctionInput(raw: any) {
   if (!raw || typeof raw !== 'object') {
-    return { error: 'Invalid auction payload.' };
+    return makeError('Invalid auction payload.', 'INVALID_PAYLOAD');
   }
 
   const title = typeof raw.title === 'string' ? raw.title.trim() : '';
@@ -188,17 +219,17 @@ function validateAuctionInput(raw: any) {
   const phoneNumber = typeof raw.phoneNumber === 'string' ? raw.phoneNumber.trim() : '';
 
   if (!title || !description || !phoneNumber) {
-    return { error: 'Title, description, and phone number are required.' };
+    return makeError('Title, description, and phone number are required.', 'MISSING_FIELDS');
   }
 
   const parsedPrice = Number(raw.startingPrice);
   if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
-    return { error: 'Starting price must be greater than $0.' };
+    return makeError('Starting price must be greater than $0.', 'INVALID_PRICE');
   }
 
   const parsedDuration = Number(raw.durationMinutes);
   if (!Number.isInteger(parsedDuration) || parsedDuration <= 0) {
-    return { error: 'Auction duration must be at least 1 minute.' };
+    return makeError('Auction duration must be at least 1 minute.', 'INVALID_DURATION');
   }
 
   const normalizedImageUrls = Array.isArray(raw.imageUrls)
@@ -214,11 +245,11 @@ function validateAuctionInput(raw: any) {
   }
 
   if (normalizedImageUrls.length === 0) {
-    return { error: 'Please upload at least one image for the listing.' };
+    return makeError('Please upload at least one image for the listing.', 'MISSING_IMAGES');
   }
 
   if (normalizedImageUrls.length > 3) {
-    return { error: 'You can upload up to 3 images per listing.' };
+    return makeError('You can upload up to 3 images per listing.', 'TOO_MANY_IMAGES');
   }
 
   return {
@@ -415,7 +446,7 @@ async function startServer() {
         activeAuctions: auctions.filter((auction) => auction.status === 'active').length,
       });
     } catch (error) {
-      res.status(500).json({ error: error instanceof Error ? error.message : 'Health check failed.' });
+      res.status(500).json(getErrorMessageAndCode('Health check failed.', 'HEALTH_CHECK_FAILED', error));
     }
   });
 
@@ -424,7 +455,7 @@ async function startServer() {
       const { username, name, password } = req.body;
 
       if (!username || !name || !password) {
-        return res.status(400).json({ error: 'Username, name, and password are required.' });
+        return res.status(400).json(makeError('Username, name, and password are required.', 'MISSING_FIELDS'));
       }
 
       const trimmedUsername = String(username).trim().toLowerCase();
@@ -432,7 +463,7 @@ async function startServer() {
       const trimmedPassword = String(password).trim();
 
       if (!trimmedUsername || !trimmedName || !trimmedPassword) {
-        return res.status(400).json({ error: 'Username, name, and password are required.' });
+        return res.status(400).json(makeError('Username, name, and password are required.', 'MISSING_FIELDS'));
       }
 
       const { data: existingUser, error: existingError } = await supabase
@@ -446,7 +477,7 @@ async function startServer() {
       }
 
       if (existingUser) {
-        return res.status(409).json({ error: 'Username is already taken. Please choose another.' });
+        return res.status(409).json(makeError('Username is already taken. Please choose another.', 'USERNAME_TAKEN'));
       }
 
       const passwordHash = await hashSecret(trimmedPassword);
@@ -477,7 +508,7 @@ async function startServer() {
         },
       });
     } catch (error) {
-      res.status(500).json({ error: error instanceof Error ? error.message : 'Registration failed.' });
+      res.status(500).json(getErrorMessageAndCode('Registration failed.', 'REGISTER_FAILED', error));
     }
   });
 
@@ -486,7 +517,7 @@ async function startServer() {
       const { username, password } = req.body;
 
       if (!username || !password) {
-        return res.status(400).json({ error: 'Username and password are required.' });
+        return res.status(400).json(makeError('Username and password are required.', 'MISSING_FIELDS'));
       }
 
       const trimmedUsername = String(username).trim().toLowerCase();
@@ -503,12 +534,12 @@ async function startServer() {
       }
 
       if (!storedUser) {
-        return res.status(401).json({ error: 'Invalid username or password.' });
+        return res.status(401).json(makeError('Invalid username or password.', 'INVALID_CREDENTIALS'));
       }
 
       const passwordHash = await hashSecret(trimmedPassword);
       if (storedUser.password_hash !== passwordHash) {
-        return res.status(401).json({ error: 'Invalid username or password.' });
+        return res.status(401).json(makeError('Invalid username or password.', 'INVALID_CREDENTIALS'));
       }
 
       const token = `tok_${crypto.randomUUID()}`;
@@ -530,7 +561,7 @@ async function startServer() {
         },
       });
     } catch (error) {
-      res.status(500).json({ error: error instanceof Error ? error.message : 'Login failed.' });
+      res.status(500).json(getErrorMessageAndCode('Login failed.', 'LOGIN_FAILED', error));
     }
   });
 
@@ -538,14 +569,14 @@ async function startServer() {
     try {
       const authHeader = req.headers.authorization;
       if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Not authenticated' });
+        return res.status(401).json(makeError('Not authenticated', 'UNAUTHORIZED'));
       }
 
       const token = authHeader.replace('Bearer ', '').trim();
       const user = await getAuthenticatedUser(token);
 
       if (!user) {
-        return res.status(401).json({ error: 'Session expired or invalid' });
+        return res.status(401).json(makeError('Session expired or invalid', 'SESSION_INVALID'));
       }
 
       res.json({
@@ -557,7 +588,7 @@ async function startServer() {
         },
       });
     } catch (error) {
-      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load your session.' });
+      res.status(500).json(getErrorMessageAndCode('Failed to load your session.', 'SESSION_ERROR', error));
     }
   });
 
@@ -566,7 +597,7 @@ async function startServer() {
       const list = await getAuctions();
       res.json({ auctions: list });
     } catch (error) {
-      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load auctions.' });
+      res.status(500).json(getErrorMessageAndCode('Failed to load auctions.', 'FETCH_AUCTIONS_FAILED', error));
     }
   });
 
@@ -575,12 +606,12 @@ async function startServer() {
       const auction = await getAuctionById(req.params.id);
 
       if (!auction) {
-        return res.status(404).json({ error: 'Auction not found' });
+        return res.status(404).json(makeError('Auction not found', 'AUCTION_NOT_FOUND'));
       }
 
       res.json({ auction });
     } catch (error) {
-      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load the auction.' });
+      res.status(500).json(getErrorMessageAndCode('Failed to load the auction.', 'FETCH_AUCTION_FAILED', error));
     }
   });
 
@@ -588,19 +619,19 @@ async function startServer() {
     try {
       const authHeader = req.headers.authorization;
       if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Authentication required to create a listing.' });
+        return res.status(401).json(makeError('Authentication required to create a listing.', 'UNAUTHORIZED'));
       }
 
       const token = authHeader.replace('Bearer ', '').trim();
       const user = await getAuthenticatedUser(token);
 
       if (!user) {
-        return res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
+        return res.status(401).json(makeError('Your session has expired. Please sign in again.', 'SESSION_EXPIRED'));
       }
 
       const validated = validateAuctionInput(req.body);
       if ('error' in validated) {
-        return res.status(400).json({ error: validated.error });
+        return res.status(400).json(validated);
       }
 
       const maxListingsPerUser = Number(process.env.MAX_LISTINGS_PER_USER ?? '20');
@@ -614,7 +645,7 @@ async function startServer() {
       }
 
       if ((count ?? 0) >= maxListingsPerUser) {
-        return res.status(429).json({ error: `You have reached the limit of ${maxListingsPerUser} listings per user.` });
+        return res.status(429).json(makeError(`You have reached the limit of ${maxListingsPerUser} listings per user.`, 'LISTING_LIMIT_REACHED'));
       }
 
       const now = Date.now();
@@ -684,7 +715,7 @@ async function startServer() {
 
       res.status(201).json({ auction });
     } catch (error) {
-      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to create the auction.' });
+      res.status(500).json(getErrorMessageAndCode('Failed to create the auction.', 'CREATE_AUCTION_FAILED', error));
     }
   });
 

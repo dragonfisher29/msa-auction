@@ -2,13 +2,13 @@ import { createClient } from '@supabase/supabase-js';
 
 function getSupabaseClient(env: Record<string, any>) {
   const supabaseUrl = env.SUPABASE_URL ?? '';
-  const supabaseServiceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY ?? '';
+  const supabaseSecretKey = env.SUPABASE_SECRET_KEY ?? env.SUPABASE_SERVICE_ROLE_KEY ?? '';
 
-  if (!supabaseUrl || !supabaseServiceRoleKey || supabaseUrl.includes('your-project')) {
+  if (!supabaseUrl || !supabaseSecretKey || supabaseUrl.includes('your-project')) {
     return null;
   }
 
-  return createClient(supabaseUrl, supabaseServiceRoleKey, {
+  return createClient(supabaseUrl, supabaseSecretKey, {
     auth: {
       persistSession: false,
       autoRefreshToken: false,
@@ -61,9 +61,39 @@ async function hashSecret(value: string) {
     .join('');
 }
 
+function getErrorMessageAndCode(fallbackMessage: string, defaultCode: string, error?: unknown): { error: string; code: string } {
+  if (typeof error === 'object' && error !== null) {
+    const errObj = error as Record<string, any>;
+    const code = String(errObj.code || defaultCode);
+    const detailMsg = errObj.message || errObj.details || errObj.error_description;
+    const baseMsg = detailMsg ? String(detailMsg) : (error instanceof Error ? error.message : fallbackMessage);
+    return {
+      error: `${baseMsg} [Code: ${code}]`,
+      code,
+    };
+  }
+  if (error instanceof Error) {
+    return {
+      error: `${error.message} [Code: ${defaultCode}]`,
+      code: defaultCode,
+    };
+  }
+  return {
+    error: `${fallbackMessage} [Code: ${defaultCode}]`,
+    code: defaultCode,
+  };
+}
+
+function makeError(message: string, code: string): { error: string; code: string } {
+  return {
+    error: `${message} [Code: ${code}]`,
+    code,
+  };
+}
+
 function validateAuctionInput(raw: any) {
   if (!raw || typeof raw !== 'object') {
-    return { error: 'Invalid auction payload.' };
+    return makeError('Invalid auction payload.', 'INVALID_PAYLOAD');
   }
 
   const title = typeof raw.title === 'string' ? raw.title.trim() : '';
@@ -71,17 +101,17 @@ function validateAuctionInput(raw: any) {
   const phoneNumber = typeof raw.phoneNumber === 'string' ? raw.phoneNumber.trim() : '';
 
   if (!title || !description || !phoneNumber) {
-    return { error: 'Title, description, and phone number are required.' };
+    return makeError('Title, description, and phone number are required.', 'MISSING_FIELDS');
   }
 
   const parsedPrice = Number(raw.startingPrice);
   if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
-    return { error: 'Starting price must be greater than $0.' };
+    return makeError('Starting price must be greater than $0.', 'INVALID_PRICE');
   }
 
   const parsedDuration = Number(raw.durationMinutes);
   if (!Number.isInteger(parsedDuration) || parsedDuration <= 0) {
-    return { error: 'Auction duration must be at least 1 minute.' };
+    return makeError('Auction duration must be at least 1 minute.', 'INVALID_DURATION');
   }
 
   const normalizedImageUrls = Array.isArray(raw.imageUrls)
@@ -97,11 +127,11 @@ function validateAuctionInput(raw: any) {
   }
 
   if (normalizedImageUrls.length === 0) {
-    return { error: 'Please upload at least one image for the listing.' };
+    return makeError('Please upload at least one image for the listing.', 'MISSING_IMAGES');
   }
 
   if (normalizedImageUrls.length > 3) {
-    return { error: 'You can upload up to 3 images per listing.' };
+    return makeError('You can upload up to 3 images per listing.', 'TOO_MANY_IMAGES');
   }
 
   return {
@@ -142,7 +172,7 @@ export default {
 
     if (request.method === 'POST' && url.pathname === '/api/auth/register') {
       if (!supabase) {
-        return jsonResponse({ error: 'Supabase env vars are not configured.' }, { status: 500 });
+        return jsonResponse(makeError('Supabase env vars are not configured.', 'CONFIG_ERROR'), { status: 500 });
       }
 
       try {
@@ -152,7 +182,7 @@ export default {
         const password = String(body.password ?? '').trim();
 
         if (!username || !name || !password) {
-          return jsonResponse({ error: 'Username, name, and password are required.' }, { status: 400 });
+          return jsonResponse(makeError('Username, name, and password are required.', 'MISSING_FIELDS'), { status: 400 });
         }
 
         const { data: existingUser, error: existingError } = await supabase
@@ -166,7 +196,7 @@ export default {
         }
 
         if (existingUser) {
-          return jsonResponse({ error: 'Username is already taken. Please choose another.' }, { status: 409 });
+          return jsonResponse(makeError('Username is already taken. Please choose another.', 'USERNAME_TAKEN'), { status: 409 });
         }
 
         const passwordHash = await hashSecret(password);
@@ -190,13 +220,13 @@ export default {
 
         return jsonResponse({ user: { id, name, username, token } }, { status: 201 });
       } catch (error) {
-        return jsonResponse({ error: error instanceof Error ? error.message : 'Registration failed.' }, { status: 500 });
+        return jsonResponse(getErrorMessageAndCode('Registration failed.', 'REGISTER_FAILED', error), { status: 500 });
       }
     }
 
     if (request.method === 'POST' && url.pathname === '/api/auth/login') {
       if (!supabase) {
-        return jsonResponse({ error: 'Supabase env vars are not configured.' }, { status: 500 });
+        return jsonResponse(makeError('Supabase env vars are not configured.', 'CONFIG_ERROR'), { status: 500 });
       }
 
       try {
@@ -205,7 +235,7 @@ export default {
         const password = String(body.password ?? '').trim();
 
         if (!username || !password) {
-          return jsonResponse({ error: 'Username and password are required.' }, { status: 400 });
+          return jsonResponse(makeError('Username and password are required.', 'MISSING_FIELDS'), { status: 400 });
         }
 
         const { data: storedUser, error: fetchError } = await supabase
@@ -219,12 +249,12 @@ export default {
         }
 
         if (!storedUser) {
-          return jsonResponse({ error: 'Invalid username or password.' }, { status: 401 });
+          return jsonResponse(makeError('Invalid username or password.', 'INVALID_CREDENTIALS'), { status: 401 });
         }
 
         const passwordHash = await hashSecret(password);
         if (storedUser.password_hash !== passwordHash) {
-          return jsonResponse({ error: 'Invalid username or password.' }, { status: 401 });
+          return jsonResponse(makeError('Invalid username or password.', 'INVALID_CREDENTIALS'), { status: 401 });
         }
 
         const token = `tok_${crypto.randomUUID()}`;
@@ -243,7 +273,7 @@ export default {
           },
         });
       } catch (error) {
-        return jsonResponse({ error: error instanceof Error ? error.message : 'Login failed.' }, { status: 500 });
+        return jsonResponse(getErrorMessageAndCode('Login failed.', 'LOGIN_FAILED', error), { status: 500 });
       }
     }
 
@@ -251,25 +281,25 @@ export default {
       try {
         const authHeader = request.headers.get('authorization') ?? '';
         if (!authHeader.startsWith('Bearer ')) {
-          return jsonResponse({ error: 'Not authenticated' }, { status: 401 });
+          return jsonResponse(makeError('Not authenticated', 'UNAUTHORIZED'), { status: 401 });
         }
 
         const token = authHeader.replace('Bearer ', '').trim();
         const user = await getAuthenticatedUser(supabase, token);
 
         if (!user) {
-          return jsonResponse({ error: 'Session expired or invalid' }, { status: 401 });
+          return jsonResponse(makeError('Session expired or invalid', 'SESSION_INVALID'), { status: 401 });
         }
 
         return jsonResponse({ user: { id: user.id, name: user.name, username: user.username, token } });
       } catch (error) {
-        return jsonResponse({ error: error instanceof Error ? error.message : 'Failed to load your session.' }, { status: 500 });
+        return jsonResponse(getErrorMessageAndCode('Failed to load your session.', 'SESSION_ERROR', error), { status: 500 });
       }
     }
 
     if (request.method === 'GET' && url.pathname === '/api/auctions') {
       if (!supabase) {
-        return jsonResponse({ error: 'Supabase env vars are not configured.' }, { status: 500 });
+        return jsonResponse(makeError('Supabase env vars are not configured.', 'CONFIG_ERROR'), { status: 500 });
       }
 
       try {
@@ -304,14 +334,14 @@ export default {
           createdAt: Number(row.created_at ?? row.createdAt),
         })) });
       } catch (error) {
-        return jsonResponse({ error: error instanceof Error ? error.message : 'Failed to load auctions.' }, { status: 500 });
+        return jsonResponse(getErrorMessageAndCode('Failed to load auctions.', 'FETCH_AUCTIONS_FAILED', error), { status: 500 });
       }
     }
 
     const singleAuctionMatch = url.pathname.match(/^\/api\/auctions\/([^/]+)$/);
     if (request.method === 'GET' && singleAuctionMatch) {
       if (!supabase) {
-        return jsonResponse({ error: 'Supabase env vars are not configured.' }, { status: 500 });
+        return jsonResponse(makeError('Supabase env vars are not configured.', 'CONFIG_ERROR'), { status: 500 });
       }
 
       try {
@@ -319,7 +349,7 @@ export default {
         const { data: row, error } = await supabase.from('auctions').select('*').eq('id', auctionId).maybeSingle();
 
         if (error) throw error;
-        if (!row) return jsonResponse({ error: 'Auction not found' }, { status: 404 });
+        if (!row) return jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 });
 
         return jsonResponse({
           auction: {
@@ -348,32 +378,32 @@ export default {
           },
         });
       } catch (error) {
-        return jsonResponse({ error: error instanceof Error ? error.message : 'Failed to load auction.' }, { status: 500 });
+        return jsonResponse(getErrorMessageAndCode('Failed to load auction.', 'FETCH_AUCTION_FAILED', error), { status: 500 });
       }
     }
 
     if (request.method === 'POST' && url.pathname === '/api/auctions') {
       if (!supabase) {
-        return jsonResponse({ error: 'Supabase env vars are not configured.' }, { status: 500 });
+        return jsonResponse(makeError('Supabase env vars are not configured.', 'CONFIG_ERROR'), { status: 500 });
       }
 
       try {
         const authHeader = request.headers.get('authorization') ?? '';
         if (!authHeader.startsWith('Bearer ')) {
-          return jsonResponse({ error: 'Authentication required to create a listing.' }, { status: 401 });
+          return jsonResponse(makeError('Authentication required to create a listing.', 'UNAUTHORIZED'), { status: 401 });
         }
 
         const token = authHeader.replace('Bearer ', '').trim();
         const user = await getAuthenticatedUser(supabase, token);
 
         if (!user) {
-          return jsonResponse({ error: 'Your session has expired. Please sign in again.' }, { status: 401 });
+          return jsonResponse(makeError('Your session has expired. Please sign in again.', 'SESSION_EXPIRED'), { status: 401 });
         }
 
         const rawBody = await request.json();
         const validated = validateAuctionInput(rawBody);
         if ('error' in validated) {
-          return jsonResponse({ error: validated.error }, { status: 400 });
+          return jsonResponse(validated, { status: 400 });
         }
 
         const maxListingsPerUser = Number(env.MAX_LISTINGS_PER_USER ?? '20');
@@ -384,7 +414,7 @@ export default {
 
         if (countError) throw countError;
         if ((count ?? 0) >= maxListingsPerUser) {
-          return jsonResponse({ error: `You have reached the limit of ${maxListingsPerUser} listings per user.` }, { status: 429 });
+          return jsonResponse(makeError(`You have reached the limit of ${maxListingsPerUser} listings per user.`, 'LISTING_LIMIT_REACHED'), { status: 429 });
         }
 
         const now = Date.now();
@@ -447,14 +477,14 @@ export default {
 
         return jsonResponse({ auction }, { status: 201 });
       } catch (error) {
-        return jsonResponse({ error: error instanceof Error ? error.message : 'Failed to create auction.' }, { status: 500 });
+        return jsonResponse(getErrorMessageAndCode('Failed to create auction.', 'CREATE_AUCTION_FAILED', error), { status: 500 });
       }
     }
 
     const bidMatch = url.pathname.match(/^\/api\/auctions\/([^/]+)\/bids$/);
     if (request.method === 'POST' && bidMatch) {
       if (!supabase) {
-        return jsonResponse({ error: 'Supabase env vars are not configured.' }, { status: 500 });
+        return jsonResponse(makeError('Supabase env vars are not configured.', 'CONFIG_ERROR'), { status: 500 });
       }
 
       try {
@@ -469,7 +499,7 @@ export default {
           .maybeSingle();
 
         if (fetchErr || !rawAuction) {
-          return jsonResponse({ error: 'Auction listing was not found.' }, { status: 404 });
+          return jsonResponse(makeError('Auction listing was not found.', 'AUCTION_NOT_FOUND'), { status: 404 });
         }
 
         const bids = Array.isArray(rawAuction.bids) ? rawAuction.bids : [];
@@ -479,24 +509,24 @@ export default {
         const endTime = Number(rawAuction.end_time ?? rawAuction.endTime);
 
         if (rawAuction.status === 'ended' || Date.now() >= endTime) {
-          return jsonResponse({ error: 'This auction has already ended.' }, { status: 400 });
+          return jsonResponse(makeError('This auction has already ended.', 'AUCTION_ENDED'), { status: 400 });
         }
 
         if (sellerId === userId) {
-          return jsonResponse({ error: 'You cannot place a bid on your own listing.' }, { status: 400 });
+          return jsonResponse(makeError('You cannot place a bid on your own listing.', 'CANNOT_BID_OWN_LISTING'), { status: 400 });
         }
 
         const numericAmount = Number(amount);
         if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
-          return jsonResponse({ error: 'Please enter a valid bid amount.' }, { status: 400 });
+          return jsonResponse(makeError('Please enter a valid bid amount.', 'INVALID_BID_AMOUNT'), { status: 400 });
         }
 
         if (bids.length === 0) {
           if (numericAmount < startingPrice) {
-            return jsonResponse({ error: `Starting bid must be at least $${startingPrice.toLocaleString()}.` }, { status: 400 });
+            return jsonResponse(makeError(`Starting bid must be at least $${startingPrice.toLocaleString()}.`, 'BID_TOO_LOW'), { status: 400 });
           }
         } else if (numericAmount <= currentPrice) {
-          return jsonResponse({ error: `Bid must be strictly higher than current bid of $${currentPrice.toLocaleString()}.` }, { status: 400 });
+          return jsonResponse(makeError(`Bid must be strictly higher than current bid of $${currentPrice.toLocaleString()}.`, 'BID_TOO_LOW'), { status: 400 });
         }
 
         const newBid = {
@@ -521,15 +551,15 @@ export default {
           .eq('id', auctionId);
 
         if (updateErr) {
-          return jsonResponse({ error: 'Unable to place the bid right now.' }, { status: 500 });
+          return jsonResponse(getErrorMessageAndCode('Unable to place the bid right now.', 'BID_UPDATE_FAILED', updateErr), { status: 500 });
         }
 
         return jsonResponse({ success: true, bid: newBid });
       } catch (error) {
-        return jsonResponse({ error: error instanceof Error ? error.message : 'Failed to place bid.' }, { status: 500 });
+        return jsonResponse(getErrorMessageAndCode('Failed to place bid.', 'PLACE_BID_FAILED', error), { status: 500 });
       }
     }
 
-    return jsonResponse({ error: 'Not found' }, { status: 404 });
+    return jsonResponse(makeError('Route not found.', 'NOT_FOUND'), { status: 404 });
   },
 };
