@@ -1,4 +1,4 @@
-name = "msa-auction-api"
+name = "msa-auction"
 main = "./workers/index.ts"
 compatibility_date = "2026-09-09"
 
