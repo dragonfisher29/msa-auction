@@ -1,6 +1,6 @@
 # MSA Auction
 
-A full-stack auction app with React + Vite on the frontend and a local SQLite-backed Express server for development. The project also includes a Cloudflare-ready D1 + R2 structure for deployment, including authenticated register/login, image uploads, and listing limits.
+A full-stack auction app with React + Vite on the frontend, an Express + Socket.io backend, and a Supabase-backed database for authentication, auctions, and listing persistence.
 
 ## Features
 
@@ -8,112 +8,223 @@ A full-stack auction app with React + Vite on the frontend and a local SQLite-ba
 - Register/login-only auth flow
 - Create listings with up to 3 images per auction
 - Client-side image compression before submission
-- Persistent local SQLite storage for development
-- Cloudflare D1 + R2 route scaffolding for deployment
-- Configurable limits for listings per user and images per listing
+- Supabase-backed persistence for users and auctions
+- Configurable listing limit per user via environment variables
 
 ## Current Architecture
 
-This workspace currently supports two environments:
+The app now uses:
 
-1. Local development: Express + Socket.io + better-sqlite3
-2. Cloudflare deployment: Pages Functions with D1 and R2 bindings
+- Frontend: React + Vite + TypeScript
+- Backend: Express + Socket.io + TypeScript
+- Database: Supabase
+- Storage: Supabase tables for `users` and `auctions`
 
-The local development path remains in `server.ts`, while the Cloudflare-specific API routes live in `functions/` and use `wrangler.toml` bindings.
+The local development server in `server.ts` now talks directly to Supabase using the service-role key.
 
 ## Tech Stack
 
 - Frontend: React + Vite + TypeScript
-- Local backend: Express + Socket.io + TypeScript + SQLite
-- Cloudflare backend: Pages Functions, D1, R2
+- Backend: Express + Socket.io + TypeScript
+- Database: Supabase
 - Styling: Tailwind CSS
 
 ## Prerequisites
 
 - Node.js 18+
 - npm
-- Cloudflare account if you want to deploy the D1/R2 version
+- Supabase project with a URL and service-role key
 
 ## Local Development
 
-### Install dependencies
+### 1. Install dependencies
 
 ```bash
 npm install
 ```
 
-### Start the app
+### 2. Create environment variables
+
+Add the following values to a `.env` file:
+
+```bash
+SUPABASE_URL="https://your-project.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY="your-service-role-key"
+MAX_LISTINGS_PER_USER="20"
+```
+
+### 3. Start the app
 
 ```bash
 npm run dev
 ```
 
-This launches the local Express server on port `3000`, which serves the Vite frontend and provides the API and live auction features.
+This launches the local Express server on port `3000`, which serves the Vite frontend and uses Supabase for the API and live auction data.
 
-### Build for local production
+### 4. Build and run locally
 
 ```bash
 npm run build
-```
-
-### Run the built local server
-
-```bash
 npm run start
 ```
 
-### Type-check and lint
+### 5. Type-check and lint
 
 ```bash
 npm run lint
 ```
 
-## Cloudflare D1 + R2 Setup
+## Cloudflare + Supabase Deployment
 
-The Cloudflare deployment files are already scaffolded in this repo:
+This project is currently structured as:
 
-- `functions/api/auth/register.ts`
-- `functions/api/auth/login.ts`
-- `functions/api/auth/me.ts`
-- `functions/api/auctions.ts`
-- `functions/lib/cloudflare.ts`
-- `wrangler.toml`
+- Frontend: React + Vite
+- Backend: Express + Socket.io
+- Database: Supabase
+- Hosting: Cloudflare Pages for the static frontend, with the Express backend running on a Node-compatible host
 
-### Required Cloudflare configuration
+> The current code in `server.ts` is an Express server, so it is not a direct Cloudflare Worker deployment. The simplest Cloudflare setup is to deploy the frontend to Cloudflare Pages and keep the backend running on a Node host (for example Railway, Render, DigitalOcean, or another VPS/provider).
 
-1. Create or select a D1 database.
-2. Create an R2 bucket for uploaded listing images.
-3. Update `wrangler.toml` with your real D1 database id and R2 bucket name.
-4. Deploy with Wrangler.
+### 1. Create the Supabase project
 
-Example values to replace in `wrangler.toml`:
+1. Create a new Supabase project in the Supabase dashboard.
+2. Go to Project Settings → API and copy:
+   - `Project URL`
+   - `service_role` key
+3. Create the `users` and `auctions` tables using the SQL shown in the Supabase Setup section below.
 
-```toml
-[[d1_databases]]
-binding = "DB"
-database_name = "msa-auction"
-database_id = "replace-with-your-d1-database-id"
+### 2. Configure environment variables
 
-[[r2_buckets]]
-binding = "R2_BUCKET"
-bucket_name = "msa-auction-images"
+For local development, use a `.env` file with:
+
+```bash
+SUPABASE_URL="https://your-project.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY="your-service-role-key"
+MAX_LISTINGS_PER_USER="20"
 ```
 
-### Cloudflare limits
+For deployment, keep the Supabase service-role key on the backend only. Do not expose it in the browser or in Cloudflare Pages environment variables if you are not using a backend on Cloudflare.
 
-The current `wrangler.toml` sets:
+### 3. Deploy the frontend to Cloudflare Pages
 
-- `MAX_LISTINGS_PER_USER = "20"`
-- `MAX_IMAGES_PER_LISTING = "3"`
+1. Push the project to GitHub.
+2. In Cloudflare Dashboard → Pages, create a new project from the repository.
+3. Use these build settings:
+   - Build command: `npm run build`
+   - Output directory: `dist`
+4. If you want the frontend to reach a hosted backend, add a frontend environment variable such as:
 
-These values can be adjusted in the `[vars]` section.
+```bash
+VITE_API_BASE_URL="https://your-backend-domain.com"
+```
+
+> The current frontend code uses relative API paths (`/api/...`), so the built frontend will work correctly when served together with the Express backend locally.
+
+### 4. Deploy the backend separately
+
+Because `server.ts` is an Express app, deploy it to a Node-capable environment and set the same environment variables there:
+
+```bash
+SUPABASE_URL="https://your-project.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY="your-service-role-key"
+MAX_LISTINGS_PER_USER="20"
+```
+
+Then start the server with:
+
+```bash
+npm install
+npm run build
+npm run start
+```
+
+This is the recommended deployment flow if you want Cloudflare Pages for hosting and Supabase for the database.
+
+### 5. Optional: Cloudflare R2 for images
+
+If you later want to store uploaded listing images in Cloudflare instead of only storing image URLs, you can add Cloudflare R2 support as a separate step. The current app already supports compressed image uploads and stores image URLs in the auction record, so R2 is optional and not required for the current setup.
+
+## Supabase Setup
+
+### 1. Add your env values
+In your local .env, make sure you have:
+```bash
+SUPABASE_URL="https://your-project.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY="your-service-role-key"
+MAX_LISTINGS_PER_USER="20"
+```
+
+> You can copy from .env.example and replace the placeholder values.
+
+### 2. Create the Supabase tables
+Open Supabase → SQL Editor and run this:
+
+```SQL
+create table if not exists public.users (
+  id text primary key,
+  name text not null,
+  username text not null unique,
+  password_hash text not null,
+  token text,
+  created_at bigint not null
+);
+
+create table if not exists public.auctions (
+  id text primary key,
+  title text not null,
+  description text not null,
+  phone_number text not null,
+  starting_price double precision not null,
+  current_price double precision not null,
+  seller_id text not null,
+  seller_name text not null,
+  highest_bidder_id text,
+  highest_bidder_name text,
+  duration_minutes integer not null,
+  start_time bigint not null,
+  end_time bigint not null,
+  status text not null default 'active',
+  category text default 'General',
+  image_url text,
+  image_urls jsonb not null default '[]'::jsonb,
+  bids jsonb not null default '[]'::jsonb,
+  winner_id text,
+  winner_name text,
+  winning_bid double precision,
+  created_at bigint not null
+);
+
+create index if not exists idx_users_username
+  on public.users (username);
+
+create index if not exists idx_auctions_seller_id
+  on public.auctions (seller_id);
+
+create index if not exists idx_auctions_status
+  on public.auctions (status);
+```
+
+> The column names above are important because server.ts expects password_hash, phone_number, starting_price, seller_id, image_urls, etc.
+
+### 3. Get your Supabase credentials
+In Supabase Dashboard:
+
+- Project URL:
+  +  Go to Project Settings → API
+  + Copy the Project URL
+
+- Service role key:
+   + Go to Project Settings → API
+   + Copy the service_role key
+> Keep that key server-side only. Do not expose it to the browser.
+
 
 ## Image Upload Rules
 
 - Up to 3 images per listing
 - Images are compressed client-side before upload
-- Images must be valid `data:image/...` payloads or public URLs
-- The Cloudflare version uploads image data directly to R2
+- Images are passed as `data:image/...` payloads or public URLs
+- The server expects those URLs to be stored in the auction record
 
 ## Auth Flow
 
@@ -125,7 +236,6 @@ The app uses a login/register-only flow.
 
 ## Notes
 
-- Local development uses the persistent `auction.db` SQLite file.
-- Cloudflare routes are separate from the local Express server and are intended for deployment use.
-- The README assumes you will configure the Cloudflare bindings yourself before deployment.
 - Demo users are intentionally removed from the app, so new accounts must be created through the UI.
+- The app currently expects a Supabase service-role key on the server for authenticated database operations.
+- If you want to harden the setup, you can replace the server-side service-role usage with Supabase Row Level Security policies and a separate anon client later.
