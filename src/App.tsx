@@ -450,6 +450,9 @@ export default function App() {
           <p className="text-[11px]">
             Built by <a href="https://github.com/dragonfisher29">dragonfisher29</a>
           </p>
+          <p className="text-[11px]">
+            Got a suggestion? <a href="https://docs.google.com/forms/d/e/1FAIpQLSdp-VsPtay7wMH34NLl0ru_3bEMJbYCzw5RC0J6AJs7qXP3wQ/viewform?usp=header">Click HERE</a>
+          </p>
         </div>
       </footer>
 
