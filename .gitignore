@@ -8,3 +8,6 @@ coverage/
 !.env.example
 .dev.vars
 bun.lock
+.claude
+test-results/
+playwright-report/

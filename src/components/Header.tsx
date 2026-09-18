@@ -1,5 +1,5 @@
 import React from 'react';
-import { Gavel, Plus, User as UserIcon, LogOut, Radio, ShieldCheck } from 'lucide-react';
+import { Plus, User as UserIcon, LogOut, Radio } from 'lucide-react';
 import { User } from '../types';
 
 interface HeaderProps {
@@ -25,9 +25,11 @@ export const Header: React.FC<HeaderProps> = ({
         
         {/* Brand Logo & Title */}
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-[#abc4ff] border border-[#ccdbfd] flex items-center justify-center shadow-xs text-[#1e293b]">
-            <Gavel className="w-5 h-5" />
-          </div>
+          <img
+            src="/MSA_Logo.png"
+            alt="MSA Auction logo"
+            className="w-10 h-10 rounded-xl object-contain bg-[#abc4ff] border border-[#ccdbfd] shadow-xs shrink-0"
+          />
           <div>
             <div className="flex items-center gap-2">
               <h1 className="text-xl font-extrabold tracking-tight text-[#1e293b]">
@@ -43,8 +45,11 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
         </div>
 
-        {/* Center Live Socket Status */}
-        <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-full bg-[#d7e3fc] border border-[#ccdbfd] text-xs font-semibold text-[#1e293b]">
+        {/* Center Live Connection Status */}
+        <div
+          data-testid="connection-status"
+          className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-full bg-[#d7e3fc] border border-[#ccdbfd] text-xs font-semibold text-[#1e293b]"
+        >
           <span className="relative flex h-2.5 w-2.5">
             {isConnected ? (
               <>
@@ -56,7 +61,7 @@ export const Header: React.FC<HeaderProps> = ({
             )}
           </span>
           <Radio className="w-3.5 h-3.5 opacity-80" />
-          <span>{isConnected ? 'Socket.io Connected' : 'Connecting to Server...'}</span>
+          <span>{isConnected ? 'Live' : 'Reconnecting...'}</span>
         </div>
 
         {/* Right Action Controls & User Profile */}

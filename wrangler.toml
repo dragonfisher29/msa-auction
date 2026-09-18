@@ -6,10 +6,20 @@ compatibility_date = "2026-09-09"
 directory = "./dist"
 not_found_handling = "single-page-application"
 
+# Everything under [vars] is PLAINTEXT configuration. It is committed to this repo,
+# readable in git history, and visible in the Cloudflare dashboard. Never put a
+# credential here.
 [vars]
 SUPABASE_URL = "https://ygyvsowniuoszlsahrvl.supabase.co"
-SUPABASE_SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlneXZzb3duaXVvc3psc2FocnZsIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4ODk3MDQxMiwiZXhwIjoyMTA0NTQ2NDEyfQ.rCx6xx9OIvLeReok4FBwmp9OXi1GSXHCWd_MZ_zeP7E"
 MAX_LISTINGS_PER_USER = "20"
+
+# SUPABASE_SERVICE_ROLE_KEY is a SECRET and must never appear in [vars] --
+# not even as a placeholder. It bypasses all Supabase row-level security.
+# Set it as an encrypted Worker secret instead:
+#   npx wrangler secret put SUPABASE_SERVICE_ROLE_KEY
+# For local development put it in .dev.vars (git-ignored), not in this file.
+# At runtime the secret arrives on the same `env` object as the [vars] above,
+# so workers/index.ts needs no change.
 
 [observability]
 enabled = true

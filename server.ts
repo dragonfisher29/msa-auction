@@ -1,3 +1,15 @@
+/**
+ * LOCAL DEV SERVER ONLY.
+ *
+ * Production runs the Cloudflare Worker in `workers/index.ts`, which is a plain
+ * fetch handler with no Socket.io server attached. The client no longer speaks
+ * Socket.io at all: it talks to the REST API (`/api/...`) and polls for updates
+ * via `src/lib/realtime.ts`.
+ *
+ * The Socket.io handlers below are therefore legacy and local-only — nothing in
+ * the current client emits or listens to them. The Express REST routes here still
+ * mirror the Worker's routes and are what `npm run dev` actually serves.
+ */
 import 'dotenv/config';
 import express from 'express';
 import http from 'http';
@@ -757,6 +769,89 @@ async function startServer() {
       res.status(201).json({ auction });
     } catch (error) {
       res.status(500).json(getErrorMessageAndCode('Failed to create the auction.', 'CREATE_AUCTION_FAILED', error));
+    }
+  });
+
+  // Mirrors the `place_bid` Socket.io handler above so bidding works over the
+  // REST API in local dev, matching the Cloudflare Worker's contract.
+  app.post('/api/auctions/:id/bids', async (req, res) => {
+    try {
+      const auctionId = req.params.id;
+      const { userId, userName, amount } = req.body;
+
+      const auction = await getAuctionById(auctionId);
+
+      if (!auction) {
+        return res.status(404).json(makeError('Auction listing was not found.', 'AUCTION_NOT_FOUND'));
+      }
+
+      if (auction.status === 'ended' || Date.now() >= auction.endTime) {
+        return res.status(400).json(makeError('This auction has already ended.', 'AUCTION_ENDED'));
+      }
+
+      if (auction.sellerId === userId) {
+        return res.status(400).json(makeError('You cannot place a bid on your own listing.', 'CANNOT_BID_OWN_LISTING'));
+      }
+
+      const numericAmount = Number(amount);
+      if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+        return res.status(400).json(makeError('Please enter a valid bid amount.', 'INVALID_BID_AMOUNT'));
+      }
+
+      if (auction.bids.length === 0) {
+        if (numericAmount < auction.startingPrice) {
+          return res.status(400).json(makeError(`Starting bid must be at least £${auction.startingPrice.toLocaleString()}.`, 'BID_TOO_LOW'));
+        }
+      } else if (numericAmount <= auction.currentPrice) {
+        return res.status(400).json(makeError(`Bid must be strictly higher than current bid of £${auction.currentPrice.toLocaleString()}.`, 'BID_TOO_LOW'));
+      }
+
+      const newBid: Bid = {
+        id: `bid_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        auctionId,
+        userId,
+        userName,
+        amount: numericAmount,
+        timestamp: Date.now(),
+      };
+
+      const updatedBids = [newBid, ...auction.bids];
+
+      const { error } = await supabase
+        .from('auctions')
+        .update({
+          bids: updatedBids,
+          current_price: numericAmount,
+          highest_bidder_id: userId,
+          highest_bidder_name: userName,
+        })
+        .eq('id', auctionId);
+
+      if (error) {
+        return res.status(500).json(getErrorMessageAndCode('Unable to place the bid right now.', 'BID_UPDATE_FAILED', error));
+      }
+
+      const updatedAuction = await getAuctionById(auctionId);
+
+      if (updatedAuction) {
+        io.to(`auction:${auctionId}`).emit('bid_updated', {
+          auctionId,
+          currentPrice: updatedAuction.currentPrice,
+          highestBidderId: updatedAuction.highestBidderId,
+          highestBidderName: updatedAuction.highestBidderName,
+          bid: newBid,
+          auction: updatedAuction,
+        });
+
+        io.emit('auction_list_updated', {
+          type: 'bid',
+          auction: updatedAuction,
+        });
+      }
+
+      res.json({ success: true, bid: newBid });
+    } catch (error) {
+      res.status(500).json(getErrorMessageAndCode('Failed to place the bid.', 'PLACE_BID_FAILED', error));
     }
   });
 

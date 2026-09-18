@@ -28,7 +28,7 @@ import { AuctionDetailModal } from './components/AuctionDetailModal';
 import { CreateListingModal } from './components/CreateListingModal';
 import { AuthModal } from './components/AuthModal';
 import { apiFetch } from './lib/api';
-import { getSocket } from './lib/socket';
+import { startPolling, checkHealth } from './lib/realtime';
 
 const CATEGORIES = [
   { id: 'All', label: 'All Categories', icon: Layers },
@@ -102,9 +102,14 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setAuctions(data.auctions || []);
+        // Resolve the header status from the very first fetch instead of waiting for a health tick
+        setIsConnected(true);
+      } else {
+        setIsConnected(false);
       }
     } catch (err) {
       console.error('Failed to load auctions:', err);
+      setIsConnected(false);
     } finally {
       setIsLoading(false);
     }
@@ -114,38 +119,47 @@ export default function App() {
     fetchAuctions();
   }, []);
 
-  // Real-time Global Socket.io listeners
+  // Live auction feed: the Cloudflare Worker is REST-only, so we poll instead of using sockets
   useEffect(() => {
-    const socket = getSocket();
-
-    const onConnect = () => setIsConnected(true);
-    const onDisconnect = () => setIsConnected(false);
-
-    if (socket.connected) {
-      setIsConnected(true);
-    }
-
-    socket.on('connect', onConnect);
-    socket.on('disconnect', onDisconnect);
-
-    // Global listener for auction updates (new listing created, bid placed, auction ended)
-    socket.on('auction_list_updated', ({ type, auction }: { type: string; auction: AuctionItem }) => {
-      setAuctions((prev) => {
-        const exists = prev.some((a) => a.id === auction.id);
-        if (!exists) {
-          return [auction, ...prev];
+    // Global auction list (new listings, bids placed, auctions ended)
+    const stopAuctionsPoll = startPolling<AuctionItem[]>(
+      async () => {
+        const res = await apiFetch('/api/auctions');
+        if (!res.ok) {
+          throw new Error(`Auction feed responded with ${res.status}`);
         }
-        return prev.map((a) => (a.id === auction.id ? auction : a));
-      });
+        const data = await res.json();
+        return (data.auctions || []) as AuctionItem[];
+      },
+      5000,
+      (nextAuctions) => {
+        setIsConnected(true);
 
-      // Also update currently active modal if open
-      setSelectedAuction((curr) => (curr && curr.id === auction.id ? auction : curr));
+        setAuctions((prev) => {
+          const serverById = new Map(nextAuctions.map((a) => [a.id, a]));
+          const knownIds = new Set(prev.map((a) => a.id));
+          // Server rows win; brand-new rows are prepended, local-only rows are kept
+          const updated = prev.map((a) => serverById.get(a.id) ?? a);
+          const added = nextAuctions.filter((a) => !knownIds.has(a.id));
+          return [...added, ...updated];
+        });
+
+        // Also update currently active modal if open
+        setSelectedAuction((curr) => {
+          if (!curr) return curr;
+          return nextAuctions.find((a) => a.id === curr.id) ?? curr;
+        });
+      },
+    );
+
+    // Slower health ping drives the connection indicator in the header
+    const stopHealthPoll = startPolling<boolean>(checkHealth, 15000, (isHealthy) => {
+      setIsConnected(isHealthy);
     });
 
     return () => {
-      socket.off('connect', onConnect);
-      socket.off('disconnect', onDisconnect);
-      socket.off('auction_list_updated');
+      stopAuctionsPoll();
+      stopHealthPoll();
     };
   }, []);
 

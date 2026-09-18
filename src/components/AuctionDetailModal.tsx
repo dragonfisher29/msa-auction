@@ -16,9 +16,17 @@ import {
   ShieldCheck,
   Send,
 } from 'lucide-react';
-import { AuctionItem, User, Bid, BidUpdatePayload, AuctionEndedPayload } from '../types';
-import { formatCurrency, formatTimeRemaining, formatTimestamp } from '../lib/formatters';
-import { getSocket } from '../lib/socket';
+import { AuctionItem, User } from '../types';
+import { formatCurrency, formatCurrencyPrecise, formatTimeRemaining, formatTimestamp } from '../lib/formatters';
+import { apiFetch } from '../lib/api';
+import { startPolling } from '../lib/realtime';
+
+// The API appends a machine-readable " [Code: SOME_CODE]" suffix to error messages for API
+// consumers and logs (see workers/index.ts). That suffix is not meant for end users, so strip
+// it before rendering the message in the UI.
+function stripErrorCode(message: string): string {
+  return message.replace(/\s*\[Code:\s*[^\]]+\]\s*$/, '');
+}
 
 interface AuctionDetailModalProps {
   auction: AuctionItem;
@@ -46,15 +54,50 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
 
   const bidHistoryEndRef = useRef<HTMLDivElement | null>(null);
 
-  // Suggested minimum next bid
+  // Tracks whether the user has started typing or incrementing their own bid. While true, the
+  // 3s poll's auto-fill effect below must not overwrite the input just because a rival's bid
+  // changed the suggested amount.
+  const hasUserEditedBidRef = useRef(false);
+
+  // Last values seen from the server, used to detect a genuinely new bid
+  const lastSeenRef = useRef({
+    currentPrice: initialAuction.currentPrice,
+    bidCount: initialAuction.bids.length,
+  });
+
+  // Held in a ref so a new parent callback identity does not restart the poll timer
+  const onAuctionUpdatedRef = useRef(onAuctionUpdated);
+  useEffect(() => {
+    onAuctionUpdatedRef.current = onAuctionUpdated;
+  }, [onAuctionUpdated]);
+
+  // The true enforced minimum: what the server will actually accept.
+  // Rounded to the nearest penny: raw float addition (e.g. 100.01 + 0.01) can land on a value
+  // like 100.02000000000001, which the input's `min` attribute would then enforce even though
+  // the "Min: £X" hint below renders the clean .toFixed(2) value. Rounding here keeps both in sync.
   const minRequiredBid = auction.bids.length === 0
+    ? auction.startingPrice
+    : Math.round((auction.currentPrice + 0.01) * 100) / 100;
+
+  // A friendlier round-number suggestion, used only to pre-fill the input.
+  const suggestedBid = auction.bids.length === 0
     ? auction.startingPrice
     : auction.currentPrice + 5;
 
-  // Initialize input with suggested minimum bid
+  // Initialize input with the suggested bid, but only while the user hasn't started editing
+  // it themselves -- otherwise a rival's bid landing mid-poll would silently clobber whatever
+  // they've typed or incremented.
   useEffect(() => {
-    setBidAmount(minRequiredBid.toString());
-  }, [minRequiredBid]);
+    if (!hasUserEditedBidRef.current) {
+      setBidAmount(suggestedBid.toString());
+    }
+  }, [suggestedBid]);
+
+  // Switching to a different auction is a fresh bidding session, so let the next suggestion
+  // pre-fill again.
+  useEffect(() => {
+    hasUserEditedBidRef.current = false;
+  }, [auction.id]);
 
   // Keep countdown updated every second
   useEffect(() => {
@@ -72,67 +115,49 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
     return () => clearInterval(timer);
   }, [auction.endTime, auction.status]);
 
-  // Real-Time Socket.io Connection & Room Events
+  // Live room updates: poll this single listing while the modal is open
   useEffect(() => {
-    const socket = getSocket();
+    const auctionId = auction.id;
 
-    // 1. Join room for this specific auction
-    socket.emit('join_auction', { auctionId: auction.id });
+    const stopPoll = startPolling<AuctionItem | null>(
+      async () => {
+        const res = await apiFetch(`/api/auctions/${auctionId}`);
+        if (!res.ok) {
+          throw new Error(`Auction listing responded with ${res.status}`);
+        }
+        const data = await res.json();
+        return (data.auction ?? null) as AuctionItem | null;
+      },
+      3000,
+      (fresh) => {
+        if (!fresh || fresh.id !== auctionId) {
+          return;
+        }
 
-    // Handle full snapshot if sent
-    const handleSnapshot = (snapshot: AuctionItem) => {
-      if (snapshot && snapshot.id === auction.id) {
-        setAuction(snapshot);
-        onAuctionUpdated(snapshot);
-      }
-    };
+        // Flash only when the price or the bid count actually moved
+        const prev = lastSeenRef.current;
+        const hasNewBid = fresh.currentPrice !== prev.currentPrice || fresh.bids.length !== prev.bidCount;
+        lastSeenRef.current = { currentPrice: fresh.currentPrice, bidCount: fresh.bids.length };
 
-    // 2. Real-time live bid update received
-    const handleBidUpdated = (payload: BidUpdatePayload) => {
-      if (payload.auctionId === auction.id) {
-        setAuction(payload.auction);
-        onAuctionUpdated(payload.auction);
-        setFlashNewBid(true);
-        setTimeout(() => setFlashNewBid(false), 2000);
-        setError(null);
-      }
-    };
+        setAuction(fresh);
+        onAuctionUpdatedRef.current(fresh);
 
-    // 3. Real-time auction ended event
-    const handleAuctionEnded = (payload: AuctionEndedPayload) => {
-      if (payload.auctionId === auction.id) {
-        setAuction(payload.auction);
-        onAuctionUpdated(payload.auction);
-      }
-    };
+        if (hasNewBid) {
+          setFlashNewBid(true);
+          setTimeout(() => setFlashNewBid(false), 2000);
+        }
+      },
+    );
 
-    // 4. Real-time bid errors
-    const handleBidError = (err: { message: string }) => {
-      setError(err.message || 'Bid rejected');
-      setIsSubmitting(false);
-    };
-
-    socket.on('auction_snapshot', handleSnapshot);
-    socket.on('bid_updated', handleBidUpdated);
-    socket.on('auction_ended', handleAuctionEnded);
-    socket.on('bid_error', handleBidError);
-
-    return () => {
-      // Leave auction room on unmount
-      socket.emit('leave_auction', { auctionId: auction.id });
-      socket.off('auction_snapshot', handleSnapshot);
-      socket.off('bid_updated', handleBidUpdated);
-      socket.off('auction_ended', handleAuctionEnded);
-      socket.off('bid_error', handleBidError);
-    };
-  }, [auction.id, onAuctionUpdated]);
+    return stopPoll;
+  }, [auction.id]);
 
   const isEnded = auction.status === 'ended' || timeInfo.isEnded;
   const isSeller = user && user.id === auction.sellerId;
   const isTopBidder = user && user.id === auction.highestBidderId;
 
-  // Handle Placing a Bid via Socket.io
-  const handlePlaceBid = (e: React.FormEvent) => {
+  // Handle Placing a Bid via the REST API
+  const handlePlaceBid = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     setSuccessMessage(null);
@@ -160,36 +185,64 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
 
     if (auction.bids.length === 0) {
       if (numericAmount < auction.startingPrice) {
-        setError(`Bid must be at least the starting price of ${formatCurrency(auction.startingPrice)}.`);
+        setError(`Bid must be at least the starting price of ${formatCurrencyPrecise(auction.startingPrice)}.`);
         return;
       }
     } else {
       if (numericAmount <= auction.currentPrice) {
-        setError(`Bid must be strictly higher than current bid of ${formatCurrency(auction.currentPrice)}.`);
+        setError(`Bid must be strictly higher than current bid of ${formatCurrencyPrecise(auction.currentPrice)}.`);
         return;
       }
     }
 
     setIsSubmitting(true);
-    const socket = getSocket();
 
-    // Emit place_bid event to the server
-    socket.emit('place_bid', {
-      auctionId: auction.id,
-      userId: user.id,
-      userName: user.name,
-      amount: numericAmount,
-    });
+    try {
+      const res = await apiFetch(`/api/auctions/${auction.id}/bids`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: user.id,
+          userName: user.name,
+          amount: numericAmount,
+        }),
+      });
 
-    setSuccessMessage(`Placed bid of ${formatCurrency(numericAmount)}!`);
-    setTimeout(() => {
+      const data = await res.json().catch(() => null);
+
+      if (!res.ok) {
+        setError(data?.error ? stripErrorCode(data.error) : 'Unable to place your bid. Please try again.');
+        return;
+      }
+
+      // The bid endpoint only returns the new bid, so pull the fresh auction back
+      const refreshed = await apiFetch(`/api/auctions/${auction.id}`);
+      if (refreshed.ok) {
+        const refreshedData = await refreshed.json();
+        const fresh = refreshedData.auction as AuctionItem | undefined;
+        if (fresh) {
+          lastSeenRef.current = { currentPrice: fresh.currentPrice, bidCount: fresh.bids.length };
+          setAuction(fresh);
+          onAuctionUpdated(fresh);
+        }
+      }
+
+      setSuccessMessage(`Placed bid of ${formatCurrencyPrecise(numericAmount)}!`);
+      setTimeout(() => setSuccessMessage(null), 2500);
+
+      // A successful bid resolves the "editing" session; let the next suggestion pre-fill.
+      hasUserEditedBidRef.current = false;
+    } catch (err) {
+      console.error('Failed to place bid:', err);
+      setError('Network error while placing your bid. Please try again.');
+    } finally {
       setIsSubmitting(false);
-      setSuccessMessage(null);
-    }, 1500);
+    }
   };
 
   const handleIncrement = (inc: number) => {
-    const currentBase = parseFloat(bidAmount) || minRequiredBid;
+    hasUserEditedBidRef.current = true;
+    const currentBase = parseFloat(bidAmount) || suggestedBid;
     setBidAmount((currentBase + inc).toString());
     setError(null);
   };
@@ -450,7 +503,7 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
                         </button>
                       ))}
                       <span className="text-[10px] text-[#1e293b]/60 ml-auto whitespace-nowrap">
-                        Min: {formatCurrency(minRequiredBid)}
+                        Min: £{minRequiredBid.toFixed(2)}
                       </span>
                     </div>
 
@@ -465,11 +518,12 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
                           min={minRequiredBid}
                           value={bidAmount}
                           onChange={(e) => {
+                            hasUserEditedBidRef.current = true;
                             setBidAmount(e.target.value);
                             setError(null);
                           }}
                           className="w-full pl-8 pr-3 py-2 text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-bold"
-                          placeholder={minRequiredBid.toString()}
+                          placeholder={suggestedBid.toString()}
                         />
                       </div>
 
@@ -486,7 +540,7 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
 
                     {!user && (
                       <p className="text-[11px] text-[#1e293b]/70 text-center">
-                        You will be asked to sign in or pick a test bidder to place your bid.
+                        You need to be signed in to place a bid.
                       </p>
                     )}
                   </form>
