@@ -21,6 +21,27 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* Hides the scrollbar on horizontal strips (category bar, filter tabs, thumbnail
+   rails) while leaving them scrollable and keyboard-reachable. Referenced from JSX
+   as `no-scrollbar`. */
+@utility no-scrollbar {
+  -ms-overflow-style: none; /* legacy Edge / IE */
+  scrollbar-width: none; /* Firefox */
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Modal shell height. `dvh` tracks the mobile URL bar as it collapses, so a modal
+   never ends up taller than the visible viewport; the `vh` line above it is the
+   fallback for engines without dynamic viewport units. The 4rem allowance covers
+   the overlay's vertical margins. */
+@utility modal-max-h {
+  max-height: calc(100vh - 4rem);
+  max-height: calc(100dvh - 4rem);
+}
+
 /* Custom scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
@@ -38,4 +59,17 @@ body {
 
 ::-webkit-scrollbar-thumb:hover {
   background: #b6ccfe;
+}
+
+/* The dashboard leans on ping/pulse/bounce to signal liveness. Honour the OS
+   "reduce motion" setting rather than animating regardless. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

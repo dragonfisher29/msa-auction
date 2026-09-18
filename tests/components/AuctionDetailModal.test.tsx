@@ -320,4 +320,130 @@ describe('AuctionDetailModal', () => {
       expect(screen.queryByText(/Code: AUCTION_ENDED/)).not.toBeInTheDocument();
     });
   });
+
+  describe('image gallery', () => {
+    const THREE_IMAGES = [
+      'https://picsum.photos/seed/one/800/600',
+      'https://picsum.photos/seed/two/800/600',
+      'https://picsum.photos/seed/three/800/600',
+    ];
+
+    // The main image is the only one whose alt carries the "image N of M" position, so this
+    // reads the gallery's actual visible state rather than a thumbnail.
+    function activeImageSrc(): string {
+      const img = screen.getByAltText(/image \d+ of \d+$/i) as HTMLImageElement;
+      return img.src;
+    }
+
+    it('renders the counter and both nav buttons for a 3-image listing', () => {
+      renderModal(makeAuction({ imageUrls: THREE_IMAGES }), bidderUser);
+
+      expect(document.getElementById('gallery-counter')).toHaveTextContent('1 / 3');
+      expect(screen.getByLabelText('Previous image')).toBeInTheDocument();
+      expect(screen.getByLabelText('Next image')).toBeInTheDocument();
+      expect(activeImageSrc()).toBe(THREE_IMAGES[0]);
+    });
+
+    it('advances the visible image on Next and wraps from the last back to the first', async () => {
+      renderModal(makeAuction({ imageUrls: THREE_IMAGES }), bidderUser);
+
+      const user = userEvent.setup();
+      const nextBtn = document.getElementById('gallery-next-btn') as HTMLButtonElement;
+
+      await user.click(nextBtn);
+      expect(activeImageSrc()).toBe(THREE_IMAGES[1]);
+      expect(document.getElementById('gallery-counter')).toHaveTextContent('2 / 3');
+
+      await user.click(nextBtn);
+      expect(activeImageSrc()).toBe(THREE_IMAGES[2]);
+
+      // Wrap-around
+      await user.click(nextBtn);
+      expect(activeImageSrc()).toBe(THREE_IMAGES[0]);
+      expect(document.getElementById('gallery-counter')).toHaveTextContent('1 / 3');
+    });
+
+    it('wraps backwards from the first image to the last on Previous', async () => {
+      renderModal(makeAuction({ imageUrls: THREE_IMAGES }), bidderUser);
+
+      const user = userEvent.setup();
+      await user.click(document.getElementById('gallery-prev-btn') as HTMLButtonElement);
+
+      expect(activeImageSrc()).toBe(THREE_IMAGES[2]);
+      expect(document.getElementById('gallery-counter')).toHaveTextContent('3 / 3');
+    });
+
+    it('selects an image when its thumbnail is clicked', async () => {
+      renderModal(makeAuction({ imageUrls: THREE_IMAGES }), bidderUser);
+
+      const user = userEvent.setup();
+      await user.click(document.getElementById('gallery-thumb-2') as HTMLButtonElement);
+
+      expect(activeImageSrc()).toBe(THREE_IMAGES[2]);
+      expect(document.getElementById('gallery-counter')).toHaveTextContent('3 / 3');
+    });
+
+    it('renders no nav buttons, counter or thumbnails for a single-image listing', () => {
+      renderModal(
+        makeAuction({ imageUrls: [THREE_IMAGES[0]], imageUrl: THREE_IMAGES[0] }),
+        bidderUser,
+      );
+
+      expect(document.getElementById('gallery-counter')).toBeNull();
+      expect(document.getElementById('gallery-prev-btn')).toBeNull();
+      expect(document.getElementById('gallery-next-btn')).toBeNull();
+      expect(document.getElementById('gallery-thumb-0')).toBeNull();
+      expect((screen.getByAltText('Vintage Film Camera') as HTMLImageElement).src).toBe(THREE_IMAGES[0]);
+    });
+
+    it('falls back to the single imageUrl when imageUrls is absent', () => {
+      renderModal(
+        makeAuction({ imageUrls: undefined, imageUrl: 'https://example.test/legacy.jpg' }),
+        bidderUser,
+      );
+
+      expect((screen.getByAltText('Vintage Film Camera') as HTMLImageElement).src).toBe(
+        'https://example.test/legacy.jpg',
+      );
+      expect(document.getElementById('gallery-counter')).toBeNull();
+    });
+
+    it('ignores blank entries in imageUrls so they never render as empty frames', () => {
+      renderModal(
+        makeAuction({ imageUrls: [THREE_IMAGES[0], '   ', THREE_IMAGES[1]] }),
+        bidderUser,
+      );
+
+      expect(document.getElementById('gallery-counter')).toHaveTextContent('1 / 2');
+      expect(document.getElementById('gallery-thumb-2')).toBeNull();
+    });
+  });
+
+  describe('WhatsApp contact button', () => {
+    it('links to wa.me with the digits of a formatted international number', () => {
+      const auction = makeAuction({ phoneNumber: '+60 12-345 6789' });
+      renderModal(auction, bidderUser);
+
+      const link = document.getElementById('contact-whatsapp-btn') as HTMLAnchorElement;
+      expect(link).toBeInTheDocument();
+      // Read the attribute rather than the .href property: the DOM getter normalises the URL
+      // and re-encodes the apostrophe in the prefilled message as %27.
+      expect(link.getAttribute('href')).toBe(
+        `https://wa.me/60123456789?text=${encodeURIComponent(
+          `Hi ${auction.sellerName}, I'm interested in your "${auction.title}" listing on MSA Auction.`,
+        )}`,
+      );
+      expect(link.getAttribute('href')).toContain('https://wa.me/60123456789');
+      expect(link.target).toBe('_blank');
+      expect(link.rel).toBe('noopener noreferrer');
+    });
+
+    it('is not rendered when the seller number is too short to be dialable', () => {
+      renderModal(makeAuction({ phoneNumber: '12345' }), bidderUser);
+
+      expect(document.getElementById('contact-whatsapp-btn')).toBeNull();
+      // The plain tel: badge is unaffected
+      expect(screen.getByText('12345')).toBeInTheDocument();
+    });
+  });
 });

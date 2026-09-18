@@ -12,14 +12,6 @@ import {
   AlertCircle,
   RefreshCw,
   Star,
-  Layers,
-  Laptop,
-  Car,
-  Gem,
-  Palette,
-  BookOpen,
-  Shirt,
-  Box,
 } from 'lucide-react';
 import { AuctionItem, User } from './types';
 import { Header } from './components/Header';
@@ -29,17 +21,7 @@ import { CreateListingModal } from './components/CreateListingModal';
 import { AuthModal } from './components/AuthModal';
 import { apiFetch } from './lib/api';
 import { startPolling, checkHealth } from './lib/realtime';
-
-const CATEGORIES = [
-  { id: 'All', label: 'All Categories', icon: Layers },
-  { id: 'Electronics', label: 'Electronics', icon: Laptop },
-  { id: 'Vehicles', label: 'Vehicles', icon: Car },
-  { id: 'Collectibles', label: 'Collectibles', icon: Gem },
-  { id: 'Art & Antiques', label: 'Art & Antiques', icon: Palette },
-  { id: 'Books & Media', label: 'Books & Media', icon: BookOpen },
-  { id: 'Fashion', label: 'Fashion', icon: Shirt },
-  { id: 'General', label: 'General', icon: Box },
-];
+import { CATEGORIES } from './lib/categories';
 
 export default function App() {
   // --- Application State ---
@@ -263,16 +245,16 @@ export default function App() {
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 space-y-6">
         
         {/* Live Overview Bar */}
-        <div className="bg-[#e2eafc] border border-[#ccdbfd] rounded-2xl p-5 shadow-xs">
+        <div className="bg-[#e2eafc] border border-[#ccdbfd] rounded-2xl p-4 sm:p-5 shadow-xs">
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-            
+
             {/* Title & Live Status */}
-            <div>
-              <div className="flex items-center gap-2">
-                <h2 className="text-xl sm:text-2xl font-black text-[#1e293b] tracking-tight">
+            <div className="min-w-0">
+              <div className="flex items-center flex-wrap gap-2">
+                <h2 className="text-lg sm:text-2xl font-black text-[#1e293b] tracking-tight">
                   Live Bidding Dashboard
                 </h2>
-                <span className="flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-[#abc4ff] border border-[#c1d3fe] text-[#1e293b] text-xs font-bold">
+                <span className="flex items-center gap-1 shrink-0 px-2.5 py-0.5 rounded-full bg-[#abc4ff] border border-[#c1d3fe] text-[#1e293b] text-xs font-bold">
                   <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
                   Active Room
                 </span>
@@ -306,7 +288,7 @@ export default function App() {
                 id="refresh-auctions-btn"
                 onClick={fetchAuctions}
                 title="Refresh Auctions"
-                className="p-2.5 rounded-xl bg-[#d7e3fc] hover:bg-[#c1d3fe] border border-[#ccdbfd] text-[#1e293b] transition-colors"
+                className="inline-flex items-center justify-center p-2.5 min-h-[44px] min-w-[44px] rounded-xl bg-[#d7e3fc] hover:bg-[#c1d3fe] border border-[#ccdbfd] text-[#1e293b] transition-colors"
               >
                 <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin' : ''}`} />
               </button>
@@ -316,8 +298,8 @@ export default function App() {
         </div>
 
         {/* Horizontal Category Navigation Bar */}
-        <div className="bg-[#e2eafc] border border-[#ccdbfd] rounded-2xl p-3 shadow-xs">
-          <div className="flex items-center gap-2 overflow-x-auto no-scrollbar scroll-smooth py-1 px-1">
+        <div className="bg-[#e2eafc] border border-[#ccdbfd] rounded-2xl p-2 sm:p-3 shadow-xs">
+          <div className="flex items-center gap-2 overflow-x-auto overscroll-x-contain no-scrollbar scroll-smooth py-1 px-1">
             {CATEGORIES.map((cat) => {
               const IconComponent = cat.icon;
               const isSelected = selectedCategory === cat.id;
@@ -330,7 +312,7 @@ export default function App() {
                   key={cat.id}
                   id={`category-btn-${cat.id.toLowerCase().replace(/\s+/g, '-')}`}
                   onClick={() => setSelectedCategory(cat.id)}
-                  className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all shrink-0 flex items-center gap-2 cursor-pointer min-h-[40px] ${
+                  className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all shrink-0 flex items-center gap-2 cursor-pointer min-h-[44px] whitespace-nowrap ${
                     isSelected
                       ? 'bg-[#abc4ff] text-[#1e293b] border border-[#c1d3fe] shadow-xs'
                       : 'bg-[#d7e3fc] text-[#1e293b]/80 border border-[#ccdbfd] hover:bg-[#c1d3fe]'
@@ -348,11 +330,11 @@ export default function App() {
         </div>
 
         {/* Search, Status Tabs & Sorting Filter Controls */}
-        <div className="bg-[#e2eafc] border border-[#ccdbfd] rounded-2xl p-4 shadow-xs space-y-3">
+        <div className="bg-[#e2eafc] border border-[#ccdbfd] rounded-2xl p-3 sm:p-4 shadow-xs space-y-3">
           <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3">
-            
+
             {/* Search Input */}
-            <div className="relative flex-1">
+            <div className="relative flex-1 min-w-0">
               <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-[#1e293b]/50" />
               <input
                 id="search-auctions-input"
@@ -371,7 +353,7 @@ export default function App() {
                 id="sort-auctions-select"
                 value={sortBy}
                 onChange={(e: any) => setSortBy(e.target.value)}
-                className="px-3 py-2.5 rounded-xl bg-[#edf2fb] border border-[#ccdbfd] text-xs font-bold text-[#1e293b] focus:border-[#abc4ff] focus:outline-hidden cursor-pointer min-h-[44px]"
+                className="flex-1 md:flex-none px-3 py-2.5 rounded-xl bg-[#edf2fb] border border-[#ccdbfd] text-xs font-bold text-[#1e293b] focus:border-[#abc4ff] focus:outline-hidden cursor-pointer min-h-[44px]"
               >
                 <option value="ending_soonest">Ending Soonest</option>
                 <option value="price_high">Highest Price</option>
@@ -383,7 +365,7 @@ export default function App() {
           </div>
 
           {/* Filter Tabs */}
-          <div className="flex items-center gap-2 overflow-x-auto pt-1 pb-0.5 no-scrollbar">
+          <div className="flex items-center gap-2 overflow-x-auto overscroll-x-contain pt-1 pb-0.5 no-scrollbar">
             {[
               { id: 'all', label: 'All Listings', count: auctions.length },
               { id: 'active', label: 'Active Live', count: activeCount },
@@ -397,7 +379,7 @@ export default function App() {
                   key={tab.id}
                   id={`filter-tab-${tab.id}`}
                   onClick={() => setStatusFilter(tab.id as any)}
-                  className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 min-h-[38px] ${
+                  className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 min-h-[44px] whitespace-nowrap ${
                     statusFilter === tab.id
                       ? 'bg-[#abc4ff] border border-[#c1d3fe] text-[#1e293b] shadow-xs'
                       : 'bg-[#d7e3fc] border border-[#ccdbfd] text-[#1e293b]/75 hover:bg-[#c1d3fe]'
@@ -423,7 +405,7 @@ export default function App() {
             <p className="text-sm font-bold text-[#1e293b]">Connecting to live auction feed...</p>
           </div>
         ) : filteredAuctions.length === 0 ? (
-          <div className="py-16 text-center bg-[#e2eafc] rounded-2xl border border-[#ccdbfd] p-6">
+          <div className="py-12 sm:py-16 text-center bg-[#e2eafc] rounded-2xl border border-[#ccdbfd] p-4 sm:p-6">
             <AlertCircle className="w-10 h-10 mx-auto text-[#1e293b]/50 mb-3" />
             <h3 className="text-base font-bold text-[#1e293b]">No auctions match your filters</h3>
             <p className="text-xs text-[#1e293b]/70 mt-1 max-w-sm mx-auto">
@@ -455,8 +437,8 @@ export default function App() {
 
       {/* Footer */}
       <footer className="mt-12 border-t border-[#ccdbfd] bg-[#e2eafc] py-6 text-center text-xs text-[#1e293b]/70">
-        <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-3">
-          <div className="flex items-center gap-2">
+        <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-3 text-center sm:text-left">
+          <div className="flex items-center justify-center flex-wrap gap-x-2 gap-y-1">
             <Gavel className="w-4 h-4 text-[#1e293b]" />
             <span className="font-extrabold text-[#1e293b]">MSA Auction</span>
             <span>— Bi-directional Real-Time Bidding (£ / GBP)</span>

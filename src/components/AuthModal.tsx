@@ -55,35 +55,37 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#1e293b]/40 backdrop-blur-xs">
-      <div className="relative w-full max-w-md bg-[#e2eafc] border border-[#ccdbfd] rounded-2xl shadow-xl overflow-hidden text-[#1e293b]">
-        
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-[#1e293b]/40 backdrop-blur-xs overflow-y-auto">
+      <div className="relative w-full max-w-md bg-[#e2eafc] border border-[#ccdbfd] rounded-2xl shadow-xl overflow-hidden text-[#1e293b] my-2 sm:my-4 flex flex-col modal-max-h">
+
         {/* Modal Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-[#ccdbfd] bg-[#d7e3fc]">
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-[#b6ccfe] flex items-center justify-center text-[#1e293b]">
+        <div className="flex items-center justify-between gap-2 px-4 sm:px-6 py-3 sm:py-4 border-b border-[#ccdbfd] bg-[#d7e3fc] shrink-0">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-8 h-8 shrink-0 rounded-lg bg-[#b6ccfe] flex items-center justify-center text-[#1e293b]">
               <Lock className="w-4 h-4" />
             </div>
-            <h2 className="text-lg font-bold text-[#1e293b]">
+            <h2 className="text-sm sm:text-lg font-bold text-[#1e293b] leading-tight min-w-0">
               {mode === 'login' ? 'Sign In to MSA Auction' : 'Create an Account'}
             </h2>
           </div>
           <button
             id="close-auth-modal-btn"
             onClick={onClose}
-            className="p-1.5 rounded-lg text-[#1e293b]/70 hover:text-[#1e293b] hover:bg-[#c1d3fe] transition-colors"
+            aria-label="Close sign in dialog"
+            className="shrink-0 inline-flex items-center justify-center p-2 min-h-[44px] min-w-[44px] rounded-lg text-[#1e293b]/70 hover:text-[#1e293b] hover:bg-[#c1d3fe] transition-colors"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
+        <div className="flex-1 overflow-y-auto overscroll-contain">
         {/* Mode Switcher Tabs */}
-        <div className="grid grid-cols-2 p-1.5 mx-6 mt-5 bg-[#d7e3fc] border border-[#ccdbfd] rounded-xl text-sm font-semibold">
+        <div className="grid grid-cols-2 p-1.5 mx-4 sm:mx-6 mt-4 sm:mt-5 bg-[#d7e3fc] border border-[#ccdbfd] rounded-xl text-sm font-semibold">
           <button
             id="tab-login-btn"
             type="button"
             onClick={() => { setMode('login'); setError(null); }}
-            className={`py-2 rounded-lg transition-all ${
+            className={`py-2 min-h-[44px] rounded-lg transition-all ${
               mode === 'login'
                 ? 'bg-[#abc4ff] text-[#1e293b] shadow-xs'
                 : 'text-[#1e293b]/70 hover:text-[#1e293b]'
@@ -95,7 +97,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             id="tab-register-btn"
             type="button"
             onClick={() => { setMode('register'); setError(null); }}
-            className={`py-2 rounded-lg transition-all ${
+            className={`py-2 min-h-[44px] rounded-lg transition-all ${
               mode === 'register'
                 ? 'bg-[#abc4ff] text-[#1e293b] shadow-xs'
                 : 'text-[#1e293b]/70 hover:text-[#1e293b]'
@@ -106,7 +108,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         </div>
 
         {/* Form Body */}
-        <div className="p-6">
+        <div className="p-4 sm:p-6">
           {error && (
             <div className="mb-4 p-3 rounded-xl bg-red-100/90 border border-red-200 text-red-800 text-xs flex items-center gap-2">
               <AlertCircle className="w-4 h-4 shrink-0" />
@@ -129,7 +131,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                     placeholder="e.g. Jordan Hayes"
                     value={name}
                     onChange={(e) => setName(e.target.value)}
-                    className="w-full pl-9 pr-3 py-2 text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] placeholder-[#1e293b]/40 font-medium"
+                    className="w-full pl-9 pr-3 py-2 min-h-[44px] text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] placeholder-[#1e293b]/40 font-medium"
                   />
                 </div>
               </div>
@@ -148,7 +150,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   placeholder="e.g. alex_r"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  className="w-full pl-9 pr-3 py-2 text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] placeholder-[#1e293b]/40 font-medium"
+                  className="w-full pl-9 pr-3 py-2 min-h-[44px] text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] placeholder-[#1e293b]/40 font-medium"
                 />
               </div>
             </div>
@@ -166,7 +168,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   placeholder="••••••••"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  className="w-full pl-9 pr-3 py-2 text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] placeholder-[#1e293b]/40 font-medium"
+                  className="w-full pl-9 pr-3 py-2 min-h-[44px] text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] placeholder-[#1e293b]/40 font-medium"
                 />
               </div>
             </div>
@@ -175,13 +177,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               id="auth-submit-btn"
               type="submit"
               disabled={isLoading}
-              className="w-full py-2.5 px-4 rounded-xl bg-[#abc4ff] hover:bg-[#b6ccfe] border border-[#c1d3fe] text-[#1e293b] font-bold text-sm shadow-xs transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
+              className="w-full py-2.5 px-4 min-h-[44px] rounded-xl bg-[#abc4ff] hover:bg-[#b6ccfe] border border-[#c1d3fe] text-[#1e293b] font-bold text-sm shadow-xs transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
             >
               <span>{isLoading ? 'Processing...' : mode === 'login' ? 'Sign In' : 'Create Account'}</span>
-              <ArrowRight className="w-4 h-4" />
+              <ArrowRight className="w-4 h-4 shrink-0" />
             </button>
           </form>
 
+        </div>
         </div>
       </div>
     </div>

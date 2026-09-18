@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { X, Tag, Phone, PoundSterling, Clock, FileText, Image as ImageIcon, AlertCircle, Trash2, Upload } from 'lucide-react';
+import { X, Tag, Phone, PoundSterling, Clock, FileText, Image as ImageIcon, AlertCircle, Trash2, Upload, ChevronDown } from 'lucide-react';
 import { apiFetch } from '../lib/api';
+import { SELECTABLE_CATEGORIES } from '../lib/categories';
 import { User, AuctionItem } from '../types';
 
 interface CreateListingModalProps {
@@ -155,6 +156,15 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
       return;
     }
 
+    // The WhatsApp contact link is built straight from this value, so it has to be a full
+    // international number. A single leading 0 is a local trunk prefix and means the country
+    // code is missing; a leading 00 is the ITU international prefix, so it is fine.
+    const phoneDigits = trimmedPhoneNumber.replace(/\D/g, '');
+    if (phoneDigits.length < 8 || phoneDigits.length > 15 || /^0(?!0)/.test(trimmedPhoneNumber)) {
+      setError('Please enter your full phone number including the country code, for example +44 7700 900123.');
+      return;
+    }
+
     if (imagePreviews.length === 0) {
       setError('Please upload at least one image before publishing the listing.');
       return;
@@ -216,29 +226,33 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#1e293b]/40 backdrop-blur-xs overflow-y-auto">
-      <div className="relative w-full max-w-xl bg-[#e2eafc] border border-[#ccdbfd] rounded-2xl shadow-xl overflow-hidden text-[#1e293b] my-8">
-        <div className="flex items-center justify-between px-6 py-4 border-b border-[#ccdbfd] bg-[#d7e3fc]">
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-[#b6ccfe] flex items-center justify-center text-[#1e293b]">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-[#1e293b]/40 backdrop-blur-xs overflow-y-auto">
+      {/* Bounded shell + its own scroll body: the header (and its close button) stays put
+          while the long form scrolls beneath it. */}
+      <div className="relative w-full max-w-xl bg-[#e2eafc] border border-[#ccdbfd] rounded-2xl shadow-xl overflow-hidden text-[#1e293b] my-2 sm:my-8 flex flex-col modal-max-h">
+        <div className="flex items-center justify-between gap-2 px-4 sm:px-6 py-3 sm:py-4 border-b border-[#ccdbfd] bg-[#d7e3fc] shrink-0">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-8 h-8 shrink-0 rounded-lg bg-[#b6ccfe] flex items-center justify-center text-[#1e293b]">
               <Tag className="w-4 h-4" />
             </div>
-            <div>
-              <h2 className="text-lg font-bold text-[#1e293b]">Create New Auction Listing</h2>
-              <p className="text-xs text-[#1e293b]/70">Publish an item for real-time live bidding</p>
+            <div className="min-w-0">
+              <h2 className="text-sm sm:text-lg font-bold text-[#1e293b] leading-tight">Create New Auction Listing</h2>
+              <p className="text-xs text-[#1e293b]/70 hidden sm:block">Publish an item for real-time live bidding</p>
             </div>
           </div>
           <button
             id="close-create-modal-btn"
             onClick={onClose}
-            className="p-1.5 rounded-lg text-[#1e293b]/70 hover:text-[#1e293b] hover:bg-[#c1d3fe] transition-colors"
+            aria-label="Close create listing form"
+            className="shrink-0 inline-flex items-center justify-center p-2 min-h-[44px] min-w-[44px] rounded-lg text-[#1e293b]/70 hover:text-[#1e293b] hover:bg-[#c1d3fe] transition-colors"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
+        <div className="flex-1 overflow-y-auto overscroll-contain">
         {!user && (
-          <div className="m-6 p-4 rounded-xl bg-[#d7e3fc] border border-[#ccdbfd] flex items-start gap-3">
+          <div className="m-4 sm:m-6 p-4 rounded-xl bg-[#d7e3fc] border border-[#ccdbfd] flex items-start gap-3">
             <AlertCircle className="w-5 h-5 text-[#1e293b] shrink-0 mt-0.5" />
             <div className="text-xs">
               <p className="font-bold text-[#1e293b]">Sign in required to create listings</p>
@@ -248,7 +262,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
               <button
                 type="button"
                 onClick={onPromptAuth}
-                className="mt-2 px-3 py-1 rounded-lg bg-[#abc4ff] hover:bg-[#b6ccfe] font-bold text-[#1e293b] text-xs shadow-xs"
+                className="mt-2 inline-flex items-center justify-center px-3 py-1 min-h-[44px] rounded-lg bg-[#abc4ff] hover:bg-[#b6ccfe] font-bold text-[#1e293b] text-xs shadow-xs"
               >
                 Sign In to Create a Listing
               </button>
@@ -256,7 +270,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
           </div>
         )}
 
-        <form onSubmit={handleSubmit} className="p-6 space-y-4">
+        <form onSubmit={handleSubmit} className="p-4 sm:p-6 space-y-4">
           {error && (
             <div className="p-3 rounded-xl bg-red-100/90 border border-red-200 text-red-800 text-xs flex items-center gap-2">
               <AlertCircle className="w-4 h-4 shrink-0" />
@@ -275,7 +289,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
               placeholder="e.g. Sony WH-1000XM5 Wireless Noise Canceling Headphones"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
-              className="w-full px-3.5 py-2.5 text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-medium placeholder-[#1e293b]/40"
+              className="w-full px-3.5 py-2.5 min-h-[44px] text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-medium placeholder-[#1e293b]/40"
             />
           </div>
 
@@ -310,7 +324,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
                   placeholder="100"
                   value={startingPrice}
                   onChange={(e) => setStartingPrice(e.target.value)}
-                  className="w-full pl-9 pr-3.5 py-2.5 text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-bold"
+                  className="w-full pl-9 pr-3.5 py-2.5 min-h-[44px] text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-bold"
                 />
               </div>
               <p className="text-[11px] text-[#1e293b]/60 mt-1">Must be greater than £0</p>
@@ -326,24 +340,26 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
                   id="listing-phone-input"
                   type="tel"
                   required
-                  placeholder="+1 (555) 000-0000"
+                  placeholder="+44 7700 900123"
                   value={phoneNumber}
                   onChange={(e) => setPhoneNumber(e.target.value)}
-                  className="w-full pl-9 pr-3.5 py-2.5 text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-medium"
+                  className="w-full pl-9 pr-3.5 py-2.5 min-h-[44px] text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-medium"
                 />
               </div>
-              <p className="text-[11px] text-[#1e293b]/60 mt-1">Displayed to verified bidders</p>
+              <p className="text-[11px] text-[#1e293b]/60 mt-1">Include your country code (e.g. +44). Used for the WhatsApp contact button.</p>
             </div>
           </div>
 
           <div>
-            <label className="block text-xs font-bold text-[#1e293b] mb-1.5 flex items-center justify-between">
+            <label className="block text-xs font-bold text-[#1e293b] mb-1.5 flex items-center flex-wrap justify-between gap-x-2 gap-y-0.5">
               <span>Auction Duration *</span>
               <span className="text-[11px] font-normal text-[#1e293b]/70">
                 Selected: {customDuration ? `${customDuration} minutes` : `${durationMinutes} minutes`}
               </span>
             </label>
-            <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+            {/* 2 up on a phone, 3 up from `sm`: at 6 across, labels like "2 Mins (Fast Test)"
+                had ~80px of cell and wrapped mid-phrase. */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
               {PRESET_DURATIONS.map((preset) => (
                 <button
                   key={preset.minutes}
@@ -352,7 +368,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
                     setDurationMinutes(preset.minutes);
                     setCustomDuration('');
                   }}
-                  className={`py-2 px-1 text-xs font-semibold rounded-xl border text-center transition-all ${
+                  className={`py-2 px-2 min-h-[44px] text-xs font-semibold leading-tight rounded-xl border text-center transition-all ${
                     durationMinutes === preset.minutes && !customDuration
                       ? 'bg-[#abc4ff] border-[#b6ccfe] text-[#1e293b] shadow-xs'
                       : 'bg-[#edf2fb] border-[#ccdbfd] text-[#1e293b]/80 hover:bg-[#d7e3fc]'
@@ -370,7 +386,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
               placeholder="Or enter custom minutes"
               value={customDuration}
               onChange={(e) => setCustomDuration(e.target.value)}
-              className="mt-2 w-full px-3.5 py-2 text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b]"
+              className="mt-2 w-full px-3.5 py-2 min-h-[44px] text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b]"
             />
           </div>
 
@@ -386,11 +402,11 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
               <div className="mb-3 grid grid-cols-3 gap-2">
                 {imagePreviews.map((preview, index) => (
                   <div key={`${preview.slice(0, 20)}-${index}`} className="relative rounded-xl overflow-hidden border border-[#ccdbfd] bg-[#edf2fb]">
-                    <img src={preview} alt={`Uploaded preview ${index + 1}`} className="h-20 w-full object-cover" />
+                    <img src={preview} alt={`Uploaded preview ${index + 1}`} className="h-20 sm:h-24 w-full object-cover" />
                     <button
                       type="button"
                       onClick={() => removeImage(index)}
-                      className="absolute top-1 right-1 rounded-md bg-[#1e293b]/70 p-1 text-white hover:bg-[#1e293b]"
+                      className="absolute top-1 right-1 inline-flex items-center justify-center rounded-md bg-[#1e293b]/70 p-2 min-h-[36px] min-w-[36px] text-white hover:bg-[#1e293b]"
                       aria-label={`Remove image ${index + 1}`}
                     >
                       <Trash2 className="w-3.5 h-3.5" />
@@ -403,7 +419,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
             {imagePreviews.length < MAX_IMAGES && (
               <label
                 htmlFor="listing-images-input"
-                className="flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-[#abc4ff] bg-[#edf2fb] px-3 py-3 text-xs font-semibold text-[#1e293b] transition-colors hover:bg-[#d7e3fc]"
+                className="flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-[#abc4ff] bg-[#edf2fb] px-3 py-3 min-h-[48px] text-xs font-semibold text-[#1e293b] transition-colors hover:bg-[#d7e3fc]"
               >
                 <Upload className="w-4 h-4" />
                 <span>Add Image{imagePreviews.length > 0 ? 's' : ''}</span>
@@ -425,23 +441,31 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
               Category
             </label>
             <div className="relative">
-              <FileText className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-[#1e293b]/50" />
-              <input
+              <FileText className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-[#1e293b]/50 pointer-events-none" />
+              <select
                 id="listing-category-input"
-                type="text"
-                placeholder="e.g. Electronics"
+                required
                 value={category}
                 onChange={(e) => setCategory(e.target.value)}
-                className="w-full pl-9 pr-3.5 py-2.5 text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-medium placeholder-[#1e293b]/40"
-              />
+                className="w-full pl-9 pr-9 py-2.5 text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-bold appearance-none cursor-pointer min-h-[44px]"
+              >
+                {SELECTABLE_CATEGORIES.map((cat) => (
+                  <option key={cat.id} value={cat.id}>
+                    {cat.label}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown className="w-4 h-4 absolute right-3 top-1/2 -translate-y-1/2 text-[#1e293b]/50 pointer-events-none" />
             </div>
           </div>
 
-          <div className="pt-3 flex items-center justify-end gap-3 border-t border-[#ccdbfd]">
+          {/* Pinned to the bottom of the scroll body so Cancel/Publish stay reachable
+              without scrolling to the end of a long form. */}
+          <div className="sticky bottom-0 -mx-4 sm:-mx-6 -mb-4 sm:-mb-6 px-4 sm:px-6 py-3 bg-[#e2eafc] flex items-center justify-end gap-3 border-t border-[#ccdbfd]">
             <button
               type="button"
               onClick={onClose}
-              className="px-4 py-2 rounded-xl bg-[#d7e3fc] hover:bg-[#c1d3fe] text-xs font-bold text-[#1e293b] transition-colors"
+              className="inline-flex items-center justify-center px-4 py-2 min-h-[44px] rounded-xl bg-[#d7e3fc] hover:bg-[#c1d3fe] text-xs font-bold text-[#1e293b] transition-colors"
             >
               Cancel
             </button>
@@ -449,13 +473,14 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
               id="submit-create-listing-btn"
               type="submit"
               disabled={isSubmitting || !user}
-              className="px-5 py-2.5 rounded-xl bg-[#abc4ff] hover:bg-[#b6ccfe] border border-[#c1d3fe] text-xs font-extrabold text-[#1e293b] shadow-xs transition-colors cursor-pointer disabled:opacity-60 flex items-center gap-2"
+              className="px-4 sm:px-5 py-2.5 min-h-[44px] rounded-xl bg-[#abc4ff] hover:bg-[#b6ccfe] border border-[#c1d3fe] text-xs font-extrabold text-[#1e293b] shadow-xs transition-colors cursor-pointer disabled:opacity-60 flex items-center justify-center gap-2 text-center"
             >
-              <Clock className="w-4 h-4" />
+              <Clock className="w-4 h-4 shrink-0" />
               <span>{isSubmitting ? 'Starting Auction...' : 'Publish Live Auction'}</span>
             </button>
           </div>
         </form>
+        </div>
       </div>
     </div>
   );

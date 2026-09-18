@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { formatCurrency, formatCurrencyPrecise, formatTimeRemaining, formatTimestamp } from '../../src/lib/formatters';
+import {
+  buildWhatsAppUrl,
+  formatCurrency,
+  formatCurrencyPrecise,
+  formatTimeRemaining,
+  formatTimestamp,
+} from '../../src/lib/formatters';
 
 describe('formatCurrency', () => {
   it('formats a whole pound amount with the £ symbol and no decimals', () => {
@@ -114,5 +120,65 @@ describe('formatTimestamp', () => {
       second: '2-digit',
     });
     expect(formatTimestamp(ts)).toBe(expected);
+  });
+});
+
+describe('buildWhatsAppUrl', () => {
+  it('strips spaces and dashes from a formatted number', () => {
+    expect(buildWhatsAppUrl('60 12-345 6789')).toBe('https://wa.me/60123456789');
+  });
+
+  it('strips a leading + from an international number', () => {
+    expect(buildWhatsAppUrl('+60 12-345 6789')).toBe('https://wa.me/60123456789');
+  });
+
+  it('strips parentheses and any other punctuation', () => {
+    expect(buildWhatsAppUrl('+44 (0)7700 900.000')).toBe('https://wa.me/4407700900000');
+  });
+
+  it('returns null for a number shorter than 8 digits', () => {
+    expect(buildWhatsAppUrl('+60 12-345')).toBeNull();
+  });
+
+  // Legacy rows stored a local number with a trunk-prefix zero and no country code. wa.me would
+  // accept the URL and then show "invalid number", so the helper rejects it and the caller hides
+  // the button instead.
+  it('returns null for a legacy local number with a single leading zero', () => {
+    expect(buildWhatsAppUrl('0123456789')).toBeNull();
+  });
+
+  it('returns null for a formatted legacy local number with a single leading zero', () => {
+    expect(buildWhatsAppUrl('012-345 6789')).toBeNull();
+  });
+
+  it('strips the ITU 00 international prefix, which wa.me rejects just like +', () => {
+    expect(buildWhatsAppUrl('0060 12 345 6789')).toBe('https://wa.me/60123456789');
+  });
+
+  it('treats a 00-prefixed number the same as the + form of the same number', () => {
+    expect(buildWhatsAppUrl('00 44 7700 900111')).toBe(buildWhatsAppUrl('+44 7700 900111'));
+  });
+
+  it('applies the 8-digit floor after stripping 00, not before', () => {
+    // Eight characters, but only a six-digit number once the prefix is gone.
+    expect(buildWhatsAppUrl('00123456')).toBeNull();
+  });
+
+  it('returns null for an empty string', () => {
+    expect(buildWhatsAppUrl('')).toBeNull();
+  });
+
+  it('returns null for a string with no digits at all', () => {
+    expect(buildWhatsAppUrl('call me maybe')).toBeNull();
+  });
+
+  it('appends a percent-encoded text query when a message is given', () => {
+    expect(buildWhatsAppUrl('+60123456789', 'Hi Sam, I\'m interested in your "Camera" listing.')).toBe(
+      `https://wa.me/60123456789?text=${encodeURIComponent('Hi Sam, I\'m interested in your "Camera" listing.')}`,
+    );
+  });
+
+  it('omits the text query when the message is an empty string', () => {
+    expect(buildWhatsAppUrl('+60123456789', '')).toBe('https://wa.me/60123456789');
   });
 });

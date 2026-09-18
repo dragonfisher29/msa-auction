@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Clock, TrendingUp, User as UserIcon, Phone, ArrowUpRight, Trophy, Star, ShieldAlert, CheckCircle2 } from 'lucide-react';
+import { Clock, TrendingUp, User as UserIcon, Phone, ArrowUpRight, Trophy, Star, ShieldAlert, CheckCircle2, Images } from 'lucide-react';
 import { AuctionItem, User } from '../types';
 import { formatCurrency, formatTimeRemaining } from '../lib/formatters';
 
@@ -35,13 +35,17 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({
   const hasUserBid = Boolean(user && auction.bids.some((b) => b.userId === user.id));
   const isOutbid = hasUserBid && !isHighestBidder && !isEnded;
 
+  const imageCount = Array.isArray(auction.imageUrls)
+    ? auction.imageUrls.filter((url) => typeof url === 'string' && url.trim() !== '').length
+    : 0;
+
   return (
     <div
       id={`auction-card-${auction.id}`}
       className="group flex flex-col bg-[#e2eafc] hover:bg-[#d7e3fc] border border-[#ccdbfd] hover:border-[#b6ccfe] rounded-2xl overflow-hidden shadow-xs hover:shadow-md transition-all duration-200 text-[#1e293b] relative"
     >
       {/* Card Image Banner */}
-      <div className="relative h-48 w-full overflow-hidden bg-[#d7e3fc]">
+      <div className="relative h-44 sm:h-48 w-full overflow-hidden bg-[#d7e3fc]">
         <img
           src={auction.imageUrl || 'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?auto=format&fit=crop&w=800&q=80'}
           alt={auction.title}
@@ -50,8 +54,8 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({
         />
 
         {/* Top Badges (Status, Category, User Bid Status) */}
-        <div className="absolute top-3 left-3 right-3 flex items-center justify-between gap-1.5 pointer-events-none">
-          <div className="flex items-center gap-1.5 flex-wrap">
+        <div className="absolute top-2.5 left-2.5 right-2.5 sm:top-3 sm:left-3 sm:right-3 flex items-start justify-between gap-1.5 pointer-events-none">
+          <div className="flex items-center gap-1.5 flex-wrap min-w-0">
             {isEnded ? (
               <span className="px-2.5 py-1 rounded-full text-xs font-extrabold bg-slate-800 text-slate-100 shadow-xs flex items-center gap-1">
                 <Trophy className="w-3.5 h-3.5 text-amber-300" />
@@ -93,7 +97,7 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({
                 onToggleWatchlist(auction.id);
               }}
               title={isWatchlisted ? 'Remove from Watchlist' : 'Add to Watchlist'}
-              className={`pointer-events-auto p-1.5 rounded-full backdrop-blur-md transition-all shadow-xs cursor-pointer ${
+              className={`pointer-events-auto shrink-0 inline-flex items-center justify-center p-2 min-h-[40px] min-w-[40px] rounded-full backdrop-blur-md transition-all shadow-xs cursor-pointer ${
                 isWatchlisted
                   ? 'bg-amber-400 text-slate-900 hover:bg-amber-300'
                   : 'bg-[#1e293b]/60 text-white hover:bg-[#1e293b]/80'
@@ -103,6 +107,18 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({
             </button>
           )}
         </div>
+
+        {/* Multi-image hint: bottom-left, clear of the top badges and the countdown pill */}
+        {imageCount > 1 && (
+          <div
+            id={`auction-card-image-count-${auction.id}`}
+            title={`${imageCount} photos`}
+            className="absolute bottom-3 left-3 px-2 py-1 rounded-xl bg-[#1e293b]/70 backdrop-blur-xs text-white text-[11px] font-bold flex items-center gap-1 shadow-sm"
+          >
+            <Images className="w-3.5 h-3.5 opacity-90" />
+            <span>{imageCount}</span>
+          </div>
+        )}
 
         {/* Floating Countdown Pill on Image */}
         <div className="absolute bottom-3 right-3 px-2.5 py-1 rounded-xl bg-[#1e293b]/85 backdrop-blur-xs text-white text-xs font-bold tracking-tight flex items-center gap-1.5 shadow-sm">
@@ -115,16 +131,16 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({
       <div className="p-4 flex-1 flex flex-col justify-between">
         <div>
           <div className="flex items-center justify-between gap-2">
-            <h3 className="font-bold text-base text-[#1e293b] line-clamp-1 group-hover:text-black transition-colors flex-1" title={auction.title}>
+            <h3 className="font-bold text-sm sm:text-base text-[#1e293b] line-clamp-1 group-hover:text-black transition-colors flex-1 min-w-0 break-words" title={auction.title}>
               {auction.title}
             </h3>
             {auction.category && (
-              <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-[#b6ccfe] text-[#1e293b] shrink-0 uppercase tracking-wider">
+              <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-[#b6ccfe] text-[#1e293b] shrink-0 uppercase tracking-wider max-w-[45%] truncate">
                 {auction.category}
               </span>
             )}
           </div>
-          <p className="text-xs text-[#1e293b]/75 line-clamp-2 mt-1 min-h-[32px] leading-relaxed">
+          <p className="text-xs text-[#1e293b]/75 line-clamp-2 mt-1 min-h-[32px] leading-relaxed break-words">
             {auction.description}
           </p>
         </div>
@@ -132,12 +148,12 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({
         {/* Pricing & Highest Bid Info */}
         <div className="mt-4 pt-3 border-t border-[#ccdbfd]/80 space-y-2.5">
           <div className="flex items-end justify-between gap-2 flex-wrap sm:flex-nowrap">
-            <div>
+            <div className="min-w-0">
               <p className="text-[11px] font-semibold uppercase tracking-wider text-[#1e293b]/65">
                 {isEnded ? 'Winning / Final Bid' : 'Current Highest Bid'}
               </p>
               <div className="flex items-center gap-1.5 flex-wrap">
-                <span className="text-xl font-extrabold text-[#1e293b] tracking-tight">
+                <span className="text-lg sm:text-xl font-extrabold text-[#1e293b] tracking-tight">
                   {formatCurrency(auction.currentPrice)}
                 </span>
                 {auction.bids.length > 0 && (
@@ -157,8 +173,8 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({
           </div>
 
           {/* Top Bidder or Winner Pill */}
-          <div className="flex items-center justify-between text-xs py-1.5 px-2.5 rounded-xl bg-[#d7e3fc] border border-[#ccdbfd]">
-            <div className="flex items-center gap-1.5 truncate">
+          <div className="flex items-center justify-between gap-2 text-xs py-1.5 px-2.5 rounded-xl bg-[#d7e3fc] border border-[#ccdbfd]">
+            <div className="flex items-center gap-1.5 min-w-0 truncate">
               {isEnded ? (
                 <Trophy className="w-3.5 h-3.5 text-amber-600 shrink-0" />
               ) : (
@@ -174,7 +190,7 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({
               </span>
             </div>
 
-            <span className="text-[11px] text-[#1e293b]/60 shrink-0 pl-2">
+            <span className="text-[11px] text-[#1e293b]/60 shrink-0 max-w-[45%] truncate" title={auction.sellerName}>
               Seller: {auction.sellerName.split(' ')[0]}
             </span>
           </div>
