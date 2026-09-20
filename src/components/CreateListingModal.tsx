@@ -1,8 +1,16 @@
 import React, { useEffect, useState } from 'react';
-import { X, Tag, Phone, PoundSterling, Clock, FileText, Image as ImageIcon, AlertCircle, Trash2, Upload, ChevronDown } from 'lucide-react';
-import { apiFetch } from '../lib/api';
+import { X, Tag, Phone, PoundSterling, Clock, FileText, Image as ImageIcon, AlertCircle, Trash2, Upload, ChevronDown, PencilLine, RefreshCw } from 'lucide-react';
+import { apiFetch, apiFetchAuthed } from '../lib/api';
 import { SELECTABLE_CATEGORIES } from '../lib/categories';
 import { User, AuctionItem } from '../types';
+import {
+  AUTH_ERROR_CODES,
+  LISTING_HAS_BIDS,
+  LISTING_NOT_EDITABLE,
+  NOT_LISTING_OWNER,
+  readErrorCode,
+  stripErrorCode,
+} from '../lib/apiErrors';
 
 interface CreateListingModalProps {
   isOpen: boolean;
@@ -10,6 +18,18 @@ interface CreateListingModalProps {
   onClose: () => void;
   onCreated: (auction: AuctionItem) => void;
   onPromptAuth: () => void;
+  /** Defaults to 'create'. 'edit' reuses this whole form to PATCH an existing listing instead of
+   *  creating a new one -- see the API contract: PATCH is seller-only and only while the listing
+   *  has zero bids, and it does not accept a duration (an auction's schedule cannot be edited). */
+  mode?: 'create' | 'edit';
+  /** Required when `mode` is 'edit': the listing being edited, used to prefill the form.
+   *  When it lacks `imageUrls` (e.g. a row from `GET /api/users/me/activity`, which ships only
+   *  `imageCount` -- see that field's doc comment on `AuctionItem`), the modal treats it as a
+   *  partial record: it prefills the text fields from it immediately, then re-fetches
+   *  `GET /api/auctions/:id` for the real images before the form can be submitted. */
+  initialAuction?: AuctionItem | null;
+  /** Required when `mode` is 'edit': called with the server's updated auction on a successful PATCH. */
+  onUpdated?: (auction: AuctionItem) => void;
 }
 
 const PRESET_DURATIONS = [
@@ -77,7 +97,12 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
   onClose,
   onCreated,
   onPromptAuth,
+  mode = 'create',
+  initialAuction = null,
+  onUpdated,
 }) => {
+  const isEditMode = mode === 'edit';
+
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [phoneNumber, setPhoneNumber] = useState('');
@@ -88,8 +113,35 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
   const [imagePreviews, setImagePreviews] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  // Edit mode only: true while re-fetching the full listing (see the effect below). Gates the
+  // submit button so a half-populated form -- e.g. `initialAuction` with no real images yet --
+  // can never be saved.
+  const [isLoadingListing, setIsLoadingListing] = useState(false);
+  // Set instead of the general `error` above so it can't be cleared by an unrelated action (e.g.
+  // picking an image resets `error`) and survives until the dialog is closed and reopened.
+  const [loadListingError, setLoadListingError] = useState<string | null>(null);
 
   const resetForm = () => {
+    if (isEditMode && initialAuction) {
+      setTitle(initialAuction.title);
+      setDescription(initialAuction.description);
+      setPhoneNumber(initialAuction.phoneNumber);
+      setStartingPrice(String(initialAuction.startingPrice));
+      setDurationMinutes(5);
+      setCustomDuration('');
+      setCategory(initialAuction.category || 'Electronics');
+      setImagePreviews(
+        Array.isArray(initialAuction.imageUrls) && initialAuction.imageUrls.length > 0
+          ? initialAuction.imageUrls
+          : initialAuction.imageUrl
+          ? [initialAuction.imageUrl]
+          : [],
+      );
+      setError(null);
+      setIsSubmitting(false);
+      return;
+    }
+
     setTitle('');
     setDescription('');
     setPhoneNumber('');
@@ -103,10 +155,84 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
   };
 
   useEffect(() => {
-    if (isOpen) {
-      resetForm();
+    if (!isOpen) {
+      return;
     }
-  }, [isOpen]);
+
+    // Instant first paint from whatever was passed in -- including, in the partial-row case
+    // below, the text fields, which the activity feed's summary row DOES carry accurately.
+    resetForm();
+    setLoadListingError(null);
+
+    if (!isEditMode || !initialAuction) {
+      setIsLoadingListing(false);
+      return;
+    }
+
+    // `imageUrls` is only ever present on a full row (see the doc comment on `imageCount` in
+    // `AuctionItem`); AuctionDetailModal's `auction` is one (it comes from, and is kept fresh by
+    // polling, `GET /api/auctions/:id`), so there is nothing to fetch and no need to touch the
+    // network again.
+    if (Array.isArray(initialAuction.imageUrls)) {
+      setIsLoadingListing(false);
+      return;
+    }
+
+    // Partial row -- e.g. AccountView's "My Listings", sourced from `/api/users/me/activity`,
+    // which ships `imageCount` instead of real image data. Re-fetch the full listing before the
+    // form can be trusted: submitting on the partial row's empty image list would PATCH
+    // `imageUrls: []` and get rejected as MISSING_IMAGES.
+    let cancelled = false;
+    setIsLoadingListing(true);
+
+    (async () => {
+      try {
+        const res = await apiFetch(`/api/auctions/${initialAuction.id}`);
+        const data = await res.json().catch(() => null);
+
+        if (cancelled) return;
+
+        if (!res.ok || !data?.auction) {
+          setLoadListingError('Could not load the current listing details. Please close this dialog and try again.');
+          return;
+        }
+
+        const fresh = data.auction as AuctionItem;
+        // Overwrite everything, including the fields `resetForm` already painted from the
+        // partial row above, so nothing stale from `initialAuction` can reach the PATCH body.
+        setTitle(fresh.title);
+        setDescription(fresh.description);
+        setPhoneNumber(fresh.phoneNumber);
+        setStartingPrice(String(fresh.startingPrice));
+        setCategory(fresh.category || 'Electronics');
+        setImagePreviews(
+          Array.isArray(fresh.imageUrls) && fresh.imageUrls.length > 0
+            ? fresh.imageUrls
+            : fresh.imageUrl
+            ? [fresh.imageUrl]
+            : [],
+        );
+      } catch (err) {
+        if (!cancelled) {
+          setLoadListingError('Network error while loading the current listing details. Please close this dialog and try again.');
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingListing(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // Depend on the listing's id, not the `initialAuction` object reference: AuctionDetailModal
+    // passes its polled `auction`, which gets a new object identity every ~3s even when nothing
+    // the user cares about has changed. Keying off identity would re-run this effect (and its
+    // `resetForm()`) on every poll tick, wiping out whatever the user has typed. Keying off `id`
+    // means it only re-runs when the modal opens or is genuinely pointed at a different listing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, isEditMode, initialAuction?.id]);
 
   if (!isOpen) return null;
 
@@ -115,6 +241,12 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
     evt.target.value = '';
 
     if (files.length === 0) {
+      return;
+    }
+
+    // The listing's real images may still be in flight (see the effect above); anything picked
+    // now would just be overwritten the moment that fetch resolves.
+    if (isEditMode && isLoadingListing) {
       return;
     }
 
@@ -134,6 +266,9 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
   };
 
   const removeImage = (indexToRemove: number) => {
+    if (isEditMode && isLoadingListing) {
+      return;
+    }
     setImagePreviews((current) => current.filter((_, index) => index !== indexToRemove));
     setError(null);
   };
@@ -144,6 +279,12 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
 
     if (!user) {
       onPromptAuth();
+      return;
+    }
+
+    // Belt-and-braces alongside the disabled submit button below: never let a PATCH out while
+    // the real record is still loading, or after it failed to load.
+    if (isEditMode && (isLoadingListing || loadListingError)) {
       return;
     }
 
@@ -176,20 +317,74 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
       return;
     }
 
-    const finalDuration = customDuration ? parseInt(customDuration, 10) : durationMinutes;
-    if (!Number.isInteger(finalDuration) || finalDuration <= 0) {
-      setError('Duration must be at least 1 minute.');
-      return;
+    // The duration field doesn't exist in edit mode at all (a listing's schedule can't be
+    // changed once published), so this validation -- and sending it in the request body below --
+    // only applies to creating a new listing.
+    let finalDuration = 0;
+    if (!isEditMode) {
+      finalDuration = customDuration ? parseInt(customDuration, 10) : durationMinutes;
+      if (!Number.isInteger(finalDuration) || finalDuration <= 0) {
+        setError('Duration must be at least 1 minute.');
+        return;
+      }
     }
 
     setIsSubmitting(true);
 
     try {
-      const res = await apiFetch('/api/auctions', {
+      if (isEditMode) {
+        if (!initialAuction) {
+          throw new Error('Nothing to save: no listing was provided to edit.');
+        }
+
+        const res = await apiFetchAuthed(`/api/auctions/${initialAuction.id}`, user.token, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: trimmedTitle,
+            description: trimmedDescription,
+            phoneNumber: trimmedPhoneNumber,
+            category: category.trim() || 'General',
+            imageUrls: imagePreviews,
+            startingPrice: priceNum,
+          }),
+        });
+
+        const data = await res.json().catch(() => null);
+
+        if (!res.ok) {
+          const code = readErrorCode(data);
+
+          if (code && AUTH_ERROR_CODES.has(code)) {
+            setError('Your session has expired. Please sign in again to save these changes.');
+            return;
+          }
+          if (code === LISTING_HAS_BIDS) {
+            setError('This listing already has bids and can no longer be edited. You can cancel it instead.');
+            return;
+          }
+          if (code === NOT_LISTING_OWNER) {
+            setError('You are not the seller of this listing, so it cannot be edited from here.');
+            return;
+          }
+          if (code === LISTING_NOT_EDITABLE) {
+            setError('This listing is no longer editable (it may have ended or already been cancelled).');
+            return;
+          }
+
+          setError(data?.error ? stripErrorCode(data.error) : `Request failed with status ${res.status}.`);
+          return;
+        }
+
+        onUpdated?.(data.auction);
+        onClose();
+        return;
+      }
+
+      const res = await apiFetchAuthed('/api/auctions', user.token, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${user.token}`,
         },
         body: JSON.stringify({
           title: trimmedTitle,
@@ -219,7 +414,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
       onCreated(data.auction);
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred while creating the listing.');
+      setError(err instanceof Error ? err.message : `An error occurred while ${isEditMode ? 'saving' : 'creating'} the listing.`);
     } finally {
       setIsSubmitting(false);
     }
@@ -233,11 +428,15 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
         <div className="flex items-center justify-between gap-2 px-4 sm:px-6 py-3 sm:py-4 border-b border-[#ccdbfd] bg-[#d7e3fc] shrink-0">
           <div className="flex items-center gap-2.5 min-w-0">
             <div className="w-8 h-8 shrink-0 rounded-lg bg-[#b6ccfe] flex items-center justify-center text-[#1e293b]">
-              <Tag className="w-4 h-4" />
+              {isEditMode ? <PencilLine className="w-4 h-4" /> : <Tag className="w-4 h-4" />}
             </div>
             <div className="min-w-0">
-              <h2 className="text-sm sm:text-lg font-bold text-[#1e293b] leading-tight">Create New Auction Listing</h2>
-              <p className="text-xs text-[#1e293b]/70 hidden sm:block">Publish an item for real-time live bidding</p>
+              <h2 className="text-sm sm:text-lg font-bold text-[#1e293b] leading-tight">
+                {isEditMode ? 'Edit Listing' : 'Create New Auction Listing'}
+              </h2>
+              <p className="text-xs text-[#1e293b]/70 hidden sm:block">
+                {isEditMode ? 'Update the details buyers see before any bids come in' : 'Publish an item for real-time live bidding'}
+              </p>
             </div>
           </div>
           <button
@@ -271,6 +470,28 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
         )}
 
         <form onSubmit={handleSubmit} className="p-4 sm:p-6 space-y-4">
+          {isEditMode && isLoadingListing && (
+            <div
+              id="edit-listing-loading"
+              role="status"
+              className="p-3 rounded-xl bg-[#d7e3fc] border border-[#ccdbfd] text-[#1e293b] text-xs font-semibold flex items-center gap-2"
+            >
+              <RefreshCw className="w-4 h-4 shrink-0 animate-spin" />
+              <span>Loading the current listing details…</span>
+            </div>
+          )}
+
+          {isEditMode && loadListingError && (
+            <div
+              id="edit-listing-load-error"
+              role="alert"
+              className="p-3 rounded-xl bg-red-100/90 border border-red-200 text-red-800 text-xs flex items-center gap-2"
+            >
+              <AlertCircle className="w-4 h-4 shrink-0" />
+              <span>{loadListingError}</span>
+            </div>
+          )}
+
           {error && (
             <div className="p-3 rounded-xl bg-red-100/90 border border-red-200 text-red-800 text-xs flex items-center gap-2">
               <AlertCircle className="w-4 h-4 shrink-0" />
@@ -350,6 +571,9 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
             </div>
           </div>
 
+          {/* An auction's schedule can't be edited once published (see the PATCH contract), so
+              this whole section only applies to creating a new listing. */}
+          {!isEditMode && (
           <div>
             <label className="block text-xs font-bold text-[#1e293b] mb-1.5 flex items-center flex-wrap justify-between gap-x-2 gap-y-0.5">
               <span>Auction Duration *</span>
@@ -389,6 +613,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
               className="mt-2 w-full px-3.5 py-2 min-h-[44px] text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b]"
             />
           </div>
+          )}
 
           <div>
             <label className="block text-xs font-bold text-[#1e293b] mb-1.5">
@@ -416,7 +641,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
               </div>
             )}
 
-            {imagePreviews.length < MAX_IMAGES && (
+            {imagePreviews.length < MAX_IMAGES && !(isEditMode && isLoadingListing) && (
               <label
                 htmlFor="listing-images-input"
                 className="flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-[#abc4ff] bg-[#edf2fb] px-3 py-3 min-h-[48px] text-xs font-semibold text-[#1e293b] transition-colors hover:bg-[#d7e3fc]"
@@ -472,11 +697,21 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
             <button
               id="submit-create-listing-btn"
               type="submit"
-              disabled={isSubmitting || !user}
+              disabled={isSubmitting || !user || (isEditMode && (isLoadingListing || !!loadListingError))}
               className="px-4 sm:px-5 py-2.5 min-h-[44px] rounded-xl bg-[#abc4ff] hover:bg-[#b6ccfe] border border-[#c1d3fe] text-xs font-extrabold text-[#1e293b] shadow-xs transition-colors cursor-pointer disabled:opacity-60 flex items-center justify-center gap-2 text-center"
             >
-              <Clock className="w-4 h-4 shrink-0" />
-              <span>{isSubmitting ? 'Starting Auction...' : 'Publish Live Auction'}</span>
+              {isEditMode ? <PencilLine className="w-4 h-4 shrink-0" /> : <Clock className="w-4 h-4 shrink-0" />}
+              <span>
+                {isEditMode
+                  ? isLoadingListing
+                    ? 'Loading...'
+                    : isSubmitting
+                    ? 'Saving...'
+                    : 'Save Changes'
+                  : isSubmitting
+                  ? 'Starting Auction...'
+                  : 'Publish Live Auction'}
+              </span>
             </button>
           </div>
         </form>

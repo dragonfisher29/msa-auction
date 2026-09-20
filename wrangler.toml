@@ -21,6 +21,12 @@ MAX_LISTINGS_PER_USER = "20"
 # At runtime the secret arrives on the same `env` object as the [vars] above,
 # so workers/index.ts needs no change.
 
+# Runs the `scheduled` handler in workers/index.ts once a minute to settle
+# auctions whose end_time has passed. Without this nothing in production ever
+# ends an auction or records a winner.
+[triggers]
+crons = ["* * * * *"]
+
 [observability]
 enabled = true
 

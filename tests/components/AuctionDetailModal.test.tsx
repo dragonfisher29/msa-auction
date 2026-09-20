@@ -5,10 +5,24 @@ import userEvent from '@testing-library/user-event';
 import { AuctionDetailModal } from '../../src/components/AuctionDetailModal';
 import { AuctionItem, User } from '../../src/types';
 
-vi.mock('../../src/lib/api', () => ({
-  apiFetch: vi.fn(),
-  resolveApiUrl: (path: string) => path,
-}));
+vi.mock('../../src/lib/api', () => {
+  const apiFetch = vi.fn();
+  return {
+    apiFetch,
+    resolveApiUrl: (path: string) => path,
+    // Mirrors the real helper in src/lib/api.ts so the assertions below observe the request
+    // exactly as it goes to the network, Authorization header included, through the single
+    // apiFetch spy.
+    apiFetchAuthed: (input: string, token: string | null | undefined, init?: RequestInit) =>
+      apiFetch(input, {
+        ...init,
+        headers: {
+          ...(init?.headers as Record<string, string> | undefined),
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+      }),
+  };
+});
 
 vi.mock('../../src/lib/realtime', () => ({
   startPolling: vi.fn(() => () => {}),
@@ -156,12 +170,11 @@ describe('AuctionDetailModal', () => {
           `/api/auctions/${auction.id}/bids`,
           {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              userId: bidderUser.id,
-              userName: bidderUser.name,
-              amount: 150.01,
-            }),
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${bidderUser.token}`,
+            },
+            body: JSON.stringify({ amount: 150.01 }),
           },
         );
       });
@@ -255,12 +268,11 @@ describe('AuctionDetailModal', () => {
           `/api/auctions/${auction.id}/bids`,
           {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              userId: bidderUser.id,
-              userName: bidderUser.name,
-              amount: 155,
-            }),
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${bidderUser.token}`,
+            },
+            body: JSON.stringify({ amount: 155 }),
           },
         );
       });
@@ -444,6 +456,40 @@ describe('AuctionDetailModal', () => {
       expect(document.getElementById('contact-whatsapp-btn')).toBeNull();
       // The plain tel: badge is unaffected
       expect(screen.getByText('12345')).toBeInTheDocument();
+    });
+  });
+
+  describe('report control', () => {
+    it('is offered to a signed-in user who is not the seller', async () => {
+      renderModal(makeAuction(), bidderUser);
+
+      const reportBtn = screen.getByRole('button', { name: /report the listing/i });
+      await userEvent.setup().click(reportBtn);
+
+      expect(await screen.findByRole('dialog', { name: /report this listing/i })).toBeInTheDocument();
+    });
+
+    it('is not offered to the seller, who has Cancel instead', () => {
+      const auction = makeAuction();
+      renderModal(auction, { ...bidderUser, id: auction.sellerId });
+
+      expect(document.getElementById('report-listing-btn')).toBeNull();
+    });
+
+    it('is not offered to a signed-out visitor', () => {
+      // The server needs a reporter id, and an anonymous report queue is a spam queue -- so
+      // this is left out entirely rather than bounced through a sign-in prompt.
+      renderModal(makeAuction(), null);
+
+      expect(document.getElementById('report-listing-btn')).toBeNull();
+    });
+
+    it('stays available on a concluded listing', () => {
+      // A scam is often only recognised after the fact, and the committee still wants to know
+      // about the account behind it.
+      renderModal(makeAuction({ status: 'ended', endTime: NOW - 60 * 1000 }), bidderUser);
+
+      expect(document.getElementById('report-listing-btn')).toBeInTheDocument();
     });
   });
 });

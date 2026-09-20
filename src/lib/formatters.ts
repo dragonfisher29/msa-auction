@@ -74,6 +74,19 @@ export function formatTimestamp(timestamp: number): string {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+// formatTimestamp above is deliberately clock-only: it labels bids inside a live auction, where
+// the day is never in question. The moderation queue is the opposite case -- a report can sit
+// there for a week -- so it needs the date too. Same locale-default approach, one place.
+export function formatDateTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  return date.toLocaleString([], {
+    day: 'numeric',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
 // wa.me needs a bare international number: digits only, no '+', no '00' prefix, no spaces or
 // punctuation. Sellers are required to enter their own country code at listing time, so nothing
 // is prefixed here -- guessing one would silently send buyers to the wrong number.

@@ -1,7 +1,12 @@
-import React, { useState, useEffect } from 'react';
-import { Clock, TrendingUp, User as UserIcon, Phone, ArrowUpRight, Trophy, Star, ShieldAlert, CheckCircle2, Images } from 'lucide-react';
+import React, { useState, useEffect, useMemo } from 'react';
+import { Clock, TrendingUp, User as UserIcon, Phone, ArrowUpRight, Trophy, Star, ShieldAlert, CheckCircle2, Images, ImageOff } from 'lucide-react';
 import { AuctionItem, User } from '../types';
 import { formatCurrency, formatTimeRemaining } from '../lib/formatters';
+import { fetchAuctionImages } from '../lib/images';
+import { useInViewport } from '../lib/useInViewport';
+
+const FALLBACK_IMAGE_URL =
+  'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?auto=format&fit=crop&w=800&q=80';
 
 interface AuctionCardProps {
   auction: AuctionItem;
@@ -30,28 +35,76 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({
     return () => clearInterval(interval);
   }, [auction.endTime]);
 
-  const isEnded = auction.status === 'ended' || timeInfo.isEnded;
+  const isEnded = auction.status === 'ended' || auction.status === 'cancelled' || timeInfo.isEnded;
   const isHighestBidder = Boolean(user && auction.highestBidderId === user.id);
   const hasUserBid = Boolean(user && auction.bids.some((b) => b.userId === user.id));
   const isOutbid = hasUserBid && !isHighestBidder && !isEnded;
 
-  const imageCount = Array.isArray(auction.imageUrls)
-    ? auction.imageUrls.filter((url) => typeof url === 'string' && url.trim() !== '').length
-    : 0;
+  // The paginated list endpoint (`GET /api/auctions`) ships no image data at all on a row --
+  // only `imageCount`, so the card knows whether to bother fetching before it has anything to
+  // show. Some callers (AccountView's activity feed, a freshly created listing, a single-item
+  // fetch) still hand over the full object with `imageUrls` inline; that path is preferred when
+  // present since it needs no network round trip at all.
+  const inlineImages = useMemo(
+    () => (Array.isArray(auction.imageUrls) ? auction.imageUrls.filter((url) => typeof url === 'string' && url.trim() !== '') : null),
+    [auction.imageUrls],
+  );
+
+  const knownImageCount = inlineImages ? inlineImages.length : (auction.imageCount ?? 0);
+
+  const [fetchedImages, setFetchedImages] = useState<string[] | null>(null);
+  const needsFetch = !inlineImages && knownImageCount > 0;
+  const [containerRef, isInViewport] = useInViewport<HTMLDivElement>();
+
+  // Fetch at most once per auction id: the 5s list poll hands this card a brand-new `auction`
+  // object every tick, but the effect below only depends on `auction.id`, and `fetchAuctionImages`
+  // itself caches by id -- so polling a page of cards triggers zero additional image requests
+  // after the first load.
+  useEffect(() => {
+    if (!needsFetch || !isInViewport) {
+      return;
+    }
+    let cancelled = false;
+    fetchAuctionImages(auction.id).then((urls) => {
+      if (!cancelled) {
+        setFetchedImages(urls);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [needsFetch, isInViewport, auction.id]);
+
+  const resolvedImages = inlineImages ?? fetchedImages;
+  const primaryImageSrc = resolvedImages?.[0] || FALLBACK_IMAGE_URL;
+  const isImageLoading = needsFetch && fetchedImages === null;
 
   return (
     <div
       id={`auction-card-${auction.id}`}
       className="group flex flex-col bg-[#e2eafc] hover:bg-[#d7e3fc] border border-[#ccdbfd] hover:border-[#b6ccfe] rounded-2xl overflow-hidden shadow-xs hover:shadow-md transition-all duration-200 text-[#1e293b] relative"
     >
-      {/* Card Image Banner */}
-      <div className="relative h-44 sm:h-48 w-full overflow-hidden bg-[#d7e3fc]">
-        <img
-          src={auction.imageUrl || 'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?auto=format&fit=crop&w=800&q=80'}
-          alt={auction.title}
-          referrerPolicy="no-referrer"
-          className="w-full h-full object-cover group-hover:scale-103 transition-transform duration-300"
-        />
+      {/* Card Image Banner: fixed height regardless of load state, so a card never reflows once
+          its image (or the "no photos" placeholder) actually resolves. */}
+      <div ref={containerRef} className="relative h-44 sm:h-48 w-full overflow-hidden bg-[#d7e3fc]">
+        {isImageLoading ? (
+          <div className="w-full h-full animate-pulse bg-[#ccdbfd]" aria-hidden="true" />
+        ) : knownImageCount === 0 && !resolvedImages ? (
+          <div className="w-full h-full flex flex-col items-center justify-center gap-1.5 bg-[#ccdbfd]/60 text-[#1e293b]/50">
+            <ImageOff className="w-6 h-6" />
+            <span className="text-[10px] font-bold uppercase tracking-wider">No photos</span>
+          </div>
+        ) : (
+          <img
+            src={primaryImageSrc}
+            alt={auction.title}
+            referrerPolicy="no-referrer"
+            loading="lazy"
+            decoding="async"
+            className="w-full h-full object-cover group-hover:scale-103 transition-transform duration-300"
+          />
+        )}
 
         {/* Top Badges (Status, Category, User Bid Status) */}
         <div className="absolute top-2.5 left-2.5 right-2.5 sm:top-3 sm:left-3 sm:right-3 flex items-start justify-between gap-1.5 pointer-events-none">
@@ -59,7 +112,7 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({
             {isEnded ? (
               <span className="px-2.5 py-1 rounded-full text-xs font-extrabold bg-slate-800 text-slate-100 shadow-xs flex items-center gap-1">
                 <Trophy className="w-3.5 h-3.5 text-amber-300" />
-                Ended
+                {auction.status === 'cancelled' ? 'Cancelled' : 'Ended'}
               </span>
             ) : timeInfo.isUrgent ? (
               <span className="px-2.5 py-1 rounded-full text-xs font-extrabold bg-rose-500 text-white shadow-xs animate-pulse flex items-center gap-1">
@@ -108,15 +161,16 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({
           )}
         </div>
 
-        {/* Multi-image hint: bottom-left, clear of the top badges and the countdown pill */}
-        {imageCount > 1 && (
+        {/* Multi-image hint: bottom-left, clear of the top badges and the countdown pill. Uses
+            the server-reported count immediately -- it doesn't wait on the lazy image fetch. */}
+        {knownImageCount > 1 && (
           <div
             id={`auction-card-image-count-${auction.id}`}
-            title={`${imageCount} photos`}
+            title={`${knownImageCount} photos`}
             className="absolute bottom-3 left-3 px-2 py-1 rounded-xl bg-[#1e293b]/70 backdrop-blur-xs text-white text-[11px] font-bold flex items-center gap-1 shadow-sm"
           >
             <Images className="w-3.5 h-3.5 opacity-90" />
-            <span>{imageCount}</span>
+            <span>{knownImageCount}</span>
           </div>
         )}
 

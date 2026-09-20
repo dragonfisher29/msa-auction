@@ -18,6 +18,8 @@ import {
   ChevronLeft,
   ChevronRight,
   MessageCircle,
+  Link as LinkIcon,
+  Flag,
 } from 'lucide-react';
 import { AuctionItem, User } from '../types';
 import {
@@ -27,8 +29,13 @@ import {
   formatTimeRemaining,
   formatTimestamp,
 } from '../lib/formatters';
-import { apiFetch } from '../lib/api';
+import { apiFetch, apiFetchAuthed } from '../lib/api';
 import { startPolling } from '../lib/realtime';
+import { AUTH_ERROR_CODES, readErrorCode, stripErrorCode } from '../lib/apiErrors';
+import { ListingActions } from './ListingActions';
+import { CreateListingModal } from './CreateListingModal';
+import { CancelListingModal } from './CancelListingModal';
+import { ReportListingModal } from './ReportListingModal';
 
 const FALLBACK_IMAGE_URL =
   'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?auto=format&fit=crop&w=800&q=80';
@@ -36,13 +43,6 @@ const FALLBACK_IMAGE_URL =
 // Minimum horizontal travel (px) before a touch counts as a swipe rather than a tap or a
 // vertical scroll that happened to drift sideways.
 const SWIPE_THRESHOLD_PX = 50;
-
-// The API appends a machine-readable " [Code: SOME_CODE]" suffix to error messages for API
-// consumers and logs (see workers/index.ts). That suffix is not meant for end users, so strip
-// it before rendering the message in the UI.
-function stripErrorCode(message: string): string {
-  return message.replace(/\s*\[Code:\s*[^\]]+\]\s*$/, '');
-}
 
 interface AuctionDetailModalProps {
   auction: AuctionItem;
@@ -63,11 +63,18 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
   const [timeInfo, setTimeInfo] = useState(() => formatTimeRemaining(auction.endTime));
   const [bidAmount, setBidAmount] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
+  // Set alongside `error` when the failure was an expired/absent session: the error block then
+  // also renders a sign-in button, because no amount of retrying fixes this one.
+  const [isAuthError, setIsAuthError] = useState(false);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [copiedPhone, setCopiedPhone] = useState(false);
+  const [copiedLink, setCopiedLink] = useState(false);
   const [flashNewBid, setFlashNewBid] = useState(false);
   const [activeImageIndex, setActiveImageIndex] = useState(0);
+  const [isEditOpen, setIsEditOpen] = useState(false);
+  const [isCancelOpen, setIsCancelOpen] = useState(false);
+  const [isReportOpen, setIsReportOpen] = useState(false);
 
   const bidHistoryEndRef = useRef<HTMLDivElement | null>(null);
   const touchStartXRef = useRef<number | null>(null);
@@ -237,14 +244,24 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
     return stopPoll;
   }, [auction.id]);
 
-  const isEnded = auction.status === 'ended' || timeInfo.isEnded;
+  const isCancelled = auction.status === 'cancelled';
+  const isEnded = isCancelled || auction.status === 'ended' || timeInfo.isEnded;
   const isSeller = user && user.id === auction.sellerId;
   const isTopBidder = user && user.id === auction.highestBidderId;
+
+  const shareUrl = typeof window !== 'undefined' ? `${window.location.origin}/auction/${auction.id}` : `/auction/${auction.id}`;
+
+  const copyShareLink = () => {
+    navigator.clipboard.writeText(shareUrl);
+    setCopiedLink(true);
+    setTimeout(() => setCopiedLink(false), 2000);
+  };
 
   // Handle Placing a Bid via the REST API
   const handlePlaceBid = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setIsAuthError(false);
     setSuccessMessage(null);
 
     if (!user) {
@@ -283,19 +300,39 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
     setIsSubmitting(true);
 
     try {
-      const res = await apiFetch(`/api/auctions/${auction.id}/bids`, {
+      // The bidder is identified by the bearer token now; userId/userName in the body are
+      // ignored server-side, so they are no longer sent.
+      const res = await apiFetchAuthed(`/api/auctions/${auction.id}/bids`, user.token, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: user.id,
-          userName: user.name,
-          amount: numericAmount,
-        }),
+        body: JSON.stringify({ amount: numericAmount }),
       });
 
       const data = await res.json().catch(() => null);
 
       if (!res.ok) {
+        const code = readErrorCode(data);
+
+        if (code && AUTH_ERROR_CODES.has(code)) {
+          // Distinct from the generic error: retrying cannot help, so point at sign-in.
+          setIsAuthError(true);
+          setError(
+            code === 'SESSION_EXPIRED'
+              ? 'Your session has expired. Please sign in again to place this bid.'
+              : 'Please sign in again to place this bid.',
+          );
+          return;
+        }
+
+        if (code === 'BID_CONFLICT') {
+          // Leave the typed amount in the field so a retry is one tap. Pinning the "edited"
+          // flag stops the suggested-bid effect from clobbering it when the 3s poll brings
+          // back the rival's higher price a moment from now.
+          hasUserEditedBidRef.current = true;
+          setError('Another bid landed at the same moment. Please try again.');
+          return;
+        }
+
         setError(data?.error ? stripErrorCode(data.error) : 'Unable to place your bid. Please try again.');
         return;
       }
@@ -330,6 +367,7 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
     const currentBase = parseFloat(bidAmount) || suggestedBid;
     setBidAmount((currentBase + inc).toString());
     setError(null);
+    setIsAuthError(false);
   };
 
   const whatsAppUrl = buildWhatsAppUrl(
@@ -360,7 +398,7 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
               {isEnded ? (
                 <>
                   <Trophy className="w-3.5 h-3.5 text-amber-300" />
-                  AUCTION ENDED
+                  {isCancelled ? 'LISTING CANCELLED' : 'AUCTION ENDED'}
                 </>
               ) : (
                 <>
@@ -377,20 +415,34 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
             )}
           </div>
 
-          <button
-            id="close-auction-detail-btn"
-            onClick={onClose}
-            aria-label="Close auction details"
-            className="shrink-0 inline-flex items-center justify-center p-2 min-h-[44px] min-w-[44px] rounded-lg text-[#1e293b]/70 hover:text-[#1e293b] hover:bg-[#c1d3fe] transition-colors"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              id="copy-auction-link-btn"
+              type="button"
+              onClick={copyShareLink}
+              title="Copy link to this auction"
+              aria-label="Copy link to this auction"
+              className="inline-flex items-center justify-center gap-1.5 px-2.5 min-h-[44px] rounded-lg text-[#1e293b]/70 hover:text-[#1e293b] hover:bg-[#c1d3fe] transition-colors"
+            >
+              {copiedLink ? <Check className="w-4 h-4 text-emerald-600" /> : <LinkIcon className="w-4 h-4" />}
+              <span className="text-xs font-bold hidden sm:inline">{copiedLink ? 'Copied!' : 'Copy Link'}</span>
+            </button>
+
+            <button
+              id="close-auction-detail-btn"
+              onClick={onClose}
+              aria-label="Close auction details"
+              className="shrink-0 inline-flex items-center justify-center p-2 min-h-[44px] min-w-[44px] rounded-lg text-[#1e293b]/70 hover:text-[#1e293b] hover:bg-[#c1d3fe] transition-colors"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         {/* Modal Scrollable Content */}
         <div className="overflow-y-auto overscroll-contain p-4 sm:p-6 space-y-4 sm:space-y-6">
           
-          {/* Winner Announcement Banner (If Ended) */}
+          {/* Winner Announcement Banner (If Ended or Cancelled) */}
           {isEnded && (
             <div className="p-3 sm:p-4 rounded-2xl bg-[#d7e3fc] border-2 border-[#abc4ff] shadow-sm flex items-center gap-3 sm:gap-4">
               <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-xl bg-[#abc4ff] text-[#1e293b] flex items-center justify-center shrink-0 shadow-xs">
@@ -398,15 +450,19 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
               </div>
               <div className="flex-1 min-w-0">
                 <h3 className="text-sm sm:text-base font-extrabold text-[#1e293b] flex items-center flex-wrap gap-2">
-                  Auction Concluded!
-                  {auction.winnerId === user?.id && (
+                  {isCancelled ? 'Listing Cancelled' : 'Auction Concluded!'}
+                  {!isCancelled && auction.winnerId === user?.id && (
                     <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300 font-bold">
                       You Won!
                     </span>
                   )}
                 </h3>
                 <p className="text-xs text-[#1e293b]/80 mt-0.5 break-words">
-                  {auction.winnerName ? (
+                  {isCancelled ? (
+                    auction.bids.length > 0
+                      ? 'The seller cancelled this listing. Bidders can still see it, but bidding is closed.'
+                      : 'The seller cancelled this listing before it received any bids.'
+                  ) : auction.winnerName ? (
                     <>
                       Winner: <strong className="text-[#1e293b] font-bold">{auction.winnerName}</strong> with winning bid of{' '}
                       <strong className="text-[#1e293b] font-bold">{formatCurrency(auction.currentPrice)}</strong>.
@@ -651,9 +707,24 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
                 </h4>
 
                 {error && (
-                  <div className="mb-3 p-2.5 rounded-xl bg-red-100/95 border border-red-200 text-red-800 text-xs flex items-center gap-2">
+                  <div
+                    id="place-bid-error"
+                    role="alert"
+                    className="mb-3 p-2.5 rounded-xl bg-red-100/95 border border-red-200 text-red-800 text-xs flex flex-wrap items-center gap-2"
+                  >
                     <AlertCircle className="w-4 h-4 shrink-0" />
-                    <span>{error}</span>
+                    <span className="min-w-0 flex-1">{error}</span>
+                    {isAuthError && (
+                      <button
+                        id="bid-error-sign-in-btn"
+                        type="button"
+                        onClick={onPromptAuth}
+                        className="shrink-0 inline-flex items-center justify-center gap-1.5 px-3 min-h-[44px] rounded-xl bg-[#abc4ff] hover:bg-[#b6ccfe] border border-[#c1d3fe] text-[#1e293b] font-extrabold transition-colors cursor-pointer"
+                      >
+                        <UserIcon className="w-3.5 h-3.5" />
+                        <span>Sign In Again</span>
+                      </button>
+                    )}
                   </div>
                 )}
 
@@ -706,6 +777,7 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
                             hasUserEditedBidRef.current = true;
                             setBidAmount(e.target.value);
                             setError(null);
+                            setIsAuthError(false);
                           }}
                           className="w-full pl-8 pr-3 py-2 min-h-[44px] text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-bold"
                           placeholder={suggestedBid.toString()}
@@ -731,6 +803,38 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
                   </form>
                 )}
               </div>
+
+              {/* Seller-only Edit / Cancel controls. Renders nothing once the listing is no
+                  longer active -- there's nothing left to change on an ended or already
+                  cancelled listing. */}
+              {isSeller && (
+                <ListingActions
+                  auction={auction}
+                  onEdit={() => setIsEditOpen(true)}
+                  onCancel={() => setIsCancelOpen(true)}
+                />
+              )}
+
+              {/* Report: any signed-in user EXCEPT the seller, who has Cancel above and does
+                  not need to report themselves. Deliberately still available on an ended or
+                  cancelled listing -- a scam is often only recognised after the fact, and the
+                  committee still wants to know about the account behind it. Left out entirely
+                  for signed-out visitors rather than bounced to sign-in: the server needs a
+                  reporter id, and an anonymous report queue is a spam queue. */}
+              {user && !isSeller && (
+                <div className="flex justify-end">
+                  <button
+                    id="report-listing-btn"
+                    type="button"
+                    onClick={() => setIsReportOpen(true)}
+                    aria-label={`Report the listing ${auction.title} to the committee`}
+                    className="inline-flex items-center justify-center gap-1.5 px-3 min-h-[44px] rounded-xl bg-[#d7e3fc] hover:bg-[#c1d3fe] border border-[#ccdbfd] text-xs font-bold text-[#1e293b] transition-colors cursor-pointer"
+                  >
+                    <Flag className="w-3.5 h-3.5 text-red-600" />
+                    <span>Report Listing</span>
+                  </button>
+                </div>
+              )}
 
               {/* Real-Time Live Bid History Feed */}
               <div className="p-3 sm:p-4 rounded-2xl bg-[#d7e3fc] border border-[#ccdbfd] flex-1 flex flex-col min-h-[160px] max-h-[220px]">
@@ -797,6 +901,40 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
         </div>
 
       </div>
+
+      {isEditOpen && (
+        <CreateListingModal
+          isOpen={isEditOpen}
+          user={user}
+          mode="edit"
+          initialAuction={auction}
+          onClose={() => setIsEditOpen(false)}
+          onCreated={() => {}}
+          onUpdated={(updated) => {
+            setAuction(updated);
+            onAuctionUpdated(updated);
+            setIsEditOpen(false);
+          }}
+          onPromptAuth={onPromptAuth}
+        />
+      )}
+
+      {isReportOpen && user && (
+        <ReportListingModal auction={auction} user={user} onClose={() => setIsReportOpen(false)} />
+      )}
+
+      {isCancelOpen && user && (
+        <CancelListingModal
+          auction={auction}
+          user={user}
+          onClose={() => setIsCancelOpen(false)}
+          onCancelled={(updated) => {
+            setAuction(updated);
+            onAuctionUpdated(updated);
+            setIsCancelOpen(false);
+          }}
+        />
+      )}
     </div>
   );
 };

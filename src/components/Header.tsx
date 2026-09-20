@@ -1,24 +1,43 @@
 import React from 'react';
-import { Plus, User as UserIcon, LogOut, Radio } from 'lucide-react';
+import { Plus, User as UserIcon, LogOut, Radio, LayoutList, ShieldCheck } from 'lucide-react';
 import { User } from '../types';
+import { NotificationBell } from './NotificationBell';
 
 interface HeaderProps {
   user: User | null;
   isConnected: boolean;
+  isAccountViewOpen: boolean;
+  /** True while the `/admin` route is open, so its button can read as pressed. */
+  isAdminViewOpen?: boolean;
   onOpenAuth: () => void;
   onOpenCreate: () => void;
   onLogout: () => void;
   onQuickSwitchUser: (username: string) => void;
+  onToggleAccountView: () => void;
+  onOpenAuctionById: (auctionId: string) => void;
+  /** Navigates to `/admin`. Optional so existing callers/tests keep working unchanged. */
+  onOpenAdminView?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   user,
   isConnected,
+  isAccountViewOpen,
+  isAdminViewOpen = false,
   onOpenAuth,
   onOpenCreate,
   onLogout,
   onQuickSwitchUser,
+  onToggleAccountView,
+  onOpenAuctionById,
+  onOpenAdminView,
 }) => {
+  // DISPLAY ONLY. `role` arrives from the server and is cached in localStorage, both of which
+  // the person at the browser can edit -- so this decides whether the button is RENDERED and
+  // nothing more. `/api/admin/*` is gated by `requireAdmin` server-side, which re-reads the
+  // role from the database on every request. Do not treat this as a permission check.
+  const showAdminLink = Boolean(user && user.role === 'admin' && onOpenAdminView);
+
   return (
     <header className="sticky top-0 z-30 bg-[#e2eafc] border-b border-[#ccdbfd] shadow-sm backdrop-blur-md bg-opacity-95">
       <div className="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-2 sm:gap-4">
@@ -88,11 +107,48 @@ export const Header: React.FC<HeaderProps> = ({
                 </span>
               </div>
 
+              {/* Notifications: signed-in only, so nothing is rendered and nothing is
+                  requested for an anonymous visitor. Keyed by user id so switching accounts
+                  never shows the previous account's read state. */}
+              <NotificationBell key={user.id} user={user} onOpenAuction={onOpenAuctionById} />
+
               {/* User Dropdown / Switcher */}
               <div className="flex items-center gap-1 sm:gap-1.5 bg-[#d7e3fc] border border-[#ccdbfd] rounded-xl p-1 shrink-0">
                 <div className="w-7 h-7 rounded-lg bg-[#b6ccfe] text-[#1e293b] flex items-center justify-center font-bold text-xs shrink-0">
                   {user.name.charAt(0).toUpperCase()}
                 </div>
+
+                <button
+                  id="my-account-btn"
+                  onClick={onToggleAccountView}
+                  title={isAccountViewOpen ? 'Back to auctions' : 'My account'}
+                  aria-label={isAccountViewOpen ? 'Back to auctions' : 'My account: listings, bids and wins'}
+                  aria-pressed={isAccountViewOpen}
+                  className={`inline-flex items-center justify-center p-2 min-h-[44px] min-w-[44px] rounded-lg transition-colors cursor-pointer ${
+                    isAccountViewOpen
+                      ? 'bg-[#abc4ff] text-[#1e293b]'
+                      : 'text-[#1e293b]/80 hover:text-[#1e293b] hover:bg-[#c1d3fe]'
+                  }`}
+                >
+                  <LayoutList className="w-3.5 h-3.5" />
+                </button>
+
+                {showAdminLink && (
+                  <button
+                    id="admin-panel-btn"
+                    onClick={onOpenAdminView}
+                    title={isAdminViewOpen ? 'Back to auctions' : 'Committee admin'}
+                    aria-label="Committee admin: reports, takedowns and password resets"
+                    aria-pressed={isAdminViewOpen}
+                    className={`inline-flex items-center justify-center p-2 min-h-[44px] min-w-[44px] rounded-lg transition-colors cursor-pointer ${
+                      isAdminViewOpen
+                        ? 'bg-[#abc4ff] text-[#1e293b]'
+                        : 'text-[#1e293b]/80 hover:text-[#1e293b] hover:bg-[#c1d3fe]'
+                    }`}
+                  >
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                  </button>
+                )}
 
                 <button
                   id="user-logout-btn"
