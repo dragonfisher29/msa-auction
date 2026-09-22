@@ -6,6 +6,49 @@ compatibility_date = "2026-09-09"
 directory = "./dist"
 not_found_handling = "single-page-application"
 
+# ===========================================================================
+# R2 OBJECT STORAGE -- INTENTIONALLY DISABLED. DO NOT UNCOMMENT BLINDLY.
+# ===========================================================================
+#
+# WHY IT IS OFF
+#
+# Enabling R2 on a Cloudflare account requires a payment method on file, even
+# to stay inside the free allowance. This is a university society's project and
+# nobody wants to attach a personal card to it, so R2 is not available. That is
+# a hard constraint, not a preference or a "not yet".
+#
+# A Worker that names a bucket which does not exist FAILS TO DEPLOY OUTRIGHT.
+# So this block stays commented out until a bucket actually exists.
+#
+# WHAT HAPPENS WHILE IT IS OFF
+#
+# Listing images are stored the way they always were: base64 `data:` URLs in
+# `auctions.image_urls`. Nothing is broken by the binding being absent --
+# `workers/index.ts` checks for `env.IMAGES` on every R2 path and degrades:
+#   POST /api/images          -> 503 IMAGE_STORAGE_UNAVAILABLE
+#   GET  /images/:key         -> 404 IMAGE_NOT_FOUND
+#   POST /api/admin/migrate-images -> 503 IMAGE_STORAGE_UNAVAILABLE
+# The client falls back to inlining the image itself, so listing creation works.
+#
+# TO TURN R2 ON LATER (only worth doing if Supabase egress is still too high)
+#
+#   1. Add a payment method to the Cloudflare account.
+#   2. npx wrangler r2 bucket create msa-auction-images
+#   3. Uncomment the three `[[r2_buckets]]` lines below.
+#   4. npx wrangler deploy
+#   5. Run the backfill: POST /api/admin/migrate-images as an admin, repeatedly,
+#      until `migrated` comes back 0. See the appendix in DEPLOY.md.
+#
+# NOTHING ELSE NEEDS CHANGING. No code edit, no migration, no client change --
+# the R2 implementation is still present and tested, it just has no bucket to
+# talk to. New uploads start going to R2 the moment the binding appears, and a
+# listing holding a mixture of `data:` URLs and `/images/<key>` paths is valid
+# in both directions.
+#
+# [[r2_buckets]]
+# binding = "IMAGES"
+# bucket_name = "msa-auction-images"
+
 # Everything under [vars] is PLAINTEXT configuration. It is committed to this repo,
 # readable in git history, and visible in the Cloudflare dashboard. Never put a
 # credential here.

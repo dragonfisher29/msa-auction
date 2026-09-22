@@ -18,6 +18,7 @@ import { createClient } from '@supabase/supabase-js';
 import { Server as SocketIOServer } from 'socket.io';
 import { createServer as createViteServer } from 'vite';
 import fs from 'fs/promises';
+import { startStaleImageCleanup } from './maintenance';
 import {
   AUCTION_LIST_COLUMNS,
   AUCTION_META_COLUMNS,
@@ -32,8 +33,11 @@ import {
   fetchAuctionListPage,
   hashPassword,
   hideAuction,
+  IMAGE_BACKFILL_UNAVAILABLE_MESSAGE,
+  IMAGE_STORAGE_UNAVAILABLE_MESSAGE,
   injectAuctionMeta,
   isAdminUser,
+  isAllowedImageRef,
   isAuctionVisible,
   isBannedUser,
   isBearerTokenAdmin,
@@ -388,6 +392,17 @@ function validateAuctionInput(raw: any) {
     return makeError('You can upload up to 3 images per listing.', 'TOO_MANY_IMAGES');
   }
 
+  // Each entry must be an image this site itself holds: an inline `data:` URL,
+  // or an `/images/<key>` path from `POST /api/images`. An arbitrary external
+  // URL is refused - accepting one would let a listing point the site's own
+  // pages at any third-party host.
+  //
+  // Both forms are accepted unconditionally. See the matching comment in
+  // `workers/index.ts` for why narrowing this would break editing.
+  if (!normalizedImageUrls.every((value: string) => isAllowedImageRef(value))) {
+    return makeError('Listing images must be uploaded through this site.', 'INVALID_IMAGE_URL');
+  }
+
   return {
     title,
     description,
@@ -429,41 +444,6 @@ async function updateEndedAuctions(io: SocketIOServer) {
   }
 }
 
-async function cleanupStaleImages(): Promise<number> {
-  try {
-    const ninetyDaysAgo = Date.now() - (90 * 24 * 60 * 60 * 1000);
-    const { data, error } = await supabase
-      .from('auctions')
-      .select('id, created_at, image_url, image_urls')
-      .lt('created_at', ninetyDaysAgo);
-
-    if (error || !data) return 0;
-
-    let cleanedCount = 0;
-    for (const row of data) {
-      const hasMainImage = typeof row.image_url === 'string' && row.image_url.trim().length > 0;
-      const imageUrls = parseJsonArray<string>(row.image_urls);
-      if (hasMainImage || imageUrls.length > 0) {
-        await supabase
-          .from('auctions')
-          .update({
-            image_url: null,
-            image_urls: '[]',
-          })
-          .eq('id', row.id);
-        cleanedCount++;
-      }
-    }
-    if (cleanedCount > 0) {
-      console.log(`[Maintenance] Cleaned stale images for ${cleanedCount} auction(s) older than 90 days.`);
-    }
-    return cleanedCount;
-  } catch (err) {
-    console.error('Failed to clean up stale images:', err);
-    return 0;
-  }
-}
-
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -482,11 +462,15 @@ async function startServer() {
     void updateEndedAuctions(io);
   }, 1000);
 
-  // Run stale image cleanup on startup and every 6 hours
-  void cleanupStaleImages();
-  setInterval(() => {
-    void cleanupStaleImages();
-  }, 6 * 60 * 60 * 1000);
+  // Stale image cleanup. OFF unless ENABLE_STALE_IMAGE_CLEANUP=true.
+  //
+  // This used to run unconditionally, here and every 6 hours. It blanks the
+  // images on every listing older than 90 days, and because `.env` points at
+  // the same Supabase project as production and the images ARE the database
+  // rows, starting the dev server destroyed real photos with no way back. It
+  // now only runs when explicitly asked for; `maintenance.ts` has the full
+  // reasoning and logs which state it is in at startup either way.
+  startStaleImageCleanup({ supabase });
 
   io.on('connection', (socket) => {
     socket.on('join_auction', async ({ auctionId }: { auctionId: string }) => {
@@ -584,6 +568,39 @@ async function startServer() {
         });
       },
     );
+  });
+
+  /* ------------------------------------------------------------------------ */
+  /* Images: no object storage here, and none in production either.            */
+  /*                                                                          */
+  /* An R2 bucket is a Worker binding, and this Express process has no         */
+  /* bindings - so there was never anywhere for an upload to go here. That now */
+  /* matches production, where the `[[r2_buckets]]` block in wrangler.toml is  */
+  /* commented out because enabling R2 needs a payment method on the account.  */
+  /*                                                                          */
+  /* These three routes therefore return exactly what the Worker returns with  */
+  /* no binding bound, byte for byte: the same status and the same error code. */
+  /* That is the point. The client's base64 fallback is driven by the          */
+  /* `IMAGE_STORAGE_UNAVAILABLE` code, and a fallback that only triggers in    */
+  /* one of the two environments is a fallback nobody has actually tested.     */
+  /*                                                                          */
+  /* Read paths are unaffected: a listing's existing images render here in     */
+  /* either form. An inline `data:` URL is self-contained, and an              */
+  /* `/images/<key>` path is served by the deployed Worker.                    */
+  /* ------------------------------------------------------------------------ */
+
+  app.post('/api/images', (_req, res) => {
+    res.status(503).json(makeError(IMAGE_STORAGE_UNAVAILABLE_MESSAGE, 'IMAGE_STORAGE_UNAVAILABLE'));
+  });
+
+  // 404, not 503: with no bucket anywhere, no key was ever minted, so there is
+  // genuinely no object at this path. Mirrors the Worker.
+  app.get('/images/:key', (_req, res) => {
+    res.status(404).json(makeError('Image not found.', 'IMAGE_NOT_FOUND'));
+  });
+
+  app.post('/api/admin/migrate-images', (_req, res) => {
+    res.status(503).json(makeError(IMAGE_BACKFILL_UNAVAILABLE_MESSAGE, 'IMAGE_STORAGE_UNAVAILABLE'));
   });
 
   app.get('/api/health', async (_req, res) => {

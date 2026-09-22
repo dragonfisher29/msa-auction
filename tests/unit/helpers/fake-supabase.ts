@@ -7,7 +7,7 @@
  * without touching a real database.
  */
 
-export type FilterOp = 'eq' | 'is' | 'lte' | 'neq' | 'or' | 'gt' | 'in';
+export type FilterOp = 'eq' | 'is' | 'lte' | 'neq' | 'or' | 'gt' | 'in' | 'like';
 
 export interface RecordedFilter {
   op: FilterOp;
@@ -38,6 +38,12 @@ export interface FakeSupabaseOptions {
   beforeUpdate?: (context: { table: string; payload: any; filters: RecordedFilter[]; attempt: number }) => void;
   /** Force an error result from the next matching operation. */
   errorOn?: (context: { table: string; op: 'select' | 'update' | 'insert' }) => any | null;
+  /**
+   * Models a PostgREST `like` that silently matches nothing rather than
+   * erroring - the one failure mode of the image backfill's indexed filter that
+   * would otherwise be indistinguishable from "there is no work left".
+   */
+  likeMatchesNothing?: boolean;
 }
 
 function clone<T>(value: T): T {
@@ -267,7 +273,26 @@ function matchesFilter(row: any, filter: RecordedFilter): boolean {
     if (actual === null || actual === undefined) {
       return false;
     }
-    return Number(actual) > Number(filter.value);
+
+    // Numeric when both sides are numbers (`reset_token_expires`,
+    // `image_count`), text ordering otherwise. The image backfill pages with
+    // `.gt('id', <last id seen>)` over text ids, and coercing those through
+    // Number() would make every comparison NaN and silently return nothing.
+    const numeric = Number.isFinite(Number(actual)) && Number.isFinite(Number(filter.value));
+    return numeric ? Number(actual) > Number(filter.value) : String(actual) > String(filter.value);
+  }
+
+  // PostgREST `like`. Only `%` is translated, which is all this codebase emits.
+  if (filter.op === 'like') {
+    if (actual === null || actual === undefined) {
+      return false;
+    }
+
+    const pattern = String(filter.value)
+      .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      .replace(/%/g, '[\\s\\S]*');
+
+    return new RegExp(`^${pattern}$`).test(String(actual));
   }
 
   if (filter.op === 'in') {
@@ -380,6 +405,14 @@ class FakeQuery {
 
   gt(column: string, value: any) {
     this.filters.push({ op: 'gt', column, value });
+    return this;
+  }
+
+  like(column: string, pattern: string) {
+    // A pattern no column value can hold, so the filter matches nothing without
+    // reporting an error. See `likeMatchesNothing`.
+    const value = this.options.likeMatchesNothing ? ' matches nothing ' : pattern;
+    this.filters.push({ op: 'like', column, value });
     return this;
   }
 

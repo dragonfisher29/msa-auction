@@ -13,8 +13,13 @@ import {
   fetchAuctionListPage,
   hashPassword,
   hideAuction,
+  IMAGE_BACKFILL_UNAVAILABLE_MESSAGE,
+  IMAGE_CACHE_CONTROL,
+  IMAGE_PATH_PREFIX,
+  IMAGE_STORAGE_UNAVAILABLE_MESSAGE,
   injectAuctionMeta,
   isAdminUser,
+  isAllowedImageRef,
   isAuctionVisible,
   isBannedUser,
   isBearerTokenAdmin,
@@ -23,8 +28,12 @@ import {
   listReportsForAdmin,
   mapAuctionSummaryRow,
   matchAuctionSharePath,
+  matchImageServePath,
+  MAX_IMAGE_BYTES,
   mergeAuctionEdit,
+  migrateAuctionImages,
   NOTIFICATION_COLUMNS,
+  putImage,
   readBidLock,
   resetPasswordWithToken,
   selectActivity,
@@ -34,6 +43,7 @@ import {
   toNullableMoney,
   toStringArray,
   USER_ROLE,
+  validateImageUpload,
   validateOptionalEmail,
   verifyAndUpgradePassword,
   type SharedFailure,
@@ -283,6 +293,22 @@ function validateAuctionInput(raw: any) {
     return makeError('You can upload up to 3 images per listing.', 'TOO_MANY_IMAGES');
   }
 
+  // Each entry must be an image this site itself holds: an inline `data:` URL,
+  // or an `/images/<key>` path from `POST /api/images`. An arbitrary external
+  // URL is refused - accepting one would let a listing point the site's own
+  // pages at any third-party host.
+  //
+  // BOTH FORMS ARE ACCEPTED UNCONDITIONALLY, and must stay that way. R2 is off
+  // today, so every new listing arrives as `data:` URLs; if it is switched on,
+  // new listings arrive as paths while old rows keep their `data:` URLs, and a
+  // single listing can hold a mixture of the two. Narrowing this to whichever
+  // form happens to be current would make the other kind of listing
+  // uneditable - `mergeAuctionEdit` feeds the stored array back through here on
+  // every PATCH.
+  if (!normalizedImageUrls.every((value: string) => isAllowedImageRef(value))) {
+    return makeError('Listing images must be uploaded through this site.', 'INVALID_IMAGE_URL');
+  }
+
   return {
     title,
     description,
@@ -366,6 +392,54 @@ export default {
 
     const supabase = getSupabaseClient(env);
 
+    /* ---------------------------------------------------------------------- */
+    /* GET /images/:key - public listing image, streamed from R2.              */
+    /*                                                                        */
+    /* MUST stay above the static-asset branch below. That branch claims every */
+    /* path that is not `/api/`, so an `/images/...` request placed after it   */
+    /* would be answered by the SPA shell instead of the image.                */
+    /*                                                                        */
+    /* R2 IS CURRENTLY DISABLED - see the commented-out `[[r2_buckets]]` block */
+    /* in wrangler.toml. With no binding there is no bucket, and because keys  */
+    /* are only ever minted by `POST /api/images` writing to that same bucket, */
+    /* NO KEY CAN EXIST. So this is a genuine 404, not a configuration error:  */
+    /* the answer to "is there an object here" is no, and 404 is what a        */
+    /* browser's <img> and every cache already know how to handle.             */
+    /* ---------------------------------------------------------------------- */
+
+    const imageKey = request.method === 'GET' ? matchImageServePath(url.pathname) : null;
+    if (imageKey) {
+      const bucket = env.IMAGES;
+      if (!bucket || typeof bucket.get !== 'function') {
+        return jsonResponse(makeError('Image not found.', 'IMAGE_NOT_FOUND'), { status: 404 });
+      }
+
+      try {
+        const object = await bucket.get(imageKey);
+        if (!object) {
+          return jsonResponse(makeError('Image not found.', 'IMAGE_NOT_FOUND'), { status: 404 });
+        }
+
+        const headers = new Headers(corsHeaders());
+        headers.set('content-type', object.httpMetadata?.contentType || 'application/octet-stream');
+        headers.set('cache-control', IMAGE_CACHE_CONTROL);
+        // These bytes were supplied by a user and are served from our own
+        // origin. The upload route already pinned the type by sniffing, and
+        // this stops a browser from second-guessing that and running the
+        // object as something else.
+        headers.set('x-content-type-options', 'nosniff');
+        if (object.httpEtag) {
+          headers.set('etag', object.httpEtag);
+        }
+
+        return new Response(object.body, { status: 200, headers });
+      } catch (error) {
+        return jsonResponse(getErrorMessageAndCode('Failed to load image.', 'IMAGE_FETCH_FAILED', error), {
+          status: 500,
+        });
+      }
+    }
+
     // Serve static frontend assets for non-API routes
     if (!url.pathname.startsWith('/api/')) {
       if (env.ASSETS && typeof env.ASSETS.fetch === 'function') {
@@ -380,6 +454,62 @@ export default {
 
     if (request.method === 'GET' && url.pathname === '/api/health') {
       return jsonResponse({ status: 'ok', serverTime: Date.now() });
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* POST /api/images - raw image bytes in, an `/images/<key>` path out.     */
+    /*                                                                        */
+    /* Signed in only, and the bytes are checked three ways before anything is */
+    /* written: declared type, length, and the leading magic bytes. The key is */
+    /* a fresh UUID, never anything derived from what the caller sent.         */
+    /*                                                                        */
+    /* WHEN R2 IS DISABLED this returns 503 IMAGE_STORAGE_UNAVAILABLE. That    */
+    /* code is a CONTRACT with the client: `CreateListingModal` reads it and   */
+    /* falls back to inlining the image as a base64 `data:` URL, which is what */
+    /* the site did before R2 existed and still accepts today. Do not rename   */
+    /* it, and do not change the status - a 5xx is correct (the server cannot  */
+    /* do this right now), and 503 specifically says "temporarily", which is   */
+    /* accurate: adding the binding fixes it with no code change.              */
+    /* ---------------------------------------------------------------------- */
+
+    if (request.method === 'POST' && url.pathname === '/api/images') {
+      if (!supabase) {
+        return jsonResponse(makeError('Supabase env vars are not configured.', 'CONFIG_ERROR'), { status: 500 });
+      }
+
+      const bucket = env.IMAGES;
+      if (!bucket || typeof bucket.put !== 'function') {
+        return jsonResponse(makeError(IMAGE_STORAGE_UNAVAILABLE_MESSAGE, 'IMAGE_STORAGE_UNAVAILABLE'), { status: 503 });
+      }
+
+      try {
+        const auth = await requireUser(supabase, request, 'Authentication required to upload an image.');
+        if (auth.response) {
+          return auth.response;
+        }
+
+        // Refused on the header before the body is read, when the sender
+        // declared a length. The real check is on the decoded bytes below,
+        // because Content-Length is a claim like any other.
+        const declaredLength = Number(request.headers.get('content-length'));
+        if (Number.isFinite(declaredLength) && declaredLength > MAX_IMAGE_BYTES) {
+          return jsonResponse(makeError('Images must be 5 MB or smaller.', 'IMAGE_TOO_LARGE'), { status: 413 });
+        }
+
+        const bytes = new Uint8Array(await request.arrayBuffer());
+        const validated = validateImageUpload(request.headers.get('content-type'), bytes);
+        if (isFailure(validated)) {
+          return failureResponse(validated);
+        }
+
+        await putImage(bucket, validated.data.key, bytes, validated.data.mime);
+
+        return jsonResponse({ url: `${IMAGE_PATH_PREFIX}${validated.data.key}`, key: validated.data.key });
+      } catch (error) {
+        return jsonResponse(getErrorMessageAndCode('Failed to upload image.', 'IMAGE_UPLOAD_FAILED', error), {
+          status: 500,
+        });
+      }
     }
 
     if (request.method === 'POST' && url.pathname === '/api/auth/register') {
@@ -1033,6 +1163,33 @@ export default {
 
         if (request.method === 'GET' && url.pathname === '/api/admin/reports') {
           return jsonResponse({ reports: await listReportsForAdmin(supabase) });
+        }
+
+        /* ------------------------------------------------------------------ */
+        /* POST /api/admin/migrate-images - one batch of the base64 -> R2      */
+        /* backfill. Safe to call repeatedly: it is driven by what is still a  */
+        /* `data:` URL in the database, so an already-migrated row is skipped  */
+        /* rather than re-uploaded.                                            */
+        /*                                                                    */
+        /* Stop when `migrated` comes back 0, not when `remaining` does - a    */
+        /* permanently broken row keeps `remaining` above zero forever and is  */
+        /* listed in `failures` for manual attention. See DEPLOY.md.          */
+        /* ------------------------------------------------------------------ */
+        if (request.method === 'POST' && url.pathname === '/api/admin/migrate-images') {
+          const bucket = env.IMAGES;
+          if (!bucket || typeof bucket.put !== 'function') {
+            // There is nothing to migrate INTO. Answering plainly beats
+            // throwing on `bucket.put` of undefined, and names the exact thing
+            // that is missing so an admin knows what to fix.
+            return jsonResponse(makeError(IMAGE_BACKFILL_UNAVAILABLE_MESSAGE, 'IMAGE_STORAGE_UNAVAILABLE'), {
+              status: 503,
+            });
+          }
+
+          const body = await request.json().catch(() => ({}));
+          const result = await migrateAuctionImages(supabase, bucket, { limit: (body as any)?.limit });
+
+          return jsonResponse(result);
         }
 
         // INTERIM MEASURE - DELETE THIS ROUTE ONCE A MAIL PROVIDER IS WIRED UP.

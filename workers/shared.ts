@@ -35,10 +35,16 @@ export interface ActivityAuction {
 
 /**
  * The slim shape `GET /api/auctions` returns. Deliberately carries NO image
- * payload: `image_url` and `image_urls` hold base64 data URLs, and shipping
- * them to every polling client was the single largest source of traffic on the
- * site. Clients read `imageCount` and fetch the real bytes from
- * `GET /api/auctions/:id/images` when they actually need to paint them.
+ * payload: shipping images to every polling client was the single largest
+ * source of traffic on the site. Clients read `imageCount` and fetch the
+ * references from `GET /api/auctions/:id/images` when they need to paint them.
+ *
+ * `image_urls` holds base64 `data:` URLs today - R2 is implemented but switched
+ * off, see the image storage section below - so the bytes themselves come out
+ * of Postgres and this omission is worth a great deal. It stays worth keeping
+ * even if R2 is switched on and the column shrinks to `/images/<key>` paths:
+ * the list endpoint is polled continuously and has no reason to carry images in
+ * either form.
  */
 export interface AuctionSummary {
   id: string;
@@ -686,7 +692,12 @@ export function escapeHtml(value: unknown): string {
 export interface AuctionMetaTags {
   title: string;
   description: string;
-  image: string;
+  /**
+   * Absolute `https://` URL - the listing's own image once it is in R2, the
+   * site logo until then. See `resolveOgImage`. Optional only so that a
+   * malformed page URL degrades to omitting the tag rather than throwing.
+   */
+  image?: string;
   url: string;
 }
 
@@ -713,7 +724,9 @@ export function buildAuctionMetaTags(row: any, pageUrl: string): AuctionMetaTags
           : 'Bidding now';
 
   const title = String(row?.title ?? 'Auction');
-  const image = String(row?.image_url ?? row?.imageUrl ?? '') || toStringArray(row?.image_urls)[0] || DEFAULT_OG_IMAGE;
+  // Either column may hold either storage form during the rollout, so the
+  // reference is resolved rather than emitted verbatim.
+  const reference = String(row?.image_url ?? row?.imageUrl ?? '') || toStringArray(row?.image_urls)[0] || '';
 
   return {
     title: priceLabel ? `${title} - ${priceLabel} | MSA Auction` : `${title} | MSA Auction`,
@@ -721,7 +734,7 @@ export function buildAuctionMetaTags(row: any, pageUrl: string): AuctionMetaTags
       `${statusLabel}${priceLabel ? ` at ${priceLabel}` : ''}. ${String(row?.description ?? '')}`,
       META_DESCRIPTION_LIMIT,
     ),
-    image,
+    image: resolveOgImage(reference, pageUrl),
     url: pageUrl,
   };
 }
@@ -740,7 +753,6 @@ const STATIC_META_PATTERN =
 export function injectAuctionMeta(html: string, meta: AuctionMetaTags): string {
   const title = escapeHtml(meta.title);
   const description = escapeHtml(meta.description);
-  const image = escapeHtml(meta.image);
   const url = escapeHtml(meta.url);
 
   const block = [
@@ -748,7 +760,8 @@ export function injectAuctionMeta(html: string, meta: AuctionMetaTags): string {
     `<meta name="description" content="${description}" />`,
     `<meta property="og:title" content="${title}" />`,
     `<meta property="og:description" content="${description}" />`,
-    `<meta property="og:image" content="${image}" />`,
+    // Omitted entirely when there is no URL a crawler could actually fetch.
+    ...(meta.image ? [`<meta property="og:image" content="${escapeHtml(meta.image)}" />`] : []),
     `<meta property="og:url" content="${url}" />`,
     `<meta property="og:type" content="product" />`,
     `<meta name="twitter:card" content="summary_large_image" />`,
@@ -773,7 +786,20 @@ export function matchAuctionSharePath(pathname: string): string | null {
   return AUCTION_ID_PATTERN.test(id) ? id : null;
 }
 
-/** Columns the OG path needs. Kept minimal, but `image_url` is unavoidably large. */
+/**
+ * Columns the OG path needs.
+ *
+ * `image_url` is here because `og:image` needs the listing's first image, and
+ * a listing stored in R2 needs it to emit a working preview.
+ *
+ * COST NOTE, while R2 is off. Every value in this column is a base64 `data:`
+ * URL, so each crawler hit on `/auction/:id` pulls a whole image out of
+ * Postgres in order for `resolveOgImage` to look at it, reject it, and emit the
+ * logo instead. That is real egress for no benefit. It is left in place anyway:
+ * dropping it would silently break previews the moment R2 is switched on, and
+ * this route is hit by crawlers rather than by the polling clients that
+ * dominate the traffic. Revisit it if egress measurement singles this out.
+ */
 export const AUCTION_META_COLUMNS = 'id,title,description,current_price,status,image_url';
 
 /* -------------------------------------------------------------------------- */
@@ -1851,4 +1877,725 @@ export function applyBidLock(query: any, lock: BidLock): any {
   return lock.hasCurrentPrice
     ? query.eq('current_price', lock.rawCurrentPrice)
     : query.is('current_price', null);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Image storage: Cloudflare R2                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * WHY THIS EXISTS.
+ *
+ * Images are stored as base64 `data:` URLs inside `auctions.image_urls`.
+ * Postgres holds the bytes, so every image a browser paints is Supabase egress
+ * - 21GB against a 5GB allowance. R2 has no egress fee, so the code below moves
+ * the bytes there and leaves the database holding only a short `/images/<key>`
+ * path.
+ *
+ * ...EXCEPT THAT R2 IS CURRENTLY TURNED OFF. Enabling R2 needs a payment method
+ * on the Cloudflare account, and this is a society's project, so the
+ * `[[r2_buckets]]` block in wrangler.toml is commented out. Everything in this
+ * section still works and is still tested; it simply has no bucket bound, and
+ * every caller checks for that before using it. Base64 is therefore the live
+ * default, and the first measure being tried against egress is the polling fix
+ * rather than object storage. See wrangler.toml for how to switch R2 on.
+ *
+ * MIXED STATE IS THE NORMAL STATE. From the moment R2 is switched on until the
+ * last backfill batch finishes, one listing's `image_urls` can hold a legacy
+ * `data:` URL and an `/images/<key>` path side by side. Nothing here may assume
+ * a row is entirely one form or entirely the other, which is why every
+ * predicate below tests a single entry rather than a whole row. That stays true
+ * in the other direction too: if R2 is switched on, used, and switched off
+ * again, already-migrated rows keep their paths and new listings go back to
+ * base64. Both remain valid input to `validateAuctionInput`.
+ */
+
+/**
+ * The single wire contract for "object storage is not available right now".
+ *
+ * Returned by `POST /api/images` with status 503 and code
+ * `IMAGE_STORAGE_UNAVAILABLE`. The client keys off that CODE to fall back to
+ * inlining a base64 `data:` URL, so the code is load-bearing and the message is
+ * only for humans. Both the Worker and the Express dev server return the same
+ * pair, so a fallback that works locally works in production.
+ */
+export const IMAGE_STORAGE_UNAVAILABLE_MESSAGE =
+  'Object storage is not configured, so images cannot be uploaded to it. The listing will store its images inline instead.';
+
+/** The admin-facing version, which names the binding rather than reassuring. */
+export const IMAGE_BACKFILL_UNAVAILABLE_MESSAGE =
+  'The IMAGES R2 binding is not configured, so there is nothing to migrate images into. Create the bucket and uncomment [[r2_buckets]] in wrangler.toml, then redeploy and run this again.';
+
+/** Hard ceiling on an uploaded image, enforced on the decoded byte length. */
+export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+/**
+ * The only types accepted on upload, and the extension each is stored under.
+ * Deliberately not a general MIME table: these bytes are served back from our
+ * own origin, so the list stays as small as the product actually needs.
+ */
+export const IMAGE_MIME_EXTENSIONS: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+};
+
+/** Path prefix under which R2 objects are served. */
+export const IMAGE_PATH_PREFIX = '/images/';
+
+/**
+ * Objects are keyed by a random UUID, never by anything the uploader supplied,
+ * so a key is unguessable and a filename can never steer the storage path.
+ */
+const IMAGE_UUID_SOURCE = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const IMAGE_EXTENSION_SOURCE = 'jpg|png|webp|gif';
+
+/** A bare object key: `<uuid>.<ext>`. */
+export const IMAGE_KEY_PATTERN = new RegExp(`^${IMAGE_UUID_SOURCE}\\.(?:${IMAGE_EXTENSION_SOURCE})$`);
+
+/** A stored reference as it appears in `image_urls`: `/images/<uuid>.<ext>`. */
+export const IMAGE_PATH_PATTERN = new RegExp(`^${IMAGE_PATH_PREFIX}${IMAGE_UUID_SOURCE}\\.(?:${IMAGE_EXTENSION_SOURCE})$`);
+
+/**
+ * Keys are unique per upload and an object is never rewritten under an existing
+ * key, so the bytes at a given key are immutable and can be cached forever.
+ */
+export const IMAGE_CACHE_CONTROL = 'public, max-age=31536000, immutable';
+
+/**
+ * Canonicalises a `Content-Type` header down to one of the four accepted types,
+ * or null. Parameters (`; charset=...`) are dropped and case is normalised;
+ * nothing else is accepted, including the common-but-invalid `image/jpg`.
+ */
+export function normalizeImageMime(contentType: unknown): string | null {
+  if (typeof contentType !== 'string') {
+    return null;
+  }
+
+  const base = contentType.split(';')[0].trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(IMAGE_MIME_EXTENSIONS, base) ? base : null;
+}
+
+/**
+ * Identifies the real format from the leading bytes.
+ *
+ * The declared `Content-Type` is a claim by whoever is uploading; this is the
+ * bytes themselves. `POST /api/images` requires the two to agree, because the
+ * object it writes is later served from our own origin - a file that claims to
+ * be a PNG while actually being something a browser will run as another type is
+ * the whole attack this closes.
+ */
+export function sniffImageMime(bytes: Uint8Array): string | null {
+  if (!bytes || bytes.length < 12) {
+    return null;
+  }
+
+  // JPEG: FF D8 FF
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'image/jpeg';
+  }
+
+  // PNG: 89 "PNG" CR LF SUB LF
+  if (
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return 'image/png';
+  }
+
+  // GIF: "GIF87a" or "GIF89a"
+  if (
+    bytes[0] === 0x47 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x38 &&
+    (bytes[4] === 0x37 || bytes[4] === 0x39) &&
+    bytes[5] === 0x61
+  ) {
+    return 'image/gif';
+  }
+
+  // WebP: "RIFF" <4 byte length> "WEBP"
+  if (
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return 'image/webp';
+  }
+
+  return null;
+}
+
+/** True for a reference this codebase stored in R2. */
+export function isStoredImagePath(value: unknown): boolean {
+  return typeof value === 'string' && IMAGE_PATH_PATTERN.test(value.trim());
+}
+
+/**
+ * True for a legacy inline image.
+ *
+ * Deliberately permissive about the exact media type and payload: these strings
+ * are already in the database and `mergeAuctionEdit` feeds them back through
+ * `validateAuctionInput` on every edit. A stricter test here would make an old
+ * listing uneditable, which is a worse outcome than accepting an odd but
+ * long-standing `data:image/...` value.
+ */
+export function isDataImageUrl(value: unknown): boolean {
+  return typeof value === 'string' && value.trim().toLowerCase().startsWith('data:image/');
+}
+
+/**
+ * The whitelist `validateAuctionInput` applies to every image entry.
+ *
+ * An arbitrary `https://` URL is NOT acceptable. Storing one would let listing
+ * creation point the site's own markup at any third-party host, which is an
+ * open-redirect / SSRF-adjacent surface and would also hand that host a log of
+ * every visitor who viewed the listing.
+ */
+export function isAllowedImageRef(value: unknown): boolean {
+  return isStoredImagePath(value) || isDataImageUrl(value);
+}
+
+/**
+ * `/images/<key>` -> the key, or null when the path is not one of ours.
+ *
+ * The pattern is anchored and allows only hex, dashes and a known extension, so
+ * traversal (`..`, an embedded `/`) and any other crafted key are refused
+ * before R2 is ever consulted.
+ */
+export function matchImageServePath(pathname: string): string | null {
+  if (typeof pathname !== 'string' || !pathname.startsWith(IMAGE_PATH_PREFIX)) {
+    return null;
+  }
+
+  const key = pathname.slice(IMAGE_PATH_PREFIX.length);
+  return IMAGE_KEY_PATTERN.test(key) ? key : null;
+}
+
+/** A fresh, unguessable object key for a known-good MIME type. */
+export function newImageKey(mime: string): string {
+  const extension = IMAGE_MIME_EXTENSIONS[mime];
+  if (!extension) {
+    throw new Error(`newImageKey: unsupported image type "${mime}"`);
+  }
+
+  return `${crypto.randomUUID()}.${extension}`;
+}
+
+export interface ValidatedImageUpload {
+  /** The sniffed type, which is also what the object is stored and served as. */
+  mime: string;
+  key: string;
+}
+
+/**
+ * The full upload gate: declared type, size, then the bytes themselves.
+ *
+ * Ordered cheapest-first - a header check, then a length check, then the sniff -
+ * so a junk request is refused before anything is read into R2.
+ */
+export function validateImageUpload(declaredType: unknown, bytes: Uint8Array): SharedResult<ValidatedImageUpload> {
+  const declared = normalizeImageMime(declaredType);
+  if (!declared) {
+    return fail(400, 'Upload a JPEG, PNG, WebP, or GIF image.', 'UNSUPPORTED_IMAGE_TYPE');
+  }
+
+  if (!bytes || bytes.length === 0) {
+    return fail(400, 'The uploaded image was empty.', 'UNSUPPORTED_IMAGE_TYPE');
+  }
+
+  if (bytes.length > MAX_IMAGE_BYTES) {
+    return fail(413, 'Images must be 5 MB or smaller.', 'IMAGE_TOO_LARGE');
+  }
+
+  const sniffed = sniffImageMime(bytes);
+  if (!sniffed || sniffed !== declared) {
+    return fail(400, 'That file is not a valid JPEG, PNG, WebP, or GIF image.', 'UNSUPPORTED_IMAGE_TYPE');
+  }
+
+  return succeed({ mime: sniffed, key: newImageKey(sniffed) });
+}
+
+export interface DecodedImage {
+  mime: string;
+  bytes: Uint8Array;
+}
+
+/**
+ * Decodes a legacy `data:` URL into raw bytes for the backfill.
+ *
+ * `atob` is used rather than a Node Buffer so this file stays runtime-agnostic;
+ * both Workers and Node 18+ expose it as a global.
+ */
+export function decodeImageDataUrl(value: unknown): DecodedImage | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const match = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+)?;base64,([\s\S]*)$/i.exec(value.trim());
+  if (!match) {
+    return null;
+  }
+
+  const base64 = (match[2] ?? '').replace(/\s+/g, '');
+  if (!base64) {
+    return null;
+  }
+
+  let binary: string;
+  try {
+    binary = atob(base64);
+  } catch {
+    return null;
+  }
+
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  // The declared type in the data URL is ignored in favour of the bytes, so a
+  // mislabelled legacy row cannot put a wrongly-typed object into R2.
+  const sniffed = sniffImageMime(bytes);
+  return sniffed ? { mime: sniffed, bytes } : null;
+}
+
+/** Writes one object, tagging it with the type the serve route will echo back. */
+export async function putImage(bucket: any, key: string, bytes: Uint8Array, mime: string): Promise<void> {
+  await bucket.put(key, bytes, {
+    httpMetadata: { contentType: mime, cacheControl: IMAGE_CACHE_CONTROL },
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/* Open Graph image                                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Resolves the `og:image` value. Always absolute, because crawlers do not
+ * resolve a relative path.
+ *
+ *   R2 path -> that image.
+ *   anything else -> the site logo.
+ *
+ * WITH R2 OFF, THE SECOND BRANCH IS THE ONLY ONE THAT RUNS. Every listing's
+ * first image is a `data:` URL, so every shared link previews as the MSA logo.
+ * That is not a regression - it is exactly what the live site does today - and
+ * it is the reason the fallback below has to stay.
+ *
+ * WHY A `data:` URL FALLS BACK TO THE LOGO RATHER THAN EMITTING NOTHING.
+ *
+ * A base64 `data:` URL is rejected by every link-preview crawler, so it can
+ * never be emitted. The tempting conclusion is to emit no `og:image` at all for
+ * such a listing - but that would be a REGRESSION against what is live today.
+ * The static shell carries a logo `og:image`, and
+ * `injectAuctionMeta` strips the shell's tags before inserting these; emitting
+ * nothing would therefore turn today's logo preview into a blank card in
+ * iMessage, Slack and WhatsApp, for precisely the listings that are most
+ * numerous on day one, and it would stay that way until the backfill finished.
+ *
+ * A logo preview is worse than the listing's photo and better than nothing.
+ */
+export function resolveOgImage(reference: unknown, pageUrl: string): string | undefined {
+  const toAbsolute = (relative: string): string | undefined => {
+    try {
+      return new URL(relative, pageUrl).toString();
+    } catch {
+      return undefined;
+    }
+  };
+
+  if (isStoredImagePath(reference)) {
+    return toAbsolute(String(reference).trim());
+  }
+
+  // Legacy inline image, no image, or anything unrecognised.
+  return toAbsolute(DEFAULT_OG_IMAGE);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Backfill: data: URLs -> R2                                                  */
+/* -------------------------------------------------------------------------- */
+
+export interface ImageMigrationFailure {
+  auctionId: string;
+  error: string;
+}
+
+/**
+ * How the batch found its work.
+ *
+ * This exists to keep two very different situations from looking identical
+ * from the outside. The backfill loop stops when `migrated` comes back 0, and
+ * "there is nothing left to do" is not the only way to get that number: if the
+ * indexed `image_url like 'data:%'` filter ever matched nothing on a database
+ * that really does hold inline images, phase 1 would also report 0.
+ *
+ * `listingsWithImages` is counted WITHOUT that filter, so the two cases can be
+ * told apart. See DEPLOY.md 5.5.3 for what the owner should see on call one.
+ */
+export interface ImageMigrationScan {
+  /** Rows the indexed `image_url like 'data:%'` filter returned this call. */
+  fastPathMatched: number;
+  /** Rows the phase-2 full scan examined this call. */
+  fallbackScanned: number;
+  /**
+   * Listings holding at least one image at all, via `image_count`. Does not go
+   * through the `like` filter, and so is the control value for it.
+   */
+  listingsWithImages: number;
+}
+
+export interface ImageMigrationResult {
+  migrated: number;
+  remaining: number;
+  failures: ImageMigrationFailure[];
+  scan: ImageMigrationScan;
+}
+
+export const IMAGE_MIGRATION_DEFAULT_LIMIT = 10;
+export const IMAGE_MIGRATION_MAX_LIMIT = 50;
+
+/** Columns the backfill reads. `image_urls` is the payload; the rest are guards. */
+const IMAGE_MIGRATION_COLUMNS = 'id,image_url,image_urls,image_count,status';
+
+/** Rows pulled per scan query. Independent of `limit`, which counts conversions. */
+const IMAGE_MIGRATION_PAGE = 25;
+
+/** Stops a pathological scan from running unbounded inside one request. */
+const IMAGE_MIGRATION_MAX_PAGES = 20;
+
+/** PostgREST `like` pattern matching a legacy inline image. */
+const LEGACY_IMAGE_LIKE = 'data:%';
+
+export function clampImageMigrationLimit(raw: unknown): number {
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    return IMAGE_MIGRATION_DEFAULT_LIMIT;
+  }
+
+  const floored = Math.floor(parsed);
+  if (floored < 1) {
+    return IMAGE_MIGRATION_DEFAULT_LIMIT;
+  }
+
+  return Math.min(floored, IMAGE_MIGRATION_MAX_LIMIT);
+}
+
+/** True when any entry on the row is still inline, in either column. */
+export function rowHasLegacyImage(row: any): boolean {
+  if (isDataImageUrl(row?.image_url)) {
+    return true;
+  }
+
+  return toStringArray(row?.image_urls).some((entry) => isDataImageUrl(entry));
+}
+
+/**
+ * Converts one row's inline images and writes the row back.
+ *
+ * Returns false when there was nothing to do, which is what makes a second run
+ * over an already-migrated row a no-op rather than a duplicate upload.
+ */
+async function migrateOneAuction(supabase: any, bucket: any, row: any): Promise<boolean> {
+  const stored = toStringArray(row?.image_urls);
+  // A row whose array is empty but whose legacy singular column still holds an
+  // image is rebuilt from that column, so no image is left behind.
+  const source = stored.length > 0 ? stored : isDataImageUrl(row?.image_url) ? [String(row.image_url)] : [];
+
+  if (source.length === 0) {
+    return false;
+  }
+
+  const converted: string[] = [];
+  let changed = false;
+
+  for (const entry of source) {
+    // Already an R2 path (or anything else non-inline) - carried through
+    // untouched. This is the mixed-array case, and it is the common one.
+    if (!isDataImageUrl(entry)) {
+      converted.push(entry);
+      continue;
+    }
+
+    const decoded = decodeImageDataUrl(entry);
+    if (!decoded) {
+      throw new Error('Inline image is not decodable base64 in a supported format.');
+    }
+
+    const key = newImageKey(decoded.mime);
+    await putImage(bucket, key, decoded.bytes, decoded.mime);
+    converted.push(`${IMAGE_PATH_PREFIX}${key}`);
+    changed = true;
+  }
+
+  if (!changed) {
+    return false;
+  }
+
+  // GUARD. The row is rewritten only while it still looks the way it did when
+  // it was read, so a seller who edited this listing between the read and the
+  // write is not silently overwritten with the images they just replaced.
+  //
+  // `auctions` has no row-version column that an edit bumps (`bid_version`
+  // tracks bids, not edits), and the value that WOULD be exact - the old
+  // `image_urls` - is megabytes of base64 and cannot go in a query string. So
+  // the guard rides on the two cheap columns an edit does move: the image count
+  // and the status.
+  let update = supabase
+    .from('auctions')
+    .update({ image_urls: converted, image_url: converted[0] })
+    .eq('id', row.id);
+
+  if (typeof row?.status === 'string' && row.status) {
+    update = update.eq('status', row.status);
+  }
+
+  const count = Number(row?.image_count);
+  if (Number.isInteger(count)) {
+    update = update.eq('image_count', count);
+  }
+
+  const { data, error } = await update.select('id');
+  if (error) {
+    throw error;
+  }
+
+  if (!Array.isArray(data) || data.length === 0) {
+    throw new Error('Listing changed while it was being migrated; left for the next run.');
+  }
+
+  return true;
+}
+
+/**
+ * Walks one candidate query, converting rows until `budget` conversions land.
+ *
+ * A row that throws is recorded and added to `skipIds`; it never aborts the
+ * batch and is not attempted twice within the same call.
+ */
+async function migrateCandidatePages(
+  supabase: any,
+  bucket: any,
+  buildPage: (cursor: string, pageSize: number) => any,
+  budget: number,
+  failures: ImageMigrationFailure[],
+  skipIds: Set<string>,
+): Promise<{ migrated: number; exhausted: boolean; examined: number }> {
+  let cursor = '';
+  let migrated = 0;
+  let examined = 0;
+
+  for (let page = 0; page < IMAGE_MIGRATION_MAX_PAGES; page += 1) {
+    if (migrated >= budget) {
+      return { migrated, exhausted: false, examined };
+    }
+
+    const { data, error } = await buildPage(cursor, IMAGE_MIGRATION_PAGE);
+    if (error) {
+      throw error;
+    }
+
+    const rows = Array.isArray(data) ? data : [];
+    if (rows.length === 0) {
+      return { migrated, exhausted: true, examined };
+    }
+
+    examined += rows.length;
+    cursor = String(rows[rows.length - 1]?.id ?? '');
+
+    for (const row of rows) {
+      if (migrated >= budget) {
+        return { migrated, exhausted: false, examined };
+      }
+
+      const auctionId = String(row?.id ?? '');
+      if (!auctionId || skipIds.has(auctionId) || !rowHasLegacyImage(row)) {
+        continue;
+      }
+
+      try {
+        if (await migrateOneAuction(supabase, bucket, row)) {
+          migrated += 1;
+        }
+      } catch (error) {
+        // Recorded and stepped over. The owner sees it in `failures`; the rest
+        // of the batch still runs.
+        skipIds.add(auctionId);
+        failures.push({
+          auctionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (rows.length < IMAGE_MIGRATION_PAGE) {
+      return { migrated, exhausted: true, examined };
+    }
+  }
+
+  return { migrated, exhausted: false, examined };
+}
+
+/**
+ * One resumable backfill batch.
+ *
+ * Idempotent: the work is driven entirely by what is still a `data:` URL in the
+ * database, so a row that has already moved is skipped rather than re-uploaded,
+ * and the whole endpoint can be called repeatedly until it reports no progress.
+ *
+ * Two phases, because the cheap server-side filter only covers the first image:
+ *
+ *   1. `image_url like 'data:%'` - every listing whose FIRST image is still
+ *      inline. This is the entire backlog at the start of the rollout, and
+ *      Postgres does the filtering, so no row is fetched that is not about to
+ *      be converted.
+ *   2. Only once phase 1 is empty: a scan of every listing that has images, to
+ *      catch an inline entry sitting BEHIND an already-migrated one - the shape
+ *      a seller creates by editing a half-migrated listing. This scan is only
+ *      affordable because by then every first image is a short path, so the
+ *      rows it reads are small.
+ */
+export async function migrateAuctionImages(
+  supabase: any,
+  bucket: any,
+  options: { limit?: unknown } = {},
+): Promise<ImageMigrationResult> {
+  const limit = clampImageMigrationLimit(options.limit);
+  const failures: ImageMigrationFailure[] = [];
+  const skipIds = new Set<string>();
+
+  const phaseOne = await migrateCandidatePages(
+    supabase,
+    bucket,
+    (cursor, pageSize) => {
+      let query = supabase.from('auctions').select(IMAGE_MIGRATION_COLUMNS).like('image_url', LEGACY_IMAGE_LIKE);
+      if (cursor) {
+        query = query.gt('id', cursor);
+      }
+      return query.order('id', { ascending: true }).limit(pageSize);
+    },
+    limit,
+    failures,
+    skipIds,
+  );
+
+  let migrated = phaseOne.migrated;
+  let fallbackScanned = 0;
+
+  // `remaining` for phase 1 is a HEAD count: PostgREST returns the number and
+  // no rows, so asking costs no image bytes.
+  const { count: phaseOneCount, error: countError } = await supabase
+    .from('auctions')
+    .select('id', { count: 'exact', head: true })
+    .like('image_url', LEGACY_IMAGE_LIKE);
+
+  if (countError) {
+    throw countError;
+  }
+
+  // The control value for the `like` filter above: same table, same HEAD-only
+  // cost, but reached through `image_count` instead. When this is large and
+  // `fastPathMatched` is zero on a database that still holds inline images,
+  // the filter is the thing at fault, not the backlog.
+  const { count: withImagesCount, error: withImagesError } = await supabase
+    .from('auctions')
+    .select('id', { count: 'exact', head: true })
+    .gt('image_count', 0);
+
+  if (withImagesError) {
+    throw withImagesError;
+  }
+
+  const listingsWithImages = Number(withImagesCount) || 0;
+  let remaining = Number(phaseOneCount) || 0;
+
+  // Phase 2 only opens once phase 1 is genuinely finished - both drained by
+  // this call and reporting zero rows left.
+  if (phaseOne.exhausted && remaining === 0) {
+    if (migrated < limit) {
+      const phaseTwo = await migrateCandidatePages(
+        supabase,
+        bucket,
+        (cursor, pageSize) => {
+          let query = supabase.from('auctions').select(IMAGE_MIGRATION_COLUMNS).gt('image_count', 0);
+          if (cursor) {
+            query = query.gt('id', cursor);
+          }
+          return query.order('id', { ascending: true }).limit(pageSize);
+        },
+        limit - migrated,
+        failures,
+        skipIds,
+      );
+
+      migrated += phaseTwo.migrated;
+      fallbackScanned = phaseTwo.examined;
+    }
+
+    remaining = await countPhaseTwoRemaining(supabase);
+  }
+
+  return {
+    migrated,
+    remaining,
+    failures,
+    scan: {
+      fastPathMatched: phaseOne.examined,
+      fallbackScanned,
+      listingsWithImages,
+    },
+  };
+}
+
+/**
+ * Counts leftover inline entries hiding behind a migrated first image.
+ *
+ * There is no server-side filter for "some entry other than the first is still
+ * inline", so this reads the rows - which is only acceptable because it runs
+ * exclusively after phase 1, when those arrays are short paths rather than
+ * base64.
+ */
+async function countPhaseTwoRemaining(supabase: any): Promise<number> {
+  let cursor = '';
+  let remaining = 0;
+
+  for (let page = 0; page < IMAGE_MIGRATION_MAX_PAGES; page += 1) {
+    let query = supabase.from('auctions').select('id,image_url,image_urls').gt('image_count', 0);
+    if (cursor) {
+      query = query.gt('id', cursor);
+    }
+
+    const { data, error } = await query.order('id', { ascending: true }).limit(IMAGE_MIGRATION_PAGE);
+    if (error) {
+      throw error;
+    }
+
+    const rows = Array.isArray(data) ? data : [];
+    if (rows.length === 0) {
+      return remaining;
+    }
+
+    cursor = String(rows[rows.length - 1]?.id ?? '');
+    remaining += rows.filter((row: any) => rowHasLegacyImage(row)).length;
+
+    if (rows.length < IMAGE_MIGRATION_PAGE) {
+      return remaining;
+    }
+  }
+
+  return remaining;
 }

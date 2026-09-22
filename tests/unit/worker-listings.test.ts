@@ -633,7 +633,11 @@ describe('GET /auction/:id - Open Graph injection', () => {
     expect(html).toContain('<title>Vintage lamp - £250 | MSA Auction</title>');
     expect(html.match(/name="description"/g)).toHaveLength(1);
     expect(html.match(/name="twitter:card"/g)).toHaveLength(1);
-    expect(html).toContain('<meta property="og:image" content="data:image/png;base64,aaa" />');
+    // This row's images are still legacy base64, which no crawler can fetch, so
+    // the preview falls back to the site logo as an ABSOLUTE url - never the
+    // data URL, and never nothing. Exactly one og:image survives.
+    expect(html.match(/property="og:image"/g)).toHaveLength(1);
+    expect(html).toContain('<meta property="og:image" content="https://msa-auction.test/MSA_Logo.png" />');
     expect(html).toContain('<meta property="og:url" content="https://msa-auction.test/auction/auc_1" />');
     expect(html).not.toContain('Real-time online auction platform.');
   });
