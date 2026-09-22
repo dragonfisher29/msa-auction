@@ -450,7 +450,12 @@ function AppShell() {
     let cancelled = false;
     (async () => {
       try {
-        const res = await apiFetch(`/api/auctions/${selectedAuctionId}`);
+        // Authed when a session exists, same as AuctionDetailModal's own poll -- GET
+        // /api/auctions/:id only sends phoneNumber back for a signed-in caller (see
+        // mapAuctionDetailRow in workers/index.ts), so a signed-in visitor opening a shared link
+        // sees the seller's contact details immediately instead of waiting on the modal's first
+        // 3s poll to correct it.
+        const res = await apiFetchAuthed(`/api/auctions/${selectedAuctionId}`, user?.token);
         if (!res.ok) return;
         const data = await res.json();
         if (!cancelled && data?.auction) {
@@ -464,7 +469,7 @@ function AppShell() {
     return () => {
       cancelled = true;
     };
-  }, [selectedAuctionId]);
+  }, [selectedAuctionId, user]);
 
   const selectedAuction = selectedAuctionId
     ? auctions.find((a) => a.id === selectedAuctionId) ?? deepLinkedAuction

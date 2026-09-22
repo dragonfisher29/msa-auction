@@ -29,7 +29,8 @@ import {
   formatTimeRemaining,
   formatTimestamp,
 } from '../lib/formatters';
-import { apiFetch, apiFetchAuthed } from '../lib/api';
+import { apiFetchAuthed } from '../lib/api';
+import { fetchAuctionImages } from '../lib/images';
 import { startPolling } from '../lib/realtime';
 import { AUTH_ERROR_CODES, readErrorCode, stripErrorCode } from '../lib/apiErrors';
 import { ListingActions } from './ListingActions';
@@ -43,6 +44,30 @@ const FALLBACK_IMAGE_URL =
 // Minimum horizontal travel (px) before a touch counts as a swipe rather than a tap or a
 // vertical scroll that happened to drift sideways.
 const SWIPE_THRESHOLD_PX = 50;
+
+/**
+ * Real image data already present on an `AuctionItem`, if any - the multi-image array first,
+ * then the legacy single `imageUrl`, otherwise `null` (meaning "nothing inline, go fetch"). Blank
+ * strings are dropped so a stored "" can never render an empty frame. Pulled out to a plain
+ * function (rather than a `useMemo` reading component state) so it can be called both as the
+ * `resolvedImages` state initializer and inside the resolve effect without either one depending on
+ * the ever-changing polled `auction` object as a hook dependency.
+ */
+function extractInlineImages(source: AuctionItem): string[] | null {
+  const fromArray = Array.isArray(source.imageUrls)
+    ? source.imageUrls.filter((url) => typeof url === 'string' && url.trim() !== '')
+    : [];
+
+  if (fromArray.length > 0) {
+    return fromArray;
+  }
+
+  if (source.imageUrl && source.imageUrl.trim() !== '') {
+    return [source.imageUrl];
+  }
+
+  return null;
+}
 
 interface AuctionDetailModalProps {
   auction: AuctionItem;
@@ -96,6 +121,14 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
     onAuctionUpdatedRef.current = onAuctionUpdated;
   }, [onAuctionUpdated]);
 
+  // Same reasoning: the poll below sends the caller's token (so a signed-in viewer, including the
+  // seller, gets phoneNumber back - see mapAuctionDetailRow), but a session starting/ending while
+  // the modal happens to be open must not tear down and restart the 3s interval.
+  const userRef = useRef(user);
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
+
   // The true enforced minimum: what the server will actually accept.
   // Rounded to the nearest penny: raw float addition (e.g. 100.01 + 0.01) can land on a value
   // like 100.02000000000001, which the input's `min` attribute would then enforce even though
@@ -124,24 +157,47 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
     hasUserEditedBidRef.current = false;
   }, [auction.id]);
 
-  // Gallery source of truth: the multi-image array when the listing has one, otherwise the
-  // legacy single imageUrl, otherwise the shared placeholder. Blank strings are dropped so a
-  // stored "" can never render an empty frame the user has to swipe past.
+  // Resolved, real image data - held in its OWN state rather than derived from `auction` on every
+  // render. The 3s poll below replaces `auction` with the slim row `GET /api/auctions/:id` sends
+  // (no imageUrls at all, only imageCount - see mapAuctionDetailRow in workers/index.ts), and that
+  // used to be read directly by a `useMemo`: the very first poll tick made the modal's own inline
+  // images (e.g. right after creating or editing a listing, both of which hand over a full
+  // mapAuctionRow object with real imageUrls) disappear and fall back to the placeholder, because
+  // nothing ever re-fetched them (the id hadn't changed). Keeping the resolved array in state that
+  // only the effect below writes means a poll tick that carries no image data of its own simply
+  // leaves whatever was already resolved alone.
+  const [resolvedImages, setResolvedImages] = useState<string[] | null>(() => extractInlineImages(initialAuction));
+
+  // Re-resolves when the auction id changes (a different listing) or when imageCount changes (the
+  // clearest signal that inline data just became unavailable/available - notably the transition
+  // from "no imageCount at all" on a freshly created/edited row to a real number on the first
+  // poll's slim row, which is exactly the moment inline images vanish and a fetch is needed).
+  // Deliberately NOT re-run on every poll tick otherwise: fetchAuctionImages caches by id, so this
+  // stays free once resolved.
+  useEffect(() => {
+    const inline = extractInlineImages(auction);
+    if (inline) {
+      setResolvedImages(inline);
+      return;
+    }
+    let cancelled = false;
+    fetchAuctionImages(auction.id).then((urls) => {
+      if (!cancelled) {
+        setResolvedImages(urls);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auction.id, auction.imageCount]);
+
+  // Gallery source of truth: the resolved images, or the shared placeholder when there are none
+  // (yet). Blank strings are dropped so a stored "" can never render an empty frame the user has
+  // to swipe past - see extractInlineImages.
   const galleryImages = useMemo(() => {
-    const fromArray = Array.isArray(auction.imageUrls)
-      ? auction.imageUrls.filter((url) => typeof url === 'string' && url.trim() !== '')
-      : [];
-
-    if (fromArray.length > 0) {
-      return fromArray;
-    }
-
-    if (auction.imageUrl && auction.imageUrl.trim() !== '') {
-      return [auction.imageUrl];
-    }
-
-    return [FALLBACK_IMAGE_URL];
-  }, [auction.imageUrls, auction.imageUrl]);
+    return resolvedImages && resolvedImages.length > 0 ? resolvedImages : [FALLBACK_IMAGE_URL];
+  }, [resolvedImages]);
 
   // The modal instance is reused across listings, so a new auction starts at its first image.
   useEffect(() => {
@@ -213,7 +269,7 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
 
     const stopPoll = startPolling<AuctionItem | null>(
       async () => {
-        const res = await apiFetch(`/api/auctions/${auctionId}`);
+        const res = await apiFetchAuthed(`/api/auctions/${auctionId}`, userRef.current?.token);
         if (!res.ok) {
           throw new Error(`Auction listing responded with ${res.status}`);
         }
@@ -337,8 +393,9 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
         return;
       }
 
-      // The bid endpoint only returns the new bid, so pull the fresh auction back
-      const refreshed = await apiFetch(`/api/auctions/${auction.id}`);
+      // The bid endpoint only returns the new bid, so pull the fresh auction back. Authed with
+      // the bidder's own token so phoneNumber comes back too (see mapAuctionDetailRow).
+      const refreshed = await apiFetchAuthed(`/api/auctions/${auction.id}`, user.token);
       if (refreshed.ok) {
         const refreshedData = await refreshed.json();
         const fresh = refreshedData.auction as AuctionItem | undefined;
@@ -370,12 +427,17 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
     setIsAuthError(false);
   };
 
+  // Absent when the viewer isn't signed in - GET /api/auctions/:id only puts phoneNumber on the
+  // wire for an authenticated request. See mapAuctionDetailRow in workers/index.ts.
+  const hasPhoneNumber = typeof auction.phoneNumber === 'string' && auction.phoneNumber.trim() !== '';
+
   const whatsAppUrl = buildWhatsAppUrl(
-    auction.phoneNumber,
+    auction.phoneNumber ?? '',
     `Hi ${auction.sellerName}, I'm interested in your "${auction.title}" listing on MSA Auction.`,
   );
 
   const copyPhoneNumber = () => {
+    if (!auction.phoneNumber) return;
     navigator.clipboard.writeText(auction.phoneNumber);
     setCopiedPhone(true);
     setTimeout(() => setCopiedPhone(false), 2000);
@@ -604,29 +666,43 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
                   </div>
 
                   <div className="flex items-center gap-2 flex-wrap w-full sm:w-auto">
-                    {/* Phone Contact Badge with Copy Action */}
-                    <div className="flex items-center gap-1.5 min-w-0 flex-1 sm:flex-none bg-[#edf2fb] pl-3 pr-1.5 py-1 rounded-xl border border-[#ccdbfd]">
-                      <Phone className="w-3.5 h-3.5 text-[#1e293b]/70 shrink-0" />
-                      <a
-                        href={`tel:${auction.phoneNumber}`}
-                        className="font-bold text-[#1e293b] hover:underline truncate"
-                      >
-                        {auction.phoneNumber}
-                      </a>
+                    {/* Phone Contact Badge with Copy Action - only for a signed-in viewer, since
+                        the detail endpoint only sends phoneNumber then (see hasPhoneNumber). */}
+                    {hasPhoneNumber ? (
+                      <div className="flex items-center gap-1.5 min-w-0 flex-1 sm:flex-none bg-[#edf2fb] pl-3 pr-1.5 py-1 rounded-xl border border-[#ccdbfd]">
+                        <Phone className="w-3.5 h-3.5 text-[#1e293b]/70 shrink-0" />
+                        <a
+                          href={`tel:${auction.phoneNumber}`}
+                          className="font-bold text-[#1e293b] hover:underline truncate"
+                        >
+                          {auction.phoneNumber}
+                        </a>
+                        <button
+                          type="button"
+                          onClick={copyPhoneNumber}
+                          title="Copy phone number"
+                          aria-label="Copy phone number"
+                          className="shrink-0 inline-flex items-center justify-center p-2 min-h-[38px] min-w-[38px] rounded-md text-[#1e293b]/60 hover:text-[#1e293b] hover:bg-[#d7e3fc] transition-colors ml-auto"
+                        >
+                          {copiedPhone ? (
+                            <Check className="w-3 h-3 text-emerald-600" />
+                          ) : (
+                            <Copy className="w-3 h-3" />
+                          )}
+                        </button>
+                      </div>
+                    ) : (
                       <button
                         type="button"
-                        onClick={copyPhoneNumber}
-                        title="Copy phone number"
-                        aria-label="Copy phone number"
-                        className="shrink-0 inline-flex items-center justify-center p-2 min-h-[38px] min-w-[38px] rounded-md text-[#1e293b]/60 hover:text-[#1e293b] hover:bg-[#d7e3fc] transition-colors ml-auto"
+                        onClick={onPromptAuth}
+                        className="flex items-center gap-1.5 min-w-0 flex-1 sm:flex-none bg-[#edf2fb] px-3 py-1 min-h-[38px] rounded-xl border border-[#ccdbfd] text-left"
                       >
-                        {copiedPhone ? (
-                          <Check className="w-3 h-3 text-emerald-600" />
-                        ) : (
-                          <Copy className="w-3 h-3" />
-                        )}
+                        <Phone className="w-3.5 h-3.5 text-[#1e293b]/70 shrink-0" />
+                        <span className="font-bold text-[#1e293b] hover:underline truncate">
+                          Sign in to see contact details
+                        </span>
                       </button>
-                    </div>
+                    )}
 
                     {/* Rendered only when the seller's number parses to a usable wa.me target,
                         so buyers never land on WhatsApp's "invalid number" page. */}

@@ -30,8 +30,23 @@ vi.mock('../../src/lib/realtime', () => ({
 }));
 
 import { apiFetch } from '../../src/lib/api';
+import { startPolling } from '../../src/lib/realtime';
 
 const mockedApiFetch = apiFetch as unknown as ReturnType<typeof vi.fn>;
+const mockedStartPolling = startPolling as unknown as ReturnType<typeof vi.fn>;
+
+/**
+ * Simulates one 3s poll tick without a real timer: captures the fetcher/onData pair the
+ * component hands to the (mocked) `startPolling`, runs the fetcher, and feeds the result to
+ * `onData` - exactly what the real implementation in src/lib/realtime.ts does on each interval.
+ */
+function triggerPollTick() {
+  const [fn, , onData] = mockedStartPolling.mock.calls[mockedStartPolling.mock.calls.length - 1];
+  return (async () => {
+    const data = await fn();
+    onData(data);
+  })();
+}
 
 const NOW = Date.now();
 
@@ -277,7 +292,11 @@ describe('AuctionDetailModal', () => {
         );
       });
 
-      expect(mockedApiFetch).toHaveBeenNthCalledWith(2, `/api/auctions/${auction.id}`);
+      // Authed with the bidder's own token, so the refreshed auction can carry phoneNumber back
+      // too (see mapAuctionDetailRow in workers/index.ts).
+      expect(mockedApiFetch).toHaveBeenNthCalledWith(2, `/api/auctions/${auction.id}`, {
+        headers: { Authorization: `Bearer ${bidderUser.token}` },
+      });
 
       expect(await screen.findByText(/Placed bid of £155!/i)).toBeInTheDocument();
       expect(onAuctionUpdated).toHaveBeenCalledWith(freshAuction);
@@ -456,6 +475,62 @@ describe('AuctionDetailModal', () => {
       // jsdom resolves a relative src against the test's base URL, so check the suffix rather
       // than the full absolute URL.
       expect(secondImage.src.endsWith(r2PathImage)).toBe(true);
+    });
+
+    it('REGRESSION: keeps showing inline images after a poll tick returns the slim row (no imageUrls, only imageCount)', async () => {
+      // Mirrors a listing just created or edited: a full mapAuctionRow object with real
+      // `imageUrls` and no `imageCount` at all (see mapAuctionRow in workers/index.ts).
+      const auction = makeAuction({ imageUrls: THREE_IMAGES, imageCount: undefined });
+
+      mockedApiFetch.mockImplementation(async (url: string) => {
+        if (url === `/api/auctions/${auction.id}`) {
+          // The real GET /api/auctions/:id response: no imageUrls/imageUrl at all, only
+          // imageCount - see mapAuctionDetailRow in workers/index.ts.
+          const { imageUrl, imageUrls, ...slim } = auction;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ auction: { ...slim, imageCount: THREE_IMAGES.length } }),
+          } as Response;
+        }
+        throw new Error(`Unexpected apiFetch call: ${url}`);
+      });
+
+      renderModal(auction, bidderUser);
+
+      expect(activeImageSrc()).toBe(THREE_IMAGES[0]);
+
+      await triggerPollTick();
+
+      // Still the real images, not the shared placeholder - the poll's slim row must not have
+      // clobbered them.
+      await waitFor(() => expect(document.getElementById('gallery-counter')).toHaveTextContent('1 / 3'));
+      expect(activeImageSrc()).toBe(THREE_IMAGES[0]);
+    });
+  });
+
+  describe('seller contact details when the viewer is not signed in', () => {
+    it('prompts the viewer to sign in instead of rendering a phone number, when the auction object carries none', async () => {
+      // Mirrors what GET /api/auctions/:id actually sends an unauthenticated caller - no
+      // `phoneNumber` field at all (see mapAuctionDetailRow in workers/index.ts).
+      const { phoneNumber, ...withoutPhone } = makeAuction();
+      const auction = withoutPhone as AuctionItem;
+
+      const { onPromptAuth } = renderModal(auction, null);
+
+      expect(screen.getByText(/Sign in to see contact details/i)).toBeInTheDocument();
+      expect(document.getElementById('contact-whatsapp-btn')).toBeNull();
+
+      const user = userEvent.setup();
+      await user.click(screen.getByText(/Sign in to see contact details/i));
+      expect(onPromptAuth).toHaveBeenCalled();
+    });
+
+    it('renders the phone number and WhatsApp button once the auction object carries one', () => {
+      renderModal(makeAuction(), bidderUser);
+
+      expect(screen.queryByText(/Sign in to see contact details/i)).toBeNull();
+      expect(screen.getByText('+44 7700 900000')).toBeInTheDocument();
     });
   });
 

@@ -17,6 +17,7 @@ import {
   blobToDataUrl,
   compressImageToBlob,
   createPreviewUrl,
+  fetchAuctionImages,
   ImageUploadError,
   revokePreviewUrl,
   uploadImage,
@@ -147,7 +148,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
     if (isEditMode && initialAuction) {
       setTitle(initialAuction.title);
       setDescription(initialAuction.description);
-      setPhoneNumber(initialAuction.phoneNumber);
+      setPhoneNumber(initialAuction.phoneNumber ?? '');
       setStartingPrice(String(initialAuction.startingPrice));
       setDurationMinutes(5);
       setCustomDuration('');
@@ -212,7 +213,10 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
 
     (async () => {
       try {
-        const res = await apiFetch(`/api/auctions/${initialAuction.id}`);
+        // Authed with the seller's own token: GET /api/auctions/:id only sends phoneNumber back
+        // for a signed-in caller (see mapAuctionDetailRow), and this is only ever reached with
+        // the seller themselves signed in (edit mode is seller-only).
+        const res = await apiFetchAuthed(`/api/auctions/${initialAuction.id}`, user?.token);
         const data = await res.json().catch(() => null);
 
         if (cancelled) return;
@@ -227,18 +231,23 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
         // partial row above, so nothing stale from `initialAuction` can reach the PATCH body.
         setTitle(fresh.title);
         setDescription(fresh.description);
-        setPhoneNumber(fresh.phoneNumber);
+        setPhoneNumber(fresh.phoneNumber ?? '');
         setStartingPrice(String(fresh.startingPrice));
         setCategory(fresh.category || 'Electronics');
-        setImageSlots(
-          slotsFromStoredValues(
-            Array.isArray(fresh.imageUrls) && fresh.imageUrls.length > 0
-              ? fresh.imageUrls
-              : fresh.imageUrl
-              ? [fresh.imageUrl]
-              : [],
-          ),
-        );
+
+        // The detail endpoint no longer ships imageUrls/imageUrl at all (see
+        // mapAuctionDetailRow) -- fall back to the same cached images route AuctionCard and
+        // AuctionDetailModal use. Still checked first in case a caller ever hands over a row
+        // that does carry them inline.
+        const imageUrls =
+          Array.isArray(fresh.imageUrls) && fresh.imageUrls.length > 0
+            ? fresh.imageUrls
+            : fresh.imageUrl
+            ? [fresh.imageUrl]
+            : await fetchAuctionImages(fresh.id);
+
+        if (cancelled) return;
+        setImageSlots(slotsFromStoredValues(imageUrls));
       } catch (err) {
         if (!cancelled) {
           setLoadListingError('Network error while loading the current listing details. Please close this dialog and try again.');

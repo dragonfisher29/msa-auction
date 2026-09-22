@@ -132,10 +132,16 @@ describe('App routing', () => {
       if (url === '/api/auctions?limit=24') {
         return { ok: true, status: 200, json: async () => ({ auctions: [onPage], nextCursor: null }) } as Response;
       }
+      throw new Error(`Unexpected apiFetch call: ${url}`);
+    });
+
+    // The deep-link lookup goes through apiFetchAuthed now (so a signed-in visitor gets
+    // phoneNumber back immediately - see the comment in App.tsx), not the plain apiFetch above.
+    mockedApiFetchAuthed.mockImplementation(async (url: string) => {
       if (url === `/api/auctions/${deepLinked.id}`) {
         return { ok: true, status: 200, json: async () => ({ auction: deepLinked }) } as Response;
       }
-      throw new Error(`Unexpected apiFetch call: ${url}`);
+      throw new Error(`Unexpected apiFetchAuthed call: ${url}`);
     });
 
     window.history.pushState({}, '', `/auction/${deepLinked.id}`);

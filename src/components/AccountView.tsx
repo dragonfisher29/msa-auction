@@ -40,8 +40,11 @@ const EMPTY_ACTIVITY: UserActivity = { listings: [], bids: [], wins: [] };
 /** Contact strip shown under a won item: the winner needs the seller to arrange handover. */
 const WinnerContactPanel: React.FC<{ auction: AuctionItem }> = ({ auction }) => {
   const winningAmount = auction.winningBid ?? auction.currentPrice;
+  // Always present here in practice - GET /api/users/me/activity is authenticated and includes
+  // phoneNumber on every row (see AUCTION_DETAIL_COLUMNS) - but the type is shared with the
+  // public list, where it is not, so the empty-string fallback keeps this typed correctly.
   const whatsAppUrl = buildWhatsAppUrl(
-    auction.phoneNumber,
+    auction.phoneNumber ?? '',
     `Hi ${auction.sellerName}, I won your "${auction.title}" listing on MSA Auction. When can we arrange handover?`,
   );
 

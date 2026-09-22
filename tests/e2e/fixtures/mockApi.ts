@@ -258,19 +258,23 @@ export async function mockApi(page: Page, options: MockApiOptions = {}) {
         });
       }
 
-      const payload = request.postDataJSON() as { userId: string; userName: string; amount: number };
+      // The real server identifies the bidder from the bearer token, not the request body (see
+      // the bid route in workers/index.ts), so the body only carries `amount`. This fixture
+      // mirrors that: the bidder is always the one identity `/api/auth/login` and `/register`
+      // hand out below, regardless of what (if anything) the body says.
+      const payload = request.postDataJSON() as { amount: number };
       const newBid: Bid = {
         id: `bid_e2e_${Date.now()}`,
         auctionId,
-        userId: payload.userId,
-        userName: payload.userName,
+        userId: 'usr_e2e_tester',
+        userName: 'Ellie Tester',
         amount: payload.amount,
         timestamp: Date.now(),
       };
       auction.bids = [newBid, ...auction.bids];
       auction.currentPrice = payload.amount;
-      auction.highestBidderId = payload.userId;
-      auction.highestBidderName = payload.userName;
+      auction.highestBidderId = newBid.userId;
+      auction.highestBidderName = newBid.userName;
 
       return route.fulfill({
         status: 200,

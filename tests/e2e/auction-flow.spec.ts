@@ -84,9 +84,11 @@ test.describe('auction dashboard', () => {
     await page.locator('#place-bid-submit-btn').click();
     const request = await bidRequest;
 
+    // The bidder is identified by the bearer token server-side now -- userId/userName are no
+    // longer part of the request body at all (see the comment in AuctionDetailModal's
+    // handlePlaceBid), so the only thing left to assert on the payload is the amount.
     const payload = request.postDataJSON();
-    expect(payload).toMatchObject({ userId: 'usr_e2e_tester', userName: 'Ellie Tester' });
-    expect(typeof payload.amount).toBe('number');
+    expect(payload).toEqual({ amount: expect.any(Number) });
 
     await expect(page.getByText(/Placed bid of/i)).toBeVisible();
   });

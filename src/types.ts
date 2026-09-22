@@ -30,7 +30,13 @@ export interface AuctionItem {
   id: string;
   title: string;
   description: string;
-  phoneNumber: string;
+  /**
+   * Absent on the public list (`GET /api/auctions`, never carries a phone number - see
+   * `AUCTION_LIST_COLUMNS` in `workers/shared.ts`) and on `GET /api/auctions/:id` when the caller
+   * is not signed in. Present everywhere else: the activity feed (own data only) and an
+   * authenticated detail fetch.
+   */
+  phoneNumber?: string;
   startingPrice: number;
   currentPrice: number;
   sellerId: string;
@@ -45,11 +51,13 @@ export interface AuctionItem {
   imageUrl?: string;
   imageUrls?: string[];
   /**
-   * Present instead of `imageUrls` on rows from the paginated `GET /api/auctions` list endpoint,
-   * which ships no image data at all to keep the page payload light. `AuctionCard` uses it to
-   * decide whether to reserve an image slot and lazily fetch `GET /api/auctions/:id/images`.
-   * The single-item `GET /api/auctions/:id` endpoint is unaffected and still returns `imageUrls`
-   * directly, in which case this field is simply absent.
+   * Present instead of `imageUrls` on rows from the paginated `GET /api/auctions` list endpoint
+   * AND on `GET /api/auctions/:id` (single-item detail) - neither ships any image data at all
+   * (see `mapAuctionDetailRow` in `workers/index.ts`), to keep both the list page and the
+   * every-3s-polled detail modal light. `AuctionCard`/`AuctionDetailModal` use this to decide
+   * whether to fetch real image data from `GET /api/auctions/:id/images`, at most once per id.
+   * `imageUrls`/`imageUrl` are only ever present on a row from that images route, from `POST
+   * /api/auctions` (create), or from a `PATCH` (edit) response.
    */
   imageCount?: number;
   bids: Bid[];
