@@ -429,6 +429,34 @@ describe('AuctionDetailModal', () => {
       expect(document.getElementById('gallery-counter')).toHaveTextContent('1 / 2');
       expect(document.getElementById('gallery-thumb-2')).toBeNull();
     });
+
+    // The R2 migration ships new listings with `/images/<key>` paths while existing rows -- and
+    // rows mid-backfill -- may still carry a base64 `data:` URL, sometimes both in the same
+    // listing. The gallery must render either form with no special-casing: an `<img src>` works
+    // for both, so this only guards against code that inspects/slices the string somewhere.
+    it('renders a gallery mixing a legacy data: URL and a stored /images/<key> path', () => {
+      const dataUrlImage = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMC';
+      const r2PathImage = '/images/img_2f9c8a1b';
+
+      renderModal(
+        makeAuction({ imageUrls: [dataUrlImage, r2PathImage] }),
+        bidderUser,
+      );
+
+      expect(document.getElementById('gallery-counter')).toHaveTextContent('1 / 2');
+
+      const mainImage = screen.getByAltText(/Vintage Film Camera - image 1 of 2/i) as HTMLImageElement;
+      expect(mainImage.src).toBe(dataUrlImage);
+
+      const thumb1 = document.getElementById('gallery-thumb-1') as HTMLButtonElement;
+      expect(thumb1).toBeInTheDocument();
+      fireEvent.click(thumb1);
+
+      const secondImage = screen.getByAltText(/Vintage Film Camera - image 2 of 2/i) as HTMLImageElement;
+      // jsdom resolves a relative src against the test's base URL, so check the suffix rather
+      // than the full absolute URL.
+      expect(secondImage.src.endsWith(r2PathImage)).toBe(true);
+    });
   });
 
   describe('WhatsApp contact button', () => {

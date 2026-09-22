@@ -118,6 +118,24 @@ describe('AuctionCard image loading', () => {
     expect(mockedApiFetch).not.toHaveBeenCalled();
   });
 
+  it('renders the first image when inline imageUrls mixes a legacy data: URL and a stored /images/<key> path', () => {
+    // The R2 migration means a listing mid-backfill can hold both forms at once; the card must
+    // not special-case either -- just take the first entry and hand it to <img src>.
+    const dataUrlImage = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMC';
+    const r2PathImage = '/images/img_2f9c8a1b';
+
+    const auction = makeListRowAuction({
+      imageCount: undefined,
+      imageUrls: [dataUrlImage, r2PathImage],
+    });
+    render(<AuctionCard auction={auction} onSelect={() => {}} />);
+
+    const img = screen.getByAltText(auction.title) as HTMLImageElement;
+    expect(img.src).toBe(dataUrlImage);
+    expect(document.getElementById(`auction-card-image-count-${auction.id}`)).toHaveTextContent('2');
+    expect(mockedApiFetch).not.toHaveBeenCalled();
+  });
+
   it('adds loading="lazy" and decoding="async" to the rendered image', async () => {
     mockedApiFetch.mockResolvedValue({
       ok: true,

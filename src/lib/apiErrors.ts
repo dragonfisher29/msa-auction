@@ -36,6 +36,17 @@ export const LISTING_NOT_EDITABLE = 'LISTING_NOT_EDITABLE';
 /** Returned by `GET /api/auctions` when the `cursor` query param is malformed or stale. */
 export const INVALID_CURSOR = 'INVALID_CURSOR';
 
+/** `POST /api/images` refuses a file whose Content-Type isn't jpeg/png/webp/gif. */
+export const UNSUPPORTED_IMAGE_TYPE = 'UNSUPPORTED_IMAGE_TYPE';
+/** `POST /api/images` refuses a body over the 5 MB cap. */
+export const IMAGE_TOO_LARGE = 'IMAGE_TOO_LARGE';
+/** `POST /api/images` answers this with a 503 when object storage (R2) is not configured in this
+ *  environment -- e.g. this university-society deployment, which cannot put a card on file with
+ *  Cloudflare. This is a CONTRACT with the server (see workers/index.ts): the client is expected
+ *  to fall back to embedding a compressed base64 `data:` URL directly in `imageUrls`, exactly as
+ *  the app did before R2 existed. Do not rename this without updating the server too. */
+export const IMAGE_STORAGE_UNAVAILABLE = 'IMAGE_STORAGE_UNAVAILABLE';
+
 /* -------------------------------------------------------------------------- */
 /* Moderation, bans and account recovery                                       */
 /* -------------------------------------------------------------------------- */

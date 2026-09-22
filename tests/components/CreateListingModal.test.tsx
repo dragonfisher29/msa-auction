@@ -24,9 +24,32 @@ vi.mock('../../src/lib/api', () => {
   };
 });
 
+// Compression and upload go through canvas/network APIs jsdom doesn't implement, so the image
+// pipeline in src/lib/images.ts is mocked here the same way src/lib/api.ts is above: real
+// exports (the `ImageUploadError` class, the accepted-types label) pass through via
+// `importActual`, and only the browser/network-touching functions are replaced with spies each
+// test configures directly.
+vi.mock('../../src/lib/images', async () => {
+  const actual = await vi.importActual<typeof import('../../src/lib/images')>('../../src/lib/images');
+  return {
+    ...actual,
+    compressImageToBlob: vi.fn(async (file: File) => new Blob(['compressed'], { type: file.type || 'image/jpeg' })),
+    uploadImage: vi.fn(),
+    createPreviewUrl: vi.fn((file: File) => `blob:mock-preview/${file.name}`),
+    revokePreviewUrl: vi.fn(),
+  };
+});
+
 import { apiFetch } from '../../src/lib/api';
+import { compressImageToBlob, uploadImage, ImageUploadError } from '../../src/lib/images';
 
 const mockedApiFetch = apiFetch as unknown as ReturnType<typeof vi.fn>;
+const mockedCompressImageToBlob = compressImageToBlob as unknown as ReturnType<typeof vi.fn>;
+const mockedUploadImage = uploadImage as unknown as ReturnType<typeof vi.fn>;
+
+function makeImageFile(name = 'photo.jpg', type = 'image/jpeg'): File {
+  return new File(['fake-bytes'], name, { type });
+}
 
 const NOW = Date.now();
 
@@ -101,8 +124,43 @@ function renderEditModal(initialAuction: AuctionItem, overrides: Partial<Paramet
   return { onClose, onPromptAuth, onCreated, onUpdated };
 }
 
+function renderCreateModal(overrides: Partial<Parameters<typeof CreateListingModal>[0]> = {}) {
+  const onClose = vi.fn();
+  const onPromptAuth = vi.fn();
+  const onCreated = vi.fn();
+  const onUpdated = vi.fn();
+
+  render(
+    <CreateListingModal
+      isOpen={true}
+      user={seller}
+      onClose={onClose}
+      onCreated={onCreated}
+      onUpdated={onUpdated}
+      onPromptAuth={onPromptAuth}
+      {...overrides}
+    />,
+  );
+
+  return { onClose, onPromptAuth, onCreated, onUpdated };
+}
+
 function submitBtn(): HTMLButtonElement {
   return document.getElementById('submit-create-listing-btn') as HTMLButtonElement;
+}
+
+function imagesInput(): HTMLInputElement {
+  return document.getElementById('listing-images-input') as HTMLInputElement;
+}
+
+/** Fills in every other required field so a test can focus purely on the image flow. */
+async function fillRequiredNonImageFields(user: ReturnType<typeof userEvent.setup>) {
+  await user.type(document.getElementById('listing-title-input') as HTMLInputElement, 'Retro Lamp');
+  await user.type(
+    document.getElementById('listing-description-input') as HTMLInputElement,
+    'A working retro desk lamp, no chips or cracks.',
+  );
+  await user.type(document.getElementById('listing-phone-input') as HTMLInputElement, '+44 7700 900456');
 }
 
 describe('CreateListingModal (edit mode)', () => {
@@ -336,5 +394,376 @@ describe('CreateListingModal (edit mode)', () => {
     );
 
     await waitFor(() => expect(titleInput.value).toBe('A Different Listing'));
+  });
+});
+
+describe('CreateListingModal (image upload)', () => {
+  beforeEach(() => {
+    mockedApiFetch.mockReset();
+    mockedCompressImageToBlob.mockReset();
+    // Tags the compressed blob's content with the source file's name, so a mocked
+    // `uploadImage` further down the chain can key its behaviour off *which* file this is
+    // without depending on the order concurrent uploads happen to settle in.
+    mockedCompressImageToBlob.mockImplementation(
+      async (file: File) => new Blob([`compressed:${file.name}`], { type: file.type || 'image/jpeg' }),
+    );
+    mockedUploadImage.mockReset();
+    mockedUploadImage.mockImplementation(
+      async () => ({ url: '/images/img_default', key: 'img_default' }),
+    );
+  });
+
+  it('uploads a picked image on selection and submits the returned /images/<key> path, not base64', async () => {
+    mockedUploadImage.mockResolvedValueOnce({ url: '/images/img_abc123', key: 'img_abc123' });
+    mockedApiFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === '/api/auctions' && init?.method === 'POST') {
+        const body = JSON.parse(init!.body as string);
+        return { ok: true, status: 201, json: async () => ({ auction: { ...makeFullAuction(), ...body } }) } as Response;
+      }
+      throw new Error(`Unexpected apiFetch call: ${url} ${init?.method ?? 'GET'}`);
+    });
+
+    const { onCreated } = renderCreateModal();
+    const user = userEvent.setup();
+    await fillRequiredNonImageFields(user);
+
+    await user.upload(imagesInput(), makeImageFile());
+
+    // The upload resolves and the thumbnail leaves its uploading state.
+    await waitFor(() => expect(submitBtn()).not.toBeDisabled());
+    expect(mockedCompressImageToBlob).toHaveBeenCalledTimes(1);
+    expect(mockedUploadImage).toHaveBeenCalledTimes(1);
+
+    await user.click(submitBtn());
+
+    await waitFor(() => {
+      const postCall = mockedApiFetch.mock.calls.find(([, init]) => init?.method === 'POST');
+      expect(postCall).toBeTruthy();
+      const body = JSON.parse((postCall![1] as RequestInit).body as string);
+      expect(body.imageUrls).toEqual(['/images/img_abc123']);
+      expect(body.imageUrl).toBe('/images/img_abc123');
+      // The whole point of the migration: no base64 data URL ever leaves the client.
+      expect(body.imageUrls.some((url: string) => url.startsWith('data:'))).toBe(false);
+    });
+
+    expect(onCreated).toHaveBeenCalled();
+  });
+
+  it('disables submit while an upload is in flight, and re-enables once it resolves', async () => {
+    let resolveUpload: (value: { url: string; key: string }) => void = () => {};
+    mockedUploadImage.mockImplementationOnce(
+      () => new Promise((resolve) => { resolveUpload = resolve; }),
+    );
+
+    renderCreateModal();
+    const user = userEvent.setup();
+    await fillRequiredNonImageFields(user);
+
+    await user.upload(imagesInput(), makeImageFile());
+
+    expect(submitBtn()).toBeDisabled();
+    expect(submitBtn()).toHaveTextContent('Uploading...');
+    expect(screen.getByText(/Uploading image, please wait/i)).toBeInTheDocument();
+
+    resolveUpload({ url: '/images/img_ready', key: 'img_ready' });
+
+    await waitFor(() => expect(submitBtn()).not.toBeDisabled());
+  });
+
+  it('shows a failed upload per-image and lets the other images survive, with a working retry', async () => {
+    // Keyed off the compressed blob's tagged content (see the compressImageToBlob mock above)
+    // rather than call order, since the two files' uploads race each other after selection.
+    const attemptsByFile: Record<string, number> = {};
+    mockedUploadImage.mockImplementation(async (blob: Blob) => {
+      const name = (await blob.text()).replace('compressed:', '');
+      attemptsByFile[name] = (attemptsByFile[name] ?? 0) + 1;
+
+      if (name === 'bad.jpg' && attemptsByFile[name] === 1) {
+        throw new Error('Network error while uploading.');
+      }
+      if (name === 'bad.jpg') {
+        return { url: '/images/img_retry_ok', key: 'img_retry_ok' };
+      }
+      return { url: '/images/img_second', key: 'img_second' };
+    });
+
+    mockedApiFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === '/api/auctions' && init?.method === 'POST') {
+        const body = JSON.parse(init!.body as string);
+        return { ok: true, status: 201, json: async () => ({ auction: { ...makeFullAuction(), ...body } }) } as Response;
+      }
+      throw new Error(`Unexpected apiFetch call: ${url} ${init?.method ?? 'GET'}`);
+    });
+
+    renderCreateModal();
+    const user = userEvent.setup();
+    await fillRequiredNonImageFields(user);
+
+    // The second image ("good.jpg") succeeds on its first attempt; this confirms it survives
+    // the first image's failure and retry untouched.
+    await user.upload(imagesInput(), [makeImageFile('bad.jpg'), makeImageFile('good.jpg')]);
+
+    const failureMessage = await screen.findByText(/Image 1: Network error while uploading\./i);
+    expect(failureMessage).toBeInTheDocument();
+
+    // Submitting with a failed image present is refused with a specific, actionable message
+    // rather than silently dropping the broken image.
+    await user.click(submitBtn());
+    expect(
+      await screen.findByText(/One or more images failed to upload\. Please retry or remove them/i),
+    ).toBeInTheDocument();
+    expect(mockedApiFetch).not.toHaveBeenCalled();
+
+    const retryBtn = screen.getByRole('button', { name: /Retry uploading image 1/i });
+    await user.click(retryBtn);
+
+    await waitFor(() => {
+      expect(screen.queryByText(/Image 1: Network error while uploading\./i)).not.toBeInTheDocument();
+    });
+    await waitFor(() => expect(submitBtn()).not.toBeDisabled());
+
+    await user.click(submitBtn());
+
+    await waitFor(() => {
+      const postCall = mockedApiFetch.mock.calls.find(([, init]) => init?.method === 'POST');
+      expect(postCall).toBeTruthy();
+      const body = JSON.parse((postCall![1] as RequestInit).body as string);
+      // Both images made it through: the survivor from before the failure, and the retried one.
+      expect(body.imageUrls).toEqual(expect.arrayContaining(['/images/img_second', '/images/img_retry_ok']));
+      expect(body.imageUrls).toHaveLength(2);
+    });
+  });
+
+  it('maps UNSUPPORTED_IMAGE_TYPE and IMAGE_TOO_LARGE to specific, human messages', async () => {
+    mockedUploadImage
+      .mockRejectedValueOnce(
+        new ImageUploadError('This file type is not supported. Please upload a JPEG, PNG, WEBP, or GIF image.', 'UNSUPPORTED_IMAGE_TYPE'),
+      )
+      .mockRejectedValueOnce(
+        new ImageUploadError('This image is over the 5 MB limit. Please choose a smaller file.', 'IMAGE_TOO_LARGE'),
+      );
+
+    renderCreateModal();
+    // The real check that rejects a `.bmp` happens server-side (`POST /api/images` -- mocked
+    // here via `uploadImage`); `applyAccept: false` stops user-event's own client-side filtering
+    // by the file input's `accept` attribute from silently dropping the file before it gets there.
+    const user = userEvent.setup({ applyAccept: false });
+    await fillRequiredNonImageFields(user);
+
+    await user.upload(imagesInput(), makeImageFile('weird.bmp', 'image/bmp'));
+    expect(await screen.findByText(/Image 1:.*not supported.*JPEG, PNG, WEBP, or GIF/i)).toBeInTheDocument();
+
+    await user.upload(imagesInput(), makeImageFile('huge.jpg'));
+    expect(await screen.findByText(/Image 2:.*over the 5 MB limit/i)).toBeInTheDocument();
+  });
+
+  it('edit mode: does not re-upload an already-stored image, only the newly added file', async () => {
+    const full = makeFullAuction({
+      imageUrls: ['https://example.test/camera-1.jpg', '/images/img_existing'],
+    });
+    mockedUploadImage.mockResolvedValueOnce({ url: '/images/img_new', key: 'img_new' });
+
+    mockedApiFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === `/api/auctions/${full.id}` && init?.method === 'PATCH') {
+        const body = JSON.parse(init!.body as string);
+        return { ok: true, status: 200, json: async () => ({ auction: { ...full, ...body } }) } as Response;
+      }
+      throw new Error(`Unexpected apiFetch call: ${url} ${init?.method ?? 'GET'}`);
+    });
+
+    renderEditModal(full);
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(submitBtn()).not.toBeDisabled());
+
+    await user.upload(imagesInput(), makeImageFile('added.jpg'));
+    await waitFor(() => expect(mockedUploadImage).toHaveBeenCalledTimes(1));
+
+    await user.click(submitBtn());
+
+    await waitFor(() => {
+      const patchCall = mockedApiFetch.mock.calls.find(([, init]) => init?.method === 'PATCH');
+      expect(patchCall).toBeTruthy();
+      const body = JSON.parse((patchCall![1] as RequestInit).body as string);
+      expect(body.imageUrls).toEqual([
+        'https://example.test/camera-1.jpg',
+        '/images/img_existing',
+        '/images/img_new',
+      ]);
+    });
+
+    // The two pre-existing images (one a plain https URL, one already an R2 path) were never
+    // handed to uploadImage -- only the one freshly-picked file was.
+    expect(mockedUploadImage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('CreateListingModal (IMAGE_STORAGE_UNAVAILABLE fallback)', () => {
+  beforeEach(() => {
+    mockedApiFetch.mockReset();
+    mockedCompressImageToBlob.mockReset();
+    mockedCompressImageToBlob.mockImplementation(
+      async (file: File) => new Blob([`compressed:${file.name}`], { type: file.type || 'image/jpeg' }),
+    );
+    mockedUploadImage.mockReset();
+  });
+
+  it('falls back to a base64 data: URL when upload answers IMAGE_STORAGE_UNAVAILABLE, and submits successfully', async () => {
+    mockedUploadImage.mockRejectedValueOnce(
+      new ImageUploadError('Image storage is not currently available.', 'IMAGE_STORAGE_UNAVAILABLE'),
+    );
+    mockedApiFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === '/api/auctions' && init?.method === 'POST') {
+        const body = JSON.parse(init!.body as string);
+        return { ok: true, status: 201, json: async () => ({ auction: { ...makeFullAuction(), ...body } }) } as Response;
+      }
+      throw new Error(`Unexpected apiFetch call: ${url} ${init?.method ?? 'GET'}`);
+    });
+
+    const { onCreated } = renderCreateModal();
+    const user = userEvent.setup();
+    await fillRequiredNonImageFields(user);
+
+    await user.upload(imagesInput(), makeImageFile());
+
+    // No warning/degraded-mode banner -- the fallback is invisible on success -- and the upload
+    // "failure" resolves the slot exactly like a success would: submit re-enables, no per-image
+    // error is shown.
+    await waitFor(() => expect(submitBtn()).not.toBeDisabled());
+    expect(screen.queryByText(/Image 1:/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/not currently available/i)).not.toBeInTheDocument();
+
+    await user.click(submitBtn());
+
+    await waitFor(() => {
+      const postCall = mockedApiFetch.mock.calls.find(([, init]) => init?.method === 'POST');
+      expect(postCall).toBeTruthy();
+      const body = JSON.parse((postCall![1] as RequestInit).body as string);
+      expect(body.imageUrls).toHaveLength(1);
+      expect(body.imageUrls[0]).toMatch(/^data:/);
+      expect(body.imageUrl).toBe(body.imageUrls[0]);
+    });
+
+    expect(onCreated).toHaveBeenCalled();
+  });
+
+  it('does not re-attempt an upload for a second image after the first one hits IMAGE_STORAGE_UNAVAILABLE', async () => {
+    mockedUploadImage.mockRejectedValueOnce(
+      new ImageUploadError('Image storage is not currently available.', 'IMAGE_STORAGE_UNAVAILABLE'),
+    );
+
+    renderCreateModal();
+    const user = userEvent.setup();
+    await fillRequiredNonImageFields(user);
+
+    await user.upload(imagesInput(), makeImageFile('first.jpg'));
+    await waitFor(() => expect(submitBtn()).not.toBeDisabled());
+    expect(mockedUploadImage).toHaveBeenCalledTimes(1);
+
+    await user.upload(imagesInput(), makeImageFile('second.jpg'));
+    await waitFor(() => expect(submitBtn()).not.toBeDisabled());
+
+    // The second image resolved via the base64 fallback without ever calling uploadImage again.
+    expect(mockedUploadImage).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/Image 2:/i)).not.toBeInTheDocument();
+  });
+
+  it('does not fall back to base64 on UNSUPPORTED_IMAGE_TYPE, IMAGE_TOO_LARGE, or a plain network error', async () => {
+    mockedUploadImage
+      .mockRejectedValueOnce(new ImageUploadError('Not supported.', 'UNSUPPORTED_IMAGE_TYPE'))
+      .mockRejectedValueOnce(new ImageUploadError('Too large.', 'IMAGE_TOO_LARGE'))
+      .mockRejectedValueOnce(new Error('Network error while uploading.'));
+
+    renderCreateModal();
+    const user = userEvent.setup({ applyAccept: false });
+    await fillRequiredNonImageFields(user);
+
+    await user.upload(imagesInput(), makeImageFile('one.jpg'));
+    expect(await screen.findByText(/Image 1:.*Not supported\./i)).toBeInTheDocument();
+
+    await user.upload(imagesInput(), makeImageFile('two.jpg'));
+    expect(await screen.findByText(/Image 2:.*Too large\./i)).toBeInTheDocument();
+
+    await user.upload(imagesInput(), makeImageFile('three.jpg'));
+    expect(await screen.findByText(/Image 3:.*Network error while uploading\./i)).toBeInTheDocument();
+
+    // None of these real failures were converted into a base64 fallback: each slot stayed in its
+    // own error state, submit is refused, and the flag that would skip future uploads was never set.
+    await user.click(submitBtn());
+    expect(
+      await screen.findByText(/One or more images failed to upload\. Please retry or remove them/i),
+    ).toBeInTheDocument();
+    expect(mockedApiFetch).not.toHaveBeenCalled();
+
+    mockedUploadImage.mockResolvedValueOnce({ url: '/images/img_after_errors', key: 'img_after_errors' });
+    const retryBtn = screen.getByRole('button', { name: /Retry uploading image 3/i });
+    await user.click(retryBtn);
+    await waitFor(() => expect(mockedUploadImage).toHaveBeenCalledTimes(4));
+  });
+
+  it('successful upload still submits the /images/<key> path unchanged when storage is available', async () => {
+    mockedUploadImage.mockResolvedValueOnce({ url: '/images/img_normal', key: 'img_normal' });
+    mockedApiFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === '/api/auctions' && init?.method === 'POST') {
+        const body = JSON.parse(init!.body as string);
+        return { ok: true, status: 201, json: async () => ({ auction: { ...makeFullAuction(), ...body } }) } as Response;
+      }
+      throw new Error(`Unexpected apiFetch call: ${url} ${init?.method ?? 'GET'}`);
+    });
+
+    renderCreateModal();
+    const user = userEvent.setup();
+    await fillRequiredNonImageFields(user);
+    await user.upload(imagesInput(), makeImageFile());
+    await waitFor(() => expect(submitBtn()).not.toBeDisabled());
+
+    await user.click(submitBtn());
+
+    await waitFor(() => {
+      const postCall = mockedApiFetch.mock.calls.find(([, init]) => init?.method === 'POST');
+      const body = JSON.parse((postCall![1] as RequestInit).body as string);
+      expect(body.imageUrls).toEqual(['/images/img_normal']);
+    });
+  });
+
+  it('edit mode: falls back for a newly added image without touching already-stored ones', async () => {
+    const full = makeFullAuction({
+      imageUrls: ['https://example.test/camera-1.jpg', '/images/img_existing'],
+    });
+    mockedUploadImage.mockRejectedValueOnce(
+      new ImageUploadError('Image storage is not currently available.', 'IMAGE_STORAGE_UNAVAILABLE'),
+    );
+
+    mockedApiFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === `/api/auctions/${full.id}` && init?.method === 'PATCH') {
+        const body = JSON.parse(init!.body as string);
+        return { ok: true, status: 200, json: async () => ({ auction: { ...full, ...body } }) } as Response;
+      }
+      throw new Error(`Unexpected apiFetch call: ${url} ${init?.method ?? 'GET'}`);
+    });
+
+    renderEditModal(full);
+    const user = userEvent.setup();
+    await waitFor(() => expect(submitBtn()).not.toBeDisabled());
+
+    await user.upload(imagesInput(), makeImageFile('added.jpg'));
+    await waitFor(() => expect(submitBtn()).not.toBeDisabled());
+    expect(mockedUploadImage).toHaveBeenCalledTimes(1);
+
+    await user.click(submitBtn());
+
+    await waitFor(() => {
+      const patchCall = mockedApiFetch.mock.calls.find(([, init]) => init?.method === 'PATCH');
+      expect(patchCall).toBeTruthy();
+      const body = JSON.parse((patchCall![1] as RequestInit).body as string);
+      expect(body.imageUrls).toHaveLength(3);
+      expect(body.imageUrls[0]).toBe('https://example.test/camera-1.jpg');
+      expect(body.imageUrls[1]).toBe('/images/img_existing');
+      expect(body.imageUrls[2]).toMatch(/^data:/);
+    });
+
+    // Still only the one freshly-picked file ever reached uploadImage -- the two stored images
+    // were never re-uploaded, whether storage is available or not.
+    expect(mockedUploadImage).toHaveBeenCalledTimes(1);
   });
 });

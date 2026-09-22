@@ -1,16 +1,26 @@
-import React, { useEffect, useState } from 'react';
-import { X, Tag, Phone, PoundSterling, Clock, FileText, Image as ImageIcon, AlertCircle, Trash2, Upload, ChevronDown, PencilLine, RefreshCw } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { X, Tag, Phone, PoundSterling, Clock, FileText, AlertCircle, Trash2, Upload, ChevronDown, PencilLine, RefreshCw, RotateCcw } from 'lucide-react';
 import { apiFetch, apiFetchAuthed } from '../lib/api';
 import { SELECTABLE_CATEGORIES } from '../lib/categories';
 import { User, AuctionItem } from '../types';
 import {
   AUTH_ERROR_CODES,
+  IMAGE_STORAGE_UNAVAILABLE,
   LISTING_HAS_BIDS,
   LISTING_NOT_EDITABLE,
   NOT_LISTING_OWNER,
   readErrorCode,
   stripErrorCode,
 } from '../lib/apiErrors';
+import {
+  ACCEPTED_IMAGE_TYPES_LABEL,
+  blobToDataUrl,
+  compressImageToBlob,
+  createPreviewUrl,
+  ImageUploadError,
+  revokePreviewUrl,
+  uploadImage,
+} from '../lib/images';
 
 interface CreateListingModalProps {
   isOpen: boolean;
@@ -42,54 +52,43 @@ const PRESET_DURATIONS = [
 ];
 
 const MAX_IMAGES = 3;
-const MAX_IMAGE_DIMENSION = 1600;
-const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
-const readFileAsDataUrl = (file: File) => new Promise<string>((resolve, reject) => {
-  const reader = new FileReader();
-  reader.onload = () => resolve(String(reader.result));
-  reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
-  reader.readAsDataURL(file);
-});
+type ImageSlotStatus = 'stored' | 'uploading' | 'ready' | 'error';
 
-const compressImage = async (file: File): Promise<string> => {
-  if (!file.type.startsWith('image/')) {
-    throw new Error(`${file.name} is not a valid image file.`);
-  }
+/**
+ * One image thumbnail in the form. `stored` covers anything that already has a final value on
+ * the server -- a legacy `data:` URL, an `/images/<key>` path, or (in tests/fixtures) a plain
+ * http(s) URL -- and is never re-uploaded. `uploading`/`ready`/`error` track a freshly picked
+ * file through client-side compression and `POST /api/images`; only `ready` (and `stored`)
+ * slots contribute a value to the submitted `imageUrls`.
+ */
+interface ImageSlot {
+  id: string;
+  status: ImageSlotStatus;
+  /** What `<img src>` renders: the stored value/URL, or a local blob preview while uploading. */
+  previewSrc: string;
+  /** The value to submit once resolved -- null while uploading or failed. */
+  value: string | null;
+  error: string | null;
+  /** The originally picked file, kept only so a failed upload can be retried without asking the
+   *  user to re-select it. Always null for `stored` slots. */
+  file: File | null;
+}
 
-  if (file.size > MAX_IMAGE_BYTES) {
-    throw new Error(`${file.name} is too large. Please upload images up to 5 MB each.`);
-  }
+let imageSlotSeq = 0;
+const nextSlotId = () => `img-slot-${++imageSlotSeq}`;
 
-  const source = await readFileAsDataUrl(file);
-
-  const image = await new Promise<HTMLImageElement>((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error(`Could not process ${file.name}.`));
-    img.src = source;
-  });
-
-  const canvas = document.createElement('canvas');
-  const scale = Math.min(1, MAX_IMAGE_DIMENSION / Math.max(image.width, image.height));
-  const targetWidth = Math.max(1, Math.round(image.width * scale));
-  const targetHeight = Math.max(1, Math.round(image.height * scale));
-
-  canvas.width = targetWidth;
-  canvas.height = targetHeight;
-
-  const context = canvas.getContext('2d');
-  if (!context) {
-    throw new Error(`Could not create a preview for ${file.name}.`);
-  }
-
-  context.drawImage(image, 0, 0, targetWidth, targetHeight);
-
-  const mimeType = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
-  const quality = file.size > 1_000_000 ? 0.72 : 0.85;
-
-  return canvas.toDataURL(mimeType, quality);
-};
+const slotsFromStoredValues = (values: string[]): ImageSlot[] =>
+  values
+    .filter((value): value is string => typeof value === 'string' && value.trim() !== '')
+    .map((value) => ({
+      id: nextSlotId(),
+      status: 'stored' as const,
+      previewSrc: value,
+      value,
+      error: null,
+      file: null,
+    }));
 
 export const CreateListingModal: React.FC<CreateListingModalProps> = ({
   isOpen,
@@ -110,7 +109,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
   const [durationMinutes, setDurationMinutes] = useState<number>(5);
   const [customDuration, setCustomDuration] = useState<string>('');
   const [category, setCategory] = useState('Electronics');
-  const [imagePreviews, setImagePreviews] = useState<string[]>([]);
+  const [imageSlots, setImageSlots] = useState<ImageSlot[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   // Edit mode only: true while re-fetching the full listing (see the effect below). Gates the
@@ -121,6 +120,29 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
   // picking an image resets `error`) and survives until the dialog is closed and reopened.
   const [loadListingError, setLoadListingError] = useState<string | null>(null);
 
+  // Set the first time `POST /api/images` answers `IMAGE_STORAGE_UNAVAILABLE` (R2 not configured
+  // in this environment -- expected at this deploy). Once true, every subsequent image in this
+  // modal session skips the upload attempt entirely and goes straight to the base64 `data:` URL
+  // fallback, rather than re-discovering the same 503 on every image. A ref, not state: flipping
+  // it must never itself trigger a re-render, and it's reset below whenever the modal is (re)opened.
+  const storageUnavailableRef = useRef(false);
+
+  // Mirrors `imageSlots` so the unmount cleanup effect below can revoke blob preview URLs
+  // without depending on (and re-subscribing to) `imageSlots` itself.
+  const imageSlotsRef = useRef<ImageSlot[]>([]);
+  useEffect(() => {
+    imageSlotsRef.current = imageSlots;
+  }, [imageSlots]);
+
+  // Blob preview URLs are only ever created client-side for freshly picked files (see
+  // `handleImageSelection`); release whatever's left when the modal instance goes away so a long
+  // session of opening/closing this dialog doesn't leak object URLs.
+  useEffect(() => {
+    return () => {
+      imageSlotsRef.current.forEach((slot) => revokePreviewUrl(slot.previewSrc));
+    };
+  }, []);
+
   const resetForm = () => {
     if (isEditMode && initialAuction) {
       setTitle(initialAuction.title);
@@ -130,12 +152,14 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
       setDurationMinutes(5);
       setCustomDuration('');
       setCategory(initialAuction.category || 'Electronics');
-      setImagePreviews(
-        Array.isArray(initialAuction.imageUrls) && initialAuction.imageUrls.length > 0
-          ? initialAuction.imageUrls
-          : initialAuction.imageUrl
-          ? [initialAuction.imageUrl]
-          : [],
+      setImageSlots(
+        slotsFromStoredValues(
+          Array.isArray(initialAuction.imageUrls) && initialAuction.imageUrls.length > 0
+            ? initialAuction.imageUrls
+            : initialAuction.imageUrl
+            ? [initialAuction.imageUrl]
+            : [],
+        ),
       );
       setError(null);
       setIsSubmitting(false);
@@ -149,7 +173,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
     setDurationMinutes(5);
     setCustomDuration('');
     setCategory('Electronics');
-    setImagePreviews([]);
+    setImageSlots([]);
     setError(null);
     setIsSubmitting(false);
   };
@@ -163,6 +187,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
     // below, the text fields, which the activity feed's summary row DOES carry accurately.
     resetForm();
     setLoadListingError(null);
+    storageUnavailableRef.current = false;
 
     if (!isEditMode || !initialAuction) {
       setIsLoadingListing(false);
@@ -205,12 +230,14 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
         setPhoneNumber(fresh.phoneNumber);
         setStartingPrice(String(fresh.startingPrice));
         setCategory(fresh.category || 'Electronics');
-        setImagePreviews(
-          Array.isArray(fresh.imageUrls) && fresh.imageUrls.length > 0
-            ? fresh.imageUrls
-            : fresh.imageUrl
-            ? [fresh.imageUrl]
-            : [],
+        setImageSlots(
+          slotsFromStoredValues(
+            Array.isArray(fresh.imageUrls) && fresh.imageUrls.length > 0
+              ? fresh.imageUrls
+              : fresh.imageUrl
+              ? [fresh.imageUrl]
+              : [],
+          ),
         );
       } catch (err) {
         if (!cancelled) {
@@ -236,7 +263,62 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
 
   if (!isOpen) return null;
 
-  const handleImageSelection = async (evt: React.ChangeEvent<HTMLInputElement>) => {
+  // Resolves one already-compressed blob straight to a base64 `data:` URL and writes it into the
+  // matching slot as if it had uploaded -- the `IMAGE_STORAGE_UNAVAILABLE` fallback. Deliberately
+  // indistinguishable from a successful upload to the rest of the form: no banner, no separate
+  // status, because there is nothing the user can do about it and the listing works either way.
+  const resolveSlotWithDataUrl = async (slotId: string, blob: Blob) => {
+    const dataUrl = await blobToDataUrl(blob);
+    setImageSlots((current) =>
+      current.map((slot) => (slot.id === slotId ? { ...slot, status: 'ready', value: dataUrl, error: null } : slot)),
+    );
+  };
+
+  // Compresses then uploads one freshly-picked file, writing the result back into the slot with
+  // a matching `id`. Never throws -- a failure lands in that slot's own `error`, so one bad file
+  // can never take out the others or the form as a whole.
+  //
+  // When object storage isn't configured server-side, `uploadImage` fails every single time with
+  // `IMAGE_STORAGE_UNAVAILABLE` -- there is no transient recovery to wait for -- so the first such
+  // response flips `storageUnavailableRef` and every subsequent call here (including this modal's
+  // remaining in-flight selections and any later ones) skips straight to the base64 fallback
+  // instead of re-discovering the same 503 on every image.
+  const processImageSlot = async (slotId: string, file: File, token: string | null | undefined) => {
+    try {
+      const blob = await compressImageToBlob(file);
+
+      if (storageUnavailableRef.current) {
+        await resolveSlotWithDataUrl(slotId, blob);
+        return;
+      }
+
+      try {
+        const { url } = await uploadImage(blob, token);
+        setImageSlots((current) =>
+          current.map((slot) => (slot.id === slotId ? { ...slot, status: 'ready', value: url, error: null } : slot)),
+        );
+      } catch (uploadErr) {
+        if (uploadErr instanceof ImageUploadError && uploadErr.code === IMAGE_STORAGE_UNAVAILABLE) {
+          storageUnavailableRef.current = true;
+          await resolveSlotWithDataUrl(slotId, blob);
+          return;
+        }
+        // Any other failure -- unsupported type, too large, auth, a genuine network error -- is a
+        // real failure and must surface as one, never be swallowed into the base64 fallback.
+        throw uploadErr;
+      }
+    } catch (err) {
+      const message =
+        err instanceof ImageUploadError || err instanceof Error
+          ? err.message
+          : 'Unable to upload this image.';
+      setImageSlots((current) =>
+        current.map((slot) => (slot.id === slotId ? { ...slot, status: 'error', value: null, error: message } : slot)),
+      );
+    }
+  };
+
+  const handleImageSelection = (evt: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(evt.target.files ?? []).filter((entry): entry is File => entry instanceof File);
     evt.target.value = '';
 
@@ -250,28 +332,68 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
       return;
     }
 
-    const remainingSlots = MAX_IMAGES - imagePreviews.length;
+    // Uploading requires a bearer token; the "Sign in required" banner covers the rest of the
+    // form, but the file picker itself has no other guard against a signed-out visitor.
+    if (!user) {
+      setError('Please sign in to upload images.');
+      return;
+    }
+
+    const remainingSlots = MAX_IMAGES - imageSlots.length;
     if (files.length > remainingSlots) {
       setError(`You can upload up to ${MAX_IMAGES} images total. Please choose ${remainingSlots} or fewer file(s).`);
       return;
     }
 
-    try {
-      setError(null);
-      const compressed = await Promise.all(files.map((file) => compressImage(file)));
-      setImagePreviews((current) => [...current, ...compressed]);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to process the selected images.');
-    }
+    setError(null);
+
+    const token = user.token;
+    const newSlots: ImageSlot[] = files.map((file) => ({
+      id: nextSlotId(),
+      status: 'uploading',
+      previewSrc: createPreviewUrl(file),
+      value: null,
+      error: null,
+      file,
+    }));
+
+    setImageSlots((current) => [...current, ...newSlots]);
+
+    newSlots.forEach((slot) => {
+      void processImageSlot(slot.id, slot.file as File, token);
+    });
   };
 
-  const removeImage = (indexToRemove: number) => {
+  const retryImageSlot = (id: string) => {
+    const slot = imageSlots.find((s) => s.id === id);
+    if (!slot || !slot.file || !user) {
+      return;
+    }
+    setImageSlots((current) =>
+      current.map((s) => (s.id === id ? { ...s, status: 'uploading', error: null } : s)),
+    );
+    void processImageSlot(id, slot.file, user.token);
+  };
+
+  const removeImage = (id: string) => {
     if (isEditMode && isLoadingListing) {
       return;
     }
-    setImagePreviews((current) => current.filter((_, index) => index !== indexToRemove));
+    setImageSlots((current) => {
+      const slot = current.find((s) => s.id === id);
+      if (slot) {
+        revokePreviewUrl(slot.previewSrc);
+      }
+      return current.filter((s) => s.id !== id);
+    });
     setError(null);
   };
+
+  const hasUploadInProgress = imageSlots.some((slot) => slot.status === 'uploading');
+  const hasFailedUpload = imageSlots.some((slot) => slot.status === 'error');
+  const resolvedImageValues = imageSlots
+    .map((slot) => slot.value)
+    .filter((value): value is string => typeof value === 'string' && value.trim() !== '');
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -306,7 +428,22 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
       return;
     }
 
-    if (imagePreviews.length === 0) {
+    if (imageSlots.length === 0) {
+      setError('Please upload at least one image before publishing the listing.');
+      return;
+    }
+
+    if (hasUploadInProgress) {
+      // Belt-and-braces alongside the disabled submit button below.
+      return;
+    }
+
+    if (hasFailedUpload) {
+      setError('One or more images failed to upload. Please retry or remove them before publishing.');
+      return;
+    }
+
+    if (resolvedImageValues.length === 0) {
       setError('Please upload at least one image before publishing the listing.');
       return;
     }
@@ -345,7 +482,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
             description: trimmedDescription,
             phoneNumber: trimmedPhoneNumber,
             category: category.trim() || 'General',
-            imageUrls: imagePreviews,
+            imageUrls: resolvedImageValues,
             startingPrice: priceNum,
           }),
         });
@@ -394,8 +531,8 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
           durationMinutes: finalDuration,
           sellerId: user.id,
           sellerName: user.name,
-          imageUrls: imagePreviews,
-          imageUrl: imagePreviews[0],
+          imageUrls: resolvedImageValues,
+          imageUrl: resolvedImageValues[0],
           category: category.trim() || 'General',
         }),
       });
@@ -620,17 +757,43 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
               Item Images (Up to 3) *
             </label>
             <div className="mb-2 text-[11px] text-[#1e293b]/65">
-              Upload up to 3 images. Files are compressed automatically before they are stored.
+              Accepted formats: {ACCEPTED_IMAGE_TYPES_LABEL}. Up to 5&nbsp;MB each. Images are
+              compressed and prepared automatically as soon as you pick them.
             </div>
 
-            {imagePreviews.length > 0 && (
+            {imageSlots.length > 0 && (
               <div className="mb-3 grid grid-cols-3 gap-2">
-                {imagePreviews.map((preview, index) => (
-                  <div key={`${preview.slice(0, 20)}-${index}`} className="relative rounded-xl overflow-hidden border border-[#ccdbfd] bg-[#edf2fb]">
-                    <img src={preview} alt={`Uploaded preview ${index + 1}`} className="h-20 sm:h-24 w-full object-cover" />
+                {imageSlots.map((slot, index) => (
+                  <div key={slot.id} className="relative rounded-xl overflow-hidden border border-[#ccdbfd] bg-[#edf2fb]">
+                    <img
+                      src={slot.previewSrc}
+                      alt={`Uploaded preview ${index + 1}`}
+                      className={`h-20 sm:h-24 w-full object-cover ${slot.status === 'uploading' || slot.status === 'error' ? 'opacity-40' : ''}`}
+                    />
+
+                    {slot.status === 'uploading' && (
+                      <div className="absolute inset-0 flex items-center justify-center bg-[#1e293b]/40" role="status">
+                        <RefreshCw className="w-5 h-5 text-white animate-spin" aria-hidden="true" />
+                        <span className="sr-only">Uploading image {index + 1}…</span>
+                      </div>
+                    )}
+
+                    {slot.status === 'error' && (
+                      <div className="absolute inset-0 flex items-center justify-center bg-red-900/55">
+                        <button
+                          type="button"
+                          onClick={() => retryImageSlot(slot.id)}
+                          aria-label={`Retry uploading image ${index + 1}`}
+                          className="inline-flex items-center justify-center p-2.5 min-h-[44px] min-w-[44px] rounded-lg bg-white text-red-700 hover:bg-red-50 transition-colors"
+                        >
+                          <RotateCcw className="w-4 h-4" />
+                        </button>
+                      </div>
+                    )}
+
                     <button
                       type="button"
-                      onClick={() => removeImage(index)}
+                      onClick={() => removeImage(slot.id)}
                       className="absolute top-1 right-1 inline-flex items-center justify-center rounded-md bg-[#1e293b]/70 p-2 min-h-[36px] min-w-[36px] text-white hover:bg-[#1e293b]"
                       aria-label={`Remove image ${index + 1}`}
                     >
@@ -641,20 +804,49 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
               </div>
             )}
 
-            {imagePreviews.length < MAX_IMAGES && !(isEditMode && isLoadingListing) && (
+            {/* Per-image failure detail: kept out of the small thumbnail overlay (which only has
+                room for the retry control) so the specific reason -- wrong format vs too large
+                vs a dead session -- is both visible and announced to assistive tech, not just
+                implied by a red icon. */}
+            {imageSlots.some((slot) => slot.status === 'error') && (
+              <div className="mb-3 space-y-1.5">
+                {imageSlots.map((slot, index) =>
+                  slot.status === 'error' ? (
+                    <div
+                      key={slot.id}
+                      id={`image-slot-error-${index}`}
+                      role="alert"
+                      className="p-2 rounded-lg bg-red-100/90 border border-red-200 text-red-800 text-[11px] flex items-center gap-1.5"
+                    >
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                      <span className="flex-1">Image {index + 1}: {slot.error}</span>
+                    </div>
+                  ) : null,
+                )}
+              </div>
+            )}
+
+            {hasUploadInProgress && (
+              <div role="status" className="mb-2 text-[11px] font-semibold text-[#1e293b]/70 flex items-center gap-1.5">
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                <span>Uploading image{imageSlots.filter((s) => s.status === 'uploading').length > 1 ? 's' : ''}, please wait…</span>
+              </div>
+            )}
+
+            {user && imageSlots.length < MAX_IMAGES && !(isEditMode && isLoadingListing) && (
               <label
                 htmlFor="listing-images-input"
                 className="flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-[#abc4ff] bg-[#edf2fb] px-3 py-3 min-h-[48px] text-xs font-semibold text-[#1e293b] transition-colors hover:bg-[#d7e3fc]"
               >
                 <Upload className="w-4 h-4" />
-                <span>Add Image{imagePreviews.length > 0 ? 's' : ''}</span>
+                <span>Add Image{imageSlots.length > 0 ? 's' : ''}</span>
               </label>
             )}
 
             <input
               id="listing-images-input"
               type="file"
-              accept="image/*"
+              accept="image/jpeg,image/png,image/webp,image/gif"
               multiple
               onChange={handleImageSelection}
               className="hidden"
@@ -697,7 +889,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
             <button
               id="submit-create-listing-btn"
               type="submit"
-              disabled={isSubmitting || !user || (isEditMode && (isLoadingListing || !!loadListingError))}
+              disabled={isSubmitting || !user || hasUploadInProgress || (isEditMode && (isLoadingListing || !!loadListingError))}
               className="px-4 sm:px-5 py-2.5 min-h-[44px] rounded-xl bg-[#abc4ff] hover:bg-[#b6ccfe] border border-[#c1d3fe] text-xs font-extrabold text-[#1e293b] shadow-xs transition-colors cursor-pointer disabled:opacity-60 flex items-center justify-center gap-2 text-center"
             >
               {isEditMode ? <PencilLine className="w-4 h-4 shrink-0" /> : <Clock className="w-4 h-4 shrink-0" />}
@@ -705,9 +897,13 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
                 {isEditMode
                   ? isLoadingListing
                     ? 'Loading...'
+                    : hasUploadInProgress
+                    ? 'Uploading...'
                     : isSubmitting
                     ? 'Saving...'
                     : 'Save Changes'
+                  : hasUploadInProgress
+                  ? 'Uploading...'
                   : isSubmitting
                   ? 'Starting Auction...'
                   : 'Publish Live Auction'}

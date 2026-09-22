@@ -10,9 +10,19 @@ export interface BidOverride {
 export interface MockApiOptions {
   /** Force a specific status/body for the next bid POST against this auction id. */
   bidOverrideByAuctionId?: Record<string, BidOverride>;
+  /** Simulates object storage (R2) not being configured: every `POST /api/images` answers 503
+   *  `IMAGE_STORAGE_UNAVAILABLE` instead of accepting the upload, matching what this deployment
+   *  actually does until R2 is turned on. Lets e2e tests exercise `CreateListingModal`'s base64
+   *  `data:` URL fallback the same way `tests/components/CreateListingModal.test.tsx` does. */
+  imageStorageUnavailable?: boolean;
 }
 
 const DEFAULT_PAGE_LIMIT = 24;
+
+/** Mirrors the real `POST /api/images` contract's accepted `Content-Type`s and 5 MB cap. */
+const ACCEPTED_IMAGE_CONTENT_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+const MAX_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024;
+let imageUploadSeq = 0;
 
 /**
  * Strips the two image fields off a full `AuctionItem` and replaces them with `imageCount`,
@@ -114,6 +124,62 @@ export async function mockApi(page: Page, options: MockApiOptions = {}) {
       return route.fulfill({
         contentType: 'application/json',
         body: JSON.stringify({ imageUrls }),
+      });
+    }
+
+    // The R2 migration's upload endpoint: raw image bytes in, `{ url, key }` out. Requires auth
+    // like every other write endpoint here, even though auth itself isn't otherwise faked in
+    // this fixture -- a request with no Authorization header at all is refused, matching the
+    // real worker's `requireUser` gate.
+    if (method === 'POST' && pathname === '/api/images') {
+      if (!request.headers()['authorization']) {
+        return route.fulfill({
+          status: 401,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: 'Unauthorized. [Code: UNAUTHORIZED]', code: 'UNAUTHORIZED' }),
+        });
+      }
+
+      // Mirrors the real worker with R2 unbound (the actual state at this deploy, since the
+      // society cannot put a card on file with Cloudflare): every upload attempt, regardless of
+      // an otherwise-valid content type or size, is refused with this 503.
+      if (options.imageStorageUnavailable) {
+        return route.fulfill({
+          status: 503,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            error: 'Image storage is not currently available. [Code: IMAGE_STORAGE_UNAVAILABLE]',
+            code: 'IMAGE_STORAGE_UNAVAILABLE',
+          }),
+        });
+      }
+
+      const contentType = (request.headers()['content-type'] || '').split(';')[0].trim();
+      if (!ACCEPTED_IMAGE_CONTENT_TYPES.includes(contentType)) {
+        return route.fulfill({
+          status: 400,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            error: 'Unsupported image type. [Code: UNSUPPORTED_IMAGE_TYPE]',
+            code: 'UNSUPPORTED_IMAGE_TYPE',
+          }),
+        });
+      }
+
+      const bodyBuffer = request.postDataBuffer();
+      if (!bodyBuffer || bodyBuffer.length > MAX_IMAGE_UPLOAD_BYTES) {
+        return route.fulfill({
+          status: 413,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: 'Image too large. [Code: IMAGE_TOO_LARGE]', code: 'IMAGE_TOO_LARGE' }),
+        });
+      }
+
+      const key = `e2e_img_${Date.now()}_${++imageUploadSeq}`;
+      return route.fulfill({
+        status: 201,
+        contentType: 'application/json',
+        body: JSON.stringify({ url: `/images/${key}`, key }),
       });
     }
 
