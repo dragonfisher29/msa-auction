@@ -142,11 +142,11 @@ Do all of this before touching the database or running `wrangler deploy`.
 ## 3. Migrations
 
 Run these against the Supabase SQL editor for the project, **in this order:
-001, 002, 003, 004.** Every one of them is written to be safe to re-run except
-where noted for 004. For each, open the file in `migrations/`, copy the whole
-thing, paste it into the SQL editor, and run it — the excerpts below are the
-load-bearing statements, not a substitute for reading the file's own comments
-if something looks off.
+001, 002, 003, 004, 005.** Every one of them is written to be safe to re-run
+except where noted for 004. For each, open the file in `migrations/`, copy the
+whole thing, paste it into the SQL editor, and run it — the excerpts below are
+the load-bearing statements, not a substitute for reading the file's own
+comments if something looks off.
 
 ### 3.1 `001_listing_lifecycle_and_list_payload.sql`
 
@@ -279,11 +279,17 @@ take seconds, not minutes, but avoid running it in the middle of active
 bidding.
 
 **Why it must run before deploy:** the Worker writes `bid_version` on every
-successful bid. The application code tolerates the column being absent — it
-falls back to the old float-based guard rather than failing outright — so a
-Worker deployed ahead of this migration will not error. It will just still
-carry the exact bug this migration exists to fix. Run it before shipping the
-Worker, same as 001.
+successful bid. The application code used to tolerate the column being absent
+— it fell back to the old float-based guard rather than failing outright — but
+this version's bid, settle, and hide-listing code paths now select
+`bid_version` **by name** (`BID_READ_COLUMNS` / `SETTLE_READ_COLUMNS` in
+`workers/shared.ts`, and the hide route's own fetch), rather than via
+`select('*')`. Naming a column PostgREST does not have errors the whole query
+with 42703 (undefined column) instead of silently omitting it, so this is now
+a **hard blocker**: run this migration before deploying this version, or
+every bid, every settle (cron and lazy), and every admin hide will 500.
+
+**This migration is REQUIRED before deploying this version** — see above.
 
 **Verify:**
 ```sql
@@ -318,6 +324,38 @@ alter table public.auctions drop column if exists bid_version;
 This carries the same `ACCESS EXCLUSIVE` lock as the forward migration — run
 it in a quiet moment too, and only alongside rolling the Worker back to a
 version that predates this change set.
+
+### 3.5 `005_enable_rls.sql`
+
+**What it does:** turns on row level security on `public.users`,
+`public.auctions`, and `public.reports`. No policies are added.
+
+**Why it must run before deploy:** with RLS off, the anon key (which ships in
+this repo's client bundle and is not a secret) has default `select` access to
+every row in these tables — including `users.token`, the bearer credential
+the whole session scheme is built on. The Worker authenticates with the
+service role key, which **bypasses RLS entirely**, so this migration changes
+nothing about how the app itself behaves; it only blocks the anon/authenticated
+keys, which this app never uses, from reading the tables directly.
+
+**Verify:**
+```sql
+select tablename, rowsecurity
+  from pg_tables
+ where schemaname = 'public' and tablename in ('users', 'auctions', 'reports')
+ order by tablename;
+```
+Expect `rowsecurity = true` on all three rows, and the app to keep working
+exactly as before.
+
+**Rollback** (only if the Worker starts erroring post-deploy and you suspect
+this migration — check the service-role-key theory in the migration's own
+comments first):
+```sql
+alter table public.users disable row level security;
+alter table public.auctions disable row level security;
+alter table public.reports disable row level security;
+```
 
 ---
 

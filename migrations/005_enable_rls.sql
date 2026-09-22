@@ -1,0 +1,68 @@
+-- ============================================================================
+-- 005_enable_rls.sql
+--
+-- WHAT THIS DOES
+--   Turns on row level security on every application table the Worker talks
+--   to: `public.users`, `public.auctions`, `public.reports`. No policies are
+--   added.
+--
+-- WHY
+--   `select tablename, rowsecurity from pg_tables where schemaname = 'public';`
+--   shows `rowsecurity = false` on all three. With RLS off, the Postgres grants
+--   Supabase attaches to the `anon` key are the only thing standing between the
+--   public and a direct `select * from users` - and `anon` already has
+--   `select` on every `public` table by default. In particular
+--   `users.token` - the bearer credential this app's session scheme is built
+--   on - is readable by anyone holding the project's anon key, which is not a
+--   secret: it ships in this repo's client bundle.
+--
+-- WHY THIS IS SAFE TO TURN ON WITH ZERO POLICIES
+--   Enabling RLS with no policies defined does not lock anyone out who is
+--   currently able to get in: every read and write this application makes
+--   goes through the Cloudflare Worker (`workers/index.ts`), and the Worker
+--   authenticates to Supabase with the SERVICE ROLE key
+--   (`SUPABASE_SECRET_KEY`/`SUPABASE_SERVICE_ROLE_KEY` - see
+--   `getSupabaseClient` in `workers/index.ts`). The service role BYPASSES RLS
+--   entirely, by Postgres design, regardless of how many (or how few) policies
+--   exist on a table. So the app's own behaviour is completely unaffected by
+--   this migration.
+--
+--   What changes is everyone else: with RLS on and no policies, `anon` and
+--   `authenticated` keys - which this app never uses, but which Supabase hands
+--   out alongside the service key and which are not treated as secret - can no
+--   longer read or write these tables at all, because a table with RLS enabled
+--   and no policies denies every row to every role except one that bypasses
+--   RLS (the service role, and the Postgres superuser). That is exactly the
+--   posture wanted here: this deployment intentionally has no policies to
+--   write, because there is exactly one caller (the Worker, via the service
+--   key) and it does not need row-level filtering - it already enforces every
+--   access rule (ownership, ban status, admin-only routes, hidden/cancelled
+--   visibility) in application code before it ever issues a query.
+--
+-- IDEMPOTENT: `enable row level security` is safe to run again on a table that
+-- already has it on - Postgres does not error, it is simply a no-op.
+--
+-- ORDER: run this FIFTH, after 001-004. It does not depend on any column
+-- those migrations add and could in principle run first, but keeping the
+-- numbering in deploy order avoids ever having to ask "did 005 already run"
+-- out of sequence.
+-- ============================================================================
+
+alter table public.users enable row level security;
+alter table public.auctions enable row level security;
+alter table public.reports enable row level security;
+
+-- ---------------------------------------------------------------------------
+-- VERIFICATION - run this afterwards
+-- ---------------------------------------------------------------------------
+-- Expect `rowsecurity = true` on all three rows, and this app to keep working
+-- exactly as before (it authenticates with the service role, which bypasses
+-- RLS) - if a page that used to load now errors, check the Worker's
+-- SUPABASE_SECRET_KEY / SUPABASE_SERVICE_ROLE_KEY env var is actually the
+-- service role key and not the anon key.
+--
+-- select tablename, rowsecurity
+--   from pg_tables
+--  where schemaname = 'public'
+--    and tablename in ('users', 'auctions', 'reports')
+--  order by tablename;
