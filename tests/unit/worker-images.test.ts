@@ -371,15 +371,20 @@ describe('reading a listing whose images are half migrated', () => {
     expect(body.imageUrls).toEqual(MIXED);
   });
 
-  it('returns both forms from the single-auction endpoint', async () => {
-    seed([auctionRow({ image_urls: MIXED })]);
+  it('reports the right imageCount from the single-auction endpoint, which carries no image data at all', async () => {
+    seed([auctionRow({ image_urls: MIXED, image_count: MIXED.length })]);
 
     const response = await worker.fetch(new Request('https://msa-auction.test/api/auctions/auc_01'), env());
     const body = (await response.json()) as any;
 
     expect(response.status).toBe(200);
-    expect(body.auction.imageUrls).toEqual(MIXED);
-    expect(body.auction.imageUrl).toBe(R2_PATH_A);
+    expect(body.auction).not.toHaveProperty('imageUrls');
+    expect(body.auction).not.toHaveProperty('imageUrl');
+    expect(body.auction.imageCount).toBe(MIXED.length);
+
+    // Both forms are still available, in order, from the dedicated images route.
+    const images = await worker.fetch(new Request('https://msa-auction.test/api/auctions/auc_01/images'), env());
+    expect((await images.json() as any).imageUrls).toEqual(MIXED);
   });
 
   it('lets a seller edit a listing that still holds a legacy image', async () => {
@@ -1016,11 +1021,14 @@ describe('with no R2 binding (the deployed configuration)', () => {
   });
 
   it('reads a listing back unchanged, images and all', async () => {
-    seed([auctionRow({ image_urls: [PNG_DATA_URL] })]);
+    seed([auctionRow({ image_urls: [PNG_DATA_URL], image_count: 1 })]);
 
     const single = await worker.fetch(new Request('https://msa-auction.test/api/auctions/auc_01'), noBucketEnv());
     expect(single.status).toBe(200);
-    expect(((await single.json()) as any).auction.imageUrl).toBe(PNG_DATA_URL);
+    // GET /api/auctions/:id no longer carries image data at all - see the
+    // "reports the right imageCount" test above. The actual image bytes are
+    // unchanged, verified below via the dedicated images route.
+    expect(((await single.json()) as any).auction.imageCount).toBe(1);
 
     const images = await worker.fetch(
       new Request('https://msa-auction.test/api/auctions/auc_01/images'),

@@ -174,6 +174,16 @@ describe('PATCH /api/auctions/:id', () => {
     }
   });
 
+  it('refuses to edit once end_time has passed, even while the row still reads status=active', async () => {
+    const db = seed([auctionRow({ end_time: NOW - 1000 })]);
+
+    const result = await callJson('PATCH', '/api/auctions/auc_1', { token: SELLER.token, body: VALID_EDIT });
+
+    expect(result.status).toBe(409);
+    expect(result.body.code).toBe('LISTING_NOT_EDITABLE');
+    expect(db.rows('auctions')[0].title).toBe('Vintage lamp');
+  });
+
   it('reuses validateAuctionInput rather than a second validator', async () => {
     seed([auctionRow()]);
     const badPrice = await callJson('PATCH', '/api/auctions/auc_1', {
@@ -284,6 +294,16 @@ describe('DELETE /api/auctions/:id', () => {
 
     expect(result.status).toBe(401);
     expect(result.body.code).toBe('UNAUTHORIZED');
+    expect(db.rows('auctions')[0].status).toBe('active');
+  });
+
+  it('refuses to cancel once end_time has passed, even while the row still reads status=active (cron has not settled it yet)', async () => {
+    const db = seed([auctionRow({ end_time: NOW - 1000 })]);
+
+    const result = await callJson('DELETE', '/api/auctions/auc_1', { token: SELLER.token });
+
+    expect(result.status).toBe(409);
+    expect(result.body.code).toBe('LISTING_NOT_EDITABLE');
     expect(db.rows('auctions')[0].status).toBe('active');
   });
 });
@@ -400,6 +420,23 @@ describe('GET /api/auctions - slim payload', () => {
     expect(listColumns).toBeDefined();
     expect(listColumns).not.toContain('image_urls');
     expect(listColumns).not.toContain('image_url,');
+  });
+
+  it('never selects phone_number for the public list, even for an authenticated caller', async () => {
+    // fake-supabase does not filter a row's fields by the column list passed to select() (real
+    // PostgREST does), so this - like the image-column assertion above - checks the query
+    // actually sent rather than the mapped response: in production, a column Postgres was never
+    // asked for is a column the row object never has, so mapAuctionSummaryRow (which does read
+    // `row.phone_number` when present, for the routes that ARE allowed to carry it - see
+    // AUCTION_DETAIL_COLUMNS) has nothing to copy.
+    const db = seed([auctionRow()]);
+
+    const result = await callJson('GET', '/api/auctions', { token: OTHER.token });
+
+    expect(result.status).toBe(200);
+    const listColumns = db.selectColumns('auctions').find((columns) => columns?.includes('image_count'));
+    expect(listColumns).toBeDefined();
+    expect(listColumns).not.toContain('phone_number');
   });
 
   it('falls back to counting image_urls when image_count is absent', async () => {
@@ -541,14 +578,39 @@ describe('GET /api/auctions/:id/images', () => {
 });
 
 describe('GET /api/auctions/:id', () => {
-  it('still returns the full object including imageUrls', async () => {
+  it('carries no image data and reports imageCount instead, and never selects image columns', async () => {
+    const db = seed([auctionRow()]);
+
+    const result = await callJson('GET', '/api/auctions/auc_1');
+
+    expect(result.status).toBe(200);
+    expect(result.body.auction).not.toHaveProperty('imageUrls');
+    expect(result.body.auction).not.toHaveProperty('imageUrl');
+    expect(result.body.auction.imageCount).toBe(2);
+    expect(JSON.stringify(result.body)).not.toContain('base64');
+
+    const detailColumns = db.selectColumns('auctions').find((columns) => columns?.includes('image_count'));
+    expect(detailColumns).toBeDefined();
+    expect(detailColumns).not.toContain('image_urls');
+    expect(detailColumns).not.toContain('image_url,');
+  });
+
+  it('omits phoneNumber for an unauthenticated request', async () => {
     seed([auctionRow()]);
 
     const result = await callJson('GET', '/api/auctions/auc_1');
 
     expect(result.status).toBe(200);
-    expect(result.body.auction.imageUrls).toEqual(['data:image/png;base64,aaa', 'data:image/png;base64,bbb']);
-    expect(result.body.auction.imageUrl).toBe('data:image/png;base64,aaa');
+    expect(result.body.auction).not.toHaveProperty('phoneNumber');
+  });
+
+  it('includes phoneNumber for an authenticated request', async () => {
+    seed([auctionRow()]);
+
+    const result = await callJson('GET', '/api/auctions/auc_1', { token: OTHER.token });
+
+    expect(result.status).toBe(200);
+    expect(result.body.auction.phoneNumber).toBe('0100000000');
   });
 });
 

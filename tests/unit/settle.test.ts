@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { resolveWinner, settleEndedAuctions, selectActivity, buildNotifications } from '../../workers/shared';
 import { createFakeSupabase } from './helpers/fake-supabase';
 
@@ -152,6 +152,49 @@ describe('settleEndedAuctions', () => {
 
     expect(settled).toHaveLength(0);
     expect(db.rows('auctions')[0].status).toBe('active');
+  });
+
+  it('does not let one row\'s failing UPDATE abort the rest of the batch', async () => {
+    let updateCalls = 0;
+    const db = createFakeSupabase(
+      {
+        auctions: [
+          // Oldest end_time first (see the settle query's own ordering) - this is the row whose
+          // UPDATE will be made to fail.
+          auctionRow({ id: 'auc_oldest', end_time: NOW - 3000, bids: [bid('usr_a', 200, 1)] }),
+          auctionRow({ id: 'auc_newer', end_time: NOW - 1000, bids: [bid('usr_b', 400, 2)] }),
+        ],
+      },
+      {
+        errorOn: ({ table, op }) => {
+          if (table === 'auctions' && op === 'update') {
+            updateCalls += 1;
+            if (updateCalls === 1) {
+              return new Error('simulated DB failure on the first row');
+            }
+          }
+          return null;
+        },
+      },
+    );
+
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const settled = await settleEndedAuctions(db, { now: NOW });
+
+    // The failing row was skipped, not thrown - the second, healthy row still settled.
+    expect(settled).toHaveLength(1);
+    expect(settled[0].id).toBe('auc_newer');
+
+    expect(db.rows('auctions').find((row: any) => row.id === 'auc_oldest')).toMatchObject({ status: 'active' });
+    expect(db.rows('auctions').find((row: any) => row.id === 'auc_newer')).toMatchObject({
+      status: 'ended',
+      winner_id: 'usr_b',
+    });
+
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining('auc_oldest'), expect.anything());
+
+    consoleError.mockRestore();
   });
 });
 

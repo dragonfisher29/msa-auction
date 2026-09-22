@@ -1,10 +1,11 @@
 import { createClient } from '@supabase/supabase-js';
 import {
-  AUCTION_LIST_COLUMNS,
+  AUCTION_DETAIL_COLUMNS,
   AUCTION_META_COLUMNS,
   AUCTION_STATUS,
   applyBidLock,
   bannedMessage,
+  BID_READ_COLUMNS,
   bidLockUpdate,
   buildAuctionMetaTags,
   buildNotifications,
@@ -160,6 +161,47 @@ function mapAuctionRow(row: any) {
     category: row.category ?? 'General',
     imageUrl: row.image_url || row.imageUrl || (Array.isArray(row.image_urls) ? row.image_urls[0] : undefined),
     imageUrls: Array.isArray(row.image_urls) ? row.image_urls : [],
+    bids: Array.isArray(row.bids) ? row.bids : [],
+    winnerId: row.winner_id ?? row.winnerId ?? null,
+    winnerName: row.winner_name ?? row.winnerName ?? null,
+    winningBid: toNullableMoney(row.winning_bid ?? row.winningBid),
+    createdAt: Number(row.created_at ?? row.createdAt),
+  };
+}
+
+/**
+ * Row -> Auction shape returned by `GET /api/auctions/:id`.
+ *
+ * No `imageUrl`/`imageUrls` - the row was fetched with `AUCTION_DETAIL_COLUMNS`,
+ * which does not select them, so this endpoint carries `imageCount` instead
+ * (mirroring the list endpoint) and the client fetches real image data at most
+ * once, from `GET /api/auctions/:id/images`, rather than on every 3s poll.
+ *
+ * `phoneNumber` is included only when `includePhone` is true - the caller
+ * resolves that from the request's `Authorization` header before calling this,
+ * so an anonymous visitor viewing a listing cannot harvest a seller's number.
+ */
+function mapAuctionDetailRow(row: any, includePhone: boolean) {
+  const rawCount = row.image_count ?? row.imageCount;
+  const imageCount = Number.isFinite(Number(rawCount)) ? Number(rawCount) : 0;
+
+  return {
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    ...(includePhone ? { phoneNumber: row.phone_number ?? row.phoneNumber } : {}),
+    startingPrice: Number(row.starting_price ?? row.startingPrice),
+    currentPrice: Number(row.current_price ?? row.currentPrice),
+    sellerId: row.seller_id ?? row.sellerId,
+    sellerName: row.seller_name ?? row.sellerName,
+    highestBidderId: row.highest_bidder_id ?? row.highestBidderId ?? null,
+    highestBidderName: row.highest_bidder_name ?? row.highestBidderName ?? null,
+    durationMinutes: Number(row.duration_minutes ?? row.durationMinutes),
+    startTime: Number(row.start_time ?? row.startTime),
+    endTime: Number(row.end_time ?? row.endTime),
+    status: row.status,
+    category: row.category ?? 'General',
+    imageCount,
     bids: Array.isArray(row.bids) ? row.bids : [],
     winnerId: row.winner_id ?? row.winnerId ?? null,
     winnerName: row.winner_name ?? row.winnerName ?? null,
@@ -765,7 +807,11 @@ export default {
       }
 
       try {
-        await settleBeforeRead(supabase);
+        // No lazy settle here any more: it rode along on every page of every
+        // poll of the list, which is by far this API's hottest read. Settling
+        // still happens on the single-auction detail route, the bid route, and
+        // the cron trigger (see scheduled() below), so an ended auction still
+        // gets its winner promptly - just not on the list's account any more.
 
         // Slim rows (no image payload) + keyset page. See fetchAuctionListPage.
         const page = await fetchAuctionListPage(supabase, {
@@ -827,20 +873,43 @@ export default {
 
         await settleBeforeRead(supabase, auctionId);
 
-        const { data: row, error } = await supabase.from('auctions').select('*').eq('id', auctionId).maybeSingle();
+        // Slim row (no image payload) - see mapAuctionDetailRow and
+        // AUCTION_DETAIL_COLUMNS. This route is polled every 3s by an open
+        // detail modal, so it was the single largest source of egress before
+        // images were split out to GET /api/auctions/:id/images.
+        const { data: row, error } = await supabase
+          .from('auctions')
+          .select(AUCTION_DETAIL_COLUMNS)
+          .eq('id', auctionId)
+          .maybeSingle();
 
         if (error) throw error;
         if (!row) return jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 });
 
+        // Resolved once, from the same lookup: whether the caller is an admin
+        // (for the hidden-listing check below) and whether they are signed in
+        // at all (for whether phoneNumber goes on the wire - see
+        // mapAuctionDetailRow). A missing or dead token resolves both to false
+        // rather than an error, exactly like isBearerTokenAdmin, since this
+        // route is intentionally reachable by an anonymous visitor.
+        const authHeader = request.headers.get('authorization') ?? '';
+        let requester: any = null;
+        if (authHeader.startsWith('Bearer ')) {
+          const token = authHeader.slice('Bearer '.length).trim();
+          if (token) {
+            requester = await getAuthenticatedUser(supabase, token);
+          }
+        }
+        const isAdmin = isAdminUser(requester);
+
         // A hidden listing is invisible to everyone but an admin - it must not
         // survive a takedown via its direct link. Reported the same as an
         // unknown id so a probe cannot tell "hidden" from "never existed".
-        const isAdmin = await isBearerTokenAdmin(supabase, request.headers.get('authorization'));
         if (!isAuctionVisible(row, isAdmin)) {
           return jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 });
         }
 
-        return jsonResponse({ auction: mapAuctionRow(row) });
+        return jsonResponse({ auction: mapAuctionDetailRow(row, Boolean(requester)) });
       } catch (error) {
         return jsonResponse(getErrorMessageAndCode('Failed to load auction.', 'FETCH_AUCTION_FAILED', error), { status: 500 });
       }
@@ -875,6 +944,18 @@ export default {
         if (row.status !== AUCTION_STATUS.active) {
           return jsonResponse(
             makeError('This listing is no longer active and can no longer be edited.', 'LISTING_NOT_EDITABLE'),
+            { status: 409 },
+          );
+        }
+
+        // A row can still read `status = 'active'` after its end_time if the
+        // cron tick that would settle it hasn't run yet - the same gap PATCH's
+        // sibling DELETE guards against below. Editing that window away would
+        // let a seller change the price on a listing that has already, in
+        // effect, ended.
+        if (Date.now() >= Number(row.end_time ?? row.endTime)) {
+          return jsonResponse(
+            makeError('This listing has already ended and can no longer be edited.', 'LISTING_NOT_EDITABLE'),
             { status: 409 },
           );
         }
@@ -967,7 +1048,11 @@ export default {
           return jsonResponse(makeError('Only the seller can cancel this listing.', 'NOT_LISTING_OWNER'), { status: 403 });
         }
 
-        if (row.status === AUCTION_STATUS.ended) {
+        // The end_time check catches the same window PATCH now guards: a row
+        // can still read `status = 'active'` after its end_time if the cron
+        // tick that would settle it hasn't run yet, and a seller must not be
+        // able to withdraw a listing out from under a bidder in that window.
+        if (row.status === AUCTION_STATUS.ended || Date.now() >= Number(row.end_time ?? row.endTime)) {
           return jsonResponse(
             makeError('This listing has already ended and can no longer be cancelled.', 'LISTING_NOT_EDITABLE'),
             { status: 409 },
@@ -982,7 +1067,13 @@ export default {
         if (row.status === AUCTION_STATUS.active) {
           const { error: updateError } = await supabase
             .from('auctions')
-            .update({ status: AUCTION_STATUS.cancelled })
+            .update({
+              status: AUCTION_STATUS.cancelled,
+              // Bumped so a bid read before this cancel lands loses its
+              // optimistic lock (see readBidLock/applyBidLock) instead of
+              // writing a bid onto a listing the seller just withdrew.
+              ...bidLockUpdate(readBidLock(row, 0)),
+            })
             .eq('id', auctionId)
             .eq('status', AUCTION_STATUS.active);
 
@@ -1276,15 +1367,24 @@ export default {
         const body = await request.json();
         const { amount } = body as { amount?: unknown };
 
+        // A missed cron tick must not let a bid land on an auction that has
+        // already reached end_time but hasn't been marked 'ended' yet.
+        await settleBeforeRead(supabase, auctionId);
+
         // Optimistic lock: the UPDATE is guarded on the bid_version we read, so
         // a bid that lands between our read and our write makes the write match
         // zero rows instead of silently clobbering its bids array. See
         // readBidLock/applyBidLock in workers/shared.ts for why the guard is an
         // integer version rather than the price it used to be.
         for (let attempt = 0; attempt < MAX_BID_ATTEMPTS; attempt += 1) {
-          const { data: rawAuction, error: fetchErr } = await supabase
+          // Typed `any`: `.select(BID_READ_COLUMNS)` passes a runtime `string`, not a literal, so
+          // postgrest-js's compile-time column parser (which only understands a literal) falls
+          // back to a `GenericStringError` type it cannot resolve. The rest of this file works
+          // around the same thing by typing a mapper's row parameter `any` (see mapAuctionRow);
+          // there is no such mapper here, so it is annotated directly instead.
+          const { data: rawAuction, error: fetchErr }: { data: any; error: any } = await supabase
             .from('auctions')
-            .select('*')
+            .select(BID_READ_COLUMNS)
             .eq('id', auctionId)
             .maybeSingle();
 
@@ -1300,7 +1400,15 @@ export default {
           const lock = readBidLock(rawAuction, startingPrice);
           const currentPrice = lock.currentPrice;
 
-          if (rawAuction.status === 'ended' || Date.now() >= endTime) {
+          // Bids are only accepted on a LIVE listing: 'ended' is covered by the
+          // end_time check below, and this additionally refuses a 'cancelled' or
+          // admin-'hidden' listing, neither of which is ever allowed to take a
+          // new bid regardless of end_time.
+          if (rawAuction.status !== AUCTION_STATUS.active) {
+            return jsonResponse(makeError('This listing is no longer accepting bids.', 'AUCTION_ENDED'), { status: 400 });
+          }
+
+          if (Date.now() >= endTime) {
             return jsonResponse(makeError('This auction has already ended.', 'AUCTION_ENDED'), { status: 400 });
           }
 
@@ -1332,6 +1440,12 @@ export default {
 
           const updatedBids = [newBid, ...bids];
 
+          // Guarded on status + end_time IN ADDITION to the bid_version/price lock:
+          // a settle or a cancel/hide landing between our read and this write must
+          // also make the UPDATE match zero rows, not just a concurrent bid. Both
+          // settle and hideAuction bump bid_version for exactly this reason, so
+          // the applyBidLock guard alone would already catch a settle - these two
+          // are a second, independent guard against the same race.
           let updateQuery = supabase
             .from('auctions')
             .update({
@@ -1341,11 +1455,13 @@ export default {
               highest_bidder_name: userName,
               ...bidLockUpdate(lock),
             })
-            .eq('id', auctionId);
+            .eq('id', auctionId)
+            .eq('status', AUCTION_STATUS.active)
+            .gt('end_time', Date.now());
 
           updateQuery = applyBidLock(updateQuery, lock);
 
-          const { data: updatedRows, error: updateErr } = await updateQuery.select();
+          const { data: updatedRows, error: updateErr } = await updateQuery.select('id');
 
           if (updateErr) {
             return jsonResponse(getErrorMessageAndCode('Unable to place the bid right now.', 'BID_UPDATE_FAILED', updateErr), { status: 500 });
@@ -1355,7 +1471,11 @@ export default {
             return jsonResponse({ success: true, bid: newBid });
           }
 
-          // Zero rows affected: someone else bid first. Re-read and revalidate.
+          // Zero rows affected: someone else bid first, or the listing ended/was
+          // cancelled/hidden between the read above and this write. Re-read and
+          // revalidate - the top-of-loop checks above will produce the right
+          // error (AUCTION_ENDED etc.) the next time round for anything other
+          // than a genuine bid race.
         }
 
         return jsonResponse(makeError('Another bid landed at the same moment. Please try again.', 'BID_CONFLICT'), { status: 409 });
@@ -1375,9 +1495,12 @@ export default {
           return auth.response;
         }
 
-        await settleBeforeRead(supabase);
-
-        const { data, error } = await supabase.from('auctions').select(AUCTION_LIST_COLUMNS);
+        // No lazy settle here - see the comment on GET /api/auctions. This route
+        // is authenticated, own-data-only, so AUCTION_DETAIL_COLUMNS (which
+        // carries phone_number, unlike the public list) is used instead of
+        // AUCTION_LIST_COLUMNS: WinnerContactPanel needs a won listing's
+        // phoneNumber to show the seller's contact details.
+        const { data, error } = await supabase.from('auctions').select(AUCTION_DETAIL_COLUMNS);
         if (error) throw error;
 
         const auctions = (data ?? []).map((row: any) => mapAuctionSummaryRow(row));
@@ -1398,8 +1521,7 @@ export default {
           return auth.response;
         }
 
-        await settleBeforeRead(supabase);
-
+        // No lazy settle here - see the comment on GET /api/auctions.
         const { data, error } = await supabase.from('auctions').select(NOTIFICATION_COLUMNS);
         if (error) throw error;
 

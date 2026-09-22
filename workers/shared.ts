@@ -50,7 +50,13 @@ export interface AuctionSummary {
   id: string;
   title: string;
   description: string;
-  phoneNumber: string;
+  /**
+   * Absent on `GET /api/auctions` (the unauthenticated public list) - a phone number is not
+   * something a scraper should be able to harvest by paging through every listing. Present when
+   * this shape backs `GET /api/users/me/activity` (authenticated, own data only), via
+   * `AUCTION_DETAIL_COLUMNS`.
+   */
+  phoneNumber?: string;
   startingPrice: number;
   currentPrice: number;
   sellerId: string;
@@ -193,10 +199,27 @@ export function resolveWinner(row: any): {
   return { winnerId: null, winnerName: null, winningBid: null };
 }
 
+/** Rows this many oldest-ended auctions are settled per call, so one lazy settle behind a hot
+ *  detail/bid request (or one cron tick after an outage) can never turn into an unbounded scan. */
+const SETTLE_BATCH_LIMIT = 20;
+
 /**
- * THE settle path. Used by the Worker cron trigger, by the lazy settle in both
- * GET handlers, and by the dev server's interval sweep, so dev and prod cannot
- * drift.
+ * The columns settlement actually reads: `resolveWinner` needs `bids`,
+ * `current_price` and the `highest_bidder_*` pair; the bid-lock guard needs
+ * `bid_version`. No image columns, no seller/bidder display names beyond what
+ * `resolveWinner` uses - `select('*')` here was pulling the base64 image
+ * payload for every ended row on every settle sweep.
+ */
+// 'bid_version' is spelled out rather than referencing `BID_VERSION_COLUMN` -
+// that constant is declared further down the file (next to the rest of the
+// bid-lock helpers) and this is a module-scope `const`, evaluated immediately
+// on load, so a forward reference to it here would throw.
+const SETTLE_READ_COLUMNS = ['id', 'status', 'end_time', 'bids', 'current_price', 'bid_version', 'highest_bidder_id', 'highest_bidder_name'].join(',');
+
+/**
+ * THE settle path. Used by the Worker cron trigger, by the lazy settle on the
+ * single-auction detail route and the bid route, and by the dev server's
+ * interval sweep, so dev and prod cannot drift.
  *
  * Every UPDATE is guarded on `status = 'active'` so two concurrent settlers
  * cannot both write a winner. Returns the rows this call actually settled.
@@ -207,7 +230,18 @@ export async function settleEndedAuctions(supabase: any, options: SettleOptions 
   // `.eq('status', 'active')` is what keeps CANCELLED and HIDDEN listings out of
   // settlement: such a row is neither selected here nor matched by the guarded
   // UPDATE below, so it can never be handed a winner. Do not relax this filter.
-  let query = supabase.from('auctions').select('*').eq('status', AUCTION_STATUS.active).lte('end_time', now);
+  //
+  // Ordered oldest end_time first and capped at SETTLE_BATCH_LIMIT: a lazy
+  // settle rides along on a normal read request, so it must stay cheap even if
+  // a missed cron tick has left a large backlog - the oldest rows are the ones
+  // a bidder or seller is most likely to be looking at right now.
+  let query = supabase
+    .from('auctions')
+    .select(SETTLE_READ_COLUMNS)
+    .eq('status', AUCTION_STATUS.active)
+    .lte('end_time', now)
+    .order('end_time', { ascending: true })
+    .limit(SETTLE_BATCH_LIMIT);
   if (options.auctionId) {
     query = query.eq('id', options.auctionId);
   }
@@ -226,17 +260,34 @@ export async function settleEndedAuctions(supabase: any, options: SettleOptions 
       winner_id: winnerId,
       winner_name: winnerName,
       winning_bid: winningBid,
+      // Bumped here too, exactly like a bid: a bid read before settlement lands
+      // (see readBidLock/applyBidLock) must lose its optimistic lock, not
+      // overwrite the ended row with a stale bids array. `startingPrice` is
+      // irrelevant to the version bump itself, so 0 is passed as a placeholder.
+      ...bidLockUpdate(readBidLock(row, 0)),
     };
 
-    const { data: updated, error: updateError } = await supabase
-      .from('auctions')
-      .update(patch)
-      .eq('id', row.id)
-      .eq('status', AUCTION_STATUS.active)
-      .select();
+    // Caught PER ROW rather than left to propagate: this runs oldest-end_time-first (see the
+    // `.order()` above), so one row that keeps failing its UPDATE - a stuck lock, bad data,
+    // whatever the cause - must not re-throw and abort the whole batch on every single cron tick
+    // and lazy settle forever after. Skip it, log it, and let every other row in the batch still
+    // get its winner.
+    let updated: any[] | null = null;
+    try {
+      const { data, error: updateError } = await supabase
+        .from('auctions')
+        .update(patch)
+        .eq('id', row.id)
+        .eq('status', AUCTION_STATUS.active)
+        .select('id');
 
-    if (updateError) {
-      throw updateError;
+      if (updateError) {
+        throw updateError;
+      }
+      updated = data;
+    } catch (rowError) {
+      console.error(`Settle failed for auction ${row.id}:`, rowError);
+      continue;
     }
 
     // Zero rows means another settler (cron vs. a concurrent read) got there
@@ -245,7 +296,7 @@ export async function settleEndedAuctions(supabase: any, options: SettleOptions 
       continue;
     }
 
-    settled.push(updated[0] ?? { ...row, ...patch });
+    settled.push({ ...row, ...patch });
   }
 
   return settled;
@@ -436,12 +487,16 @@ export function mergeAuctionEdit(row: any, body: any): Record<string, unknown> {
  * `migrations/001_listing_lifecycle_and_list_payload.sql`; that migration must
  * be applied before this build is deployed or the list query will fail with
  * Postgres 42703 (undefined column).
+ *
+ * `phone_number` is also absent ON PURPOSE: this is the unauthenticated public
+ * list, paged through by anyone, and a phone number is not something a scraper
+ * should be able to harvest one page at a time. See `AUCTION_DETAIL_COLUMNS`
+ * for the routes that are allowed to carry it.
  */
 export const AUCTION_LIST_COLUMNS = [
   'id',
   'title',
   'description',
-  'phone_number',
   'starting_price',
   'current_price',
   'seller_id',
@@ -460,6 +515,18 @@ export const AUCTION_LIST_COLUMNS = [
   'winning_bid',
   'created_at',
 ].join(',');
+
+/**
+ * Explicit column list for `GET /api/auctions/:id` (single-item detail) and
+ * `GET /api/users/me/activity`. Same shape as `AUCTION_LIST_COLUMNS` - still no
+ * `image_url`/`image_urls`, see `mapAuctionSummaryRow` and `AuctionCard` for how
+ * a client gets real image data instead - but WITH `phone_number` added back:
+ * the detail route only puts it on the wire for an authenticated caller (see
+ * the route in `workers/index.ts`), and the activity route is authenticated
+ * end to end, so neither is the anyone-can-page-through exposure that keeps
+ * `phone_number` off `AUCTION_LIST_COLUMNS`.
+ */
+export const AUCTION_DETAIL_COLUMNS = `${AUCTION_LIST_COLUMNS},phone_number`;
 
 /**
  * Explicit column list for `GET /api/notifications`. Only what
@@ -1724,7 +1791,7 @@ export async function hideAuction(
 
   const { data: row, error: fetchError } = await supabase
     .from('auctions')
-    .select('id,status')
+    .select('id,status,bid_version')
     .eq('id', options.auctionId)
     .maybeSingle();
 
@@ -1745,6 +1812,10 @@ export async function hideAuction(
       hidden_reason: reason,
       hidden_by: options.adminId,
       hidden_at: now,
+      // Bumped so a bid read before this hide lands loses its optimistic lock
+      // (see readBidLock/applyBidLock) instead of writing a bid onto a listing
+      // an admin just took down.
+      ...bidLockUpdate(readBidLock(row, 0)),
     })
     .eq('id', options.auctionId);
 
@@ -1798,6 +1869,24 @@ export async function hideAuction(
  * representation to get wrong.
  */
 export const BID_VERSION_COLUMN = 'bid_version';
+
+/**
+ * The columns `POST /api/auctions/:id/bids` actually needs off the row it reads
+ * before validating and placing a bid: the lock (`bid_version`/`current_price`),
+ * the fields the validation checks read (`status`, `end_time`, `seller_id`,
+ * `starting_price`), and `bids` itself, which the new bid is appended to.
+ * No image columns, no display names beyond what is already on the row.
+ */
+export const BID_READ_COLUMNS = [
+  'id',
+  'status',
+  'starting_price',
+  'current_price',
+  'seller_id',
+  'end_time',
+  'bids',
+  BID_VERSION_COLUMN,
+].join(',');
 
 export interface BidLock {
   /**

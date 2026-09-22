@@ -235,6 +235,56 @@ describe('POST /api/auctions/:id/bids - optimistic lock', () => {
   });
 });
 
+describe('POST /api/auctions/:id/bids - listing status guard', () => {
+  beforeEach(() => {
+    mocks.client = null;
+  });
+
+  it('rejects a bid on a cancelled listing', async () => {
+    const db = seed({ status: 'cancelled' });
+
+    const result = await placeBid({ amount: 500 }, 'tok_good');
+
+    expect(result.status).toBe(400);
+    expect(result.body.code).toBe('AUCTION_ENDED');
+    expect(db.rows('auctions')[0].bids).toHaveLength(0);
+  });
+
+  it('rejects a bid on an admin-hidden listing', async () => {
+    const db = seed({ status: 'hidden' });
+
+    const result = await placeBid({ amount: 500 }, 'tok_good');
+
+    expect(result.status).toBe(400);
+    expect(result.body.code).toBe('AUCTION_ENDED');
+    expect(db.rows('auctions')[0].bids).toHaveLength(0);
+  });
+
+  it('rejects a bid, rather than 500ing, when the listing is cancelled and its bid_version bumped between the read and the write', async () => {
+    let db: FakeSupabase;
+    db = seed({ bid_version: 0 }, {
+      beforeUpdate: ({ table, attempt }) => {
+        if (table !== 'auctions' || attempt !== 1) return;
+        // Mirrors what DELETE /api/auctions/:id actually does: flips status AND
+        // bumps bid_version in the same write, exactly so this in-flight bid
+        // loses its lock instead of landing on a listing just withdrawn.
+        const row = db.rows('auctions')[0];
+        row.status = 'cancelled';
+        row.bid_version = 1;
+      },
+    });
+
+    const result = await placeBid({ amount: 500 }, 'tok_good');
+
+    // The guarded UPDATE matches zero rows (bid_version and status both moved), so the loop
+    // re-reads, sees the now-cancelled row, and answers a normal 400 - never a 500.
+    expect(result.status).toBe(400);
+    expect(result.body.code).toBe('AUCTION_ENDED');
+    expect(db.rows('auctions')[0].bids).toHaveLength(0);
+    expect(db.updateFilters('auctions')[0]).toContainEqual({ op: 'eq', column: 'status', value: 'active' });
+  });
+});
+
 /**
  * These exercise the guard that migration 004 introduces: `auctions.bid_version`,
  * a monotonic integer, in place of the old `.eq('current_price', ...)`.
@@ -603,7 +653,7 @@ describe('scheduled settle', () => {
     });
   });
 
-  it('settles a past-end_time auction lazily on GET /api/auctions', async () => {
+  it('does NOT lazily settle on GET /api/auctions any more - that ride-along was the list route\'s single biggest source of load', async () => {
     const now = Date.now();
     const db = seed({
       end_time: now - 1000,
@@ -614,7 +664,41 @@ describe('scheduled settle', () => {
     const response = await worker.fetch(new Request('https://msa-auction.test/api/auctions'), ENV);
     const body = await response.json() as any;
 
+    // The row is left exactly as the cron will find it - still 'active' past its end_time.
+    expect(db.rows('auctions')[0].status).toBe('active');
+    // The list still reports it correctly for display purposes: the client derives "ended" from
+    // end_time itself (see AuctionCard/AuctionDetailModal's own countdown), so a stale `status`
+    // field here is not user-visible.
+    expect(body.auctions[0].status).toBe('active');
+  });
+
+  it('settles a past-end_time auction lazily on GET /api/auctions/:id (kept on the detail route)', async () => {
+    const now = Date.now();
+    const db = seed({
+      end_time: now - 1000,
+      current_price: 400,
+      bids: [{ id: 'bid_1', auctionId: 'auc_1', userId: 'usr_rival', userName: 'Rival', amount: 400, timestamp: now - 2000 }],
+    });
+
+    const response = await worker.fetch(new Request('https://msa-auction.test/api/auctions/auc_1'), ENV);
+    const body = await response.json() as any;
+
     expect(db.rows('auctions')[0].status).toBe('ended');
-    expect(body.auctions[0]).toMatchObject({ status: 'ended', winnerId: 'usr_rival', winningBid: 400 });
+    expect(body.auction).toMatchObject({ status: 'ended', winnerId: 'usr_rival', winningBid: 400 });
+  });
+
+  it('settles a past-end_time auction lazily on POST /api/auctions/:id/bids (kept on the bid route), rejecting the bid as ended', async () => {
+    const now = Date.now();
+    const db = seed({
+      end_time: now - 1000,
+      current_price: 400,
+      bids: [{ id: 'bid_1', auctionId: 'auc_1', userId: 'usr_rival', userName: 'Rival', amount: 400, timestamp: now - 2000 }],
+    });
+
+    const result = await placeBid({ amount: 500 }, 'tok_good');
+
+    expect(db.rows('auctions')[0].status).toBe('ended');
+    expect(result.status).toBe(400);
+    expect(result.body.code).toBe('AUCTION_ENDED');
   });
 });
