@@ -7,28 +7,53 @@ step — if it does not match, stop and fix it before moving on.
 
 ---
 
-## DANGER: never run the local dev server against this database
+## DANGER: the local dev server runs against the production database
 
-**`npm run dev` (and `npm start`) will permanently delete photos from every
-listing older than 90 days, seconds after the process starts.**
+**There is no separate development database.** `.env`, `.dev.vars`, and
+`wrangler.toml` all point at the exact same Supabase project
+(`ygyvsowniuoszlsahrvl`). Booting `server.ts` on your laptop with `npm run
+dev` talks to production, not a sandbox. Every row you touch locally is a row
+a student can see.
 
-`server.ts` runs `cleanupStaleImages()` on startup and then again every 6
-hours. It selects every auction with `created_at` older than 90 days and, for
-any that still has an image, sets `image_url = null` and `image_urls = '[]'`.
-That is not a bug you can catch after the fact — there is no R2 bucket, no
-backup, and no separate copy. Images are base64 data URLs stored directly in
-the `auctions` row, so once they're nulled out they are gone.
+### The photo-deleting sweep is now gated off — keep it that way
 
-The reason this is so easy to trigger by accident: **there is no separate
-development database.** `.env`, `.dev.vars`, and `wrangler.toml` all point at
-the exact same Supabase project (`ygyvsowniuoszlsahrvl`). Booting `server.ts`
-on your laptop with `npm run dev` talks to production, not a sandbox.
+`server.ts` used to run `cleanupStaleImages()` on startup and then again every
+6 hours. It selects every auction with `created_at` older than 90 days and,
+for any that still has an image, sets `image_url = null` and `image_urls =
+'[]'`. Combined with the shared database above, that meant **starting the dev
+server permanently deleted photos from every production listing older than 90
+days, seconds after the process launched.** Images are base64 data URLs stored
+directly in the `auctions` row, and there is no backup and no second copy, so
+once they are nulled out they are gone.
+
+**That sweep no longer runs by default.** It is gated behind an environment
+variable and the default is off:
+
+```
+ENABLE_STALE_IMAGE_CLEANUP=true
+```
+
+Only the literal string `true` enables it. Unset — which is what you get from
+a fresh `.env.example` — means it never runs, and the server prints one line at
+startup confirming that:
+
+```
+[Maintenance] Stale image cleanup is DISABLED. Listings older than 90 days keep
+their photos. Set ENABLE_STALE_IMAGE_CLEANUP=true to enable it -- ...
+```
+
+If you ever see the `ENABLED` version of that line instead, stop the server.
+Somebody put that variable in a `.env` file and it is about to delete photos
+from production. The gate lives in `maintenance.ts`; the function itself is
+unchanged and kept deliberately, so it is available if the society ever
+genuinely wants a retention policy — but turning it on is then a decision
+someone makes on purpose, not a side effect of running `npm run dev`.
 
 **Nothing in this document ever asks you to run `npm run dev` or `npm
 start`.** Only use `npm run lint`, `npm test`, and `npm run build` — none of
 them open a database connection or execute `server.ts`; `npm run build` only
-bundles it into a file, it does not run it. If a step ever seems to imply
-otherwise, stop and re-read it.
+bundles it into a file, it does not run it. The gate removes the worst
+consequence of an accidental `npm run dev`; it does not make it a good idea.
 
 ---
 
@@ -41,9 +66,11 @@ columns move from `double precision` to `numeric(12,2)`, guarded by a new
 `bid_version` counter instead of a float comparison).
 
 **Verified:** `npm run lint` (`tsc --noEmit`) exits 0, and `npm test`
-(`vitest run`) passes all 280 tests as of writing this document.
+(`vitest run`) passes the whole suite — 357 tests at the time of writing. That
+total moves as tests are added; what matters is that none fail and that the
+count does not go *down*.
 
-**NOT verified:** every one of those 280 tests runs against an in-memory fake
+**NOT verified:** every one of those tests runs against an in-memory fake
 of Supabase (`tests/unit/helpers/fake-supabase.ts`), not real Postgres. None
 of the four migrations have ever been run against the live database. The bid
 lock in particular has never been exercised against real Postgres row
@@ -81,7 +108,7 @@ Do all of this before touching the database or running `wrangler deploy`.
    npm test
    ```
    `lint` should print nothing and exit 0. `test` should end with
-   `Tests  280 passed (280)` (or all-passed with whatever the current total
+   `Tests  357 passed (357)` (or all-passed with whatever the current total
    is — a failing or reduced count means don't proceed).
 
 4. **Record the current deployment**, so you have something to roll back to:
@@ -369,10 +396,51 @@ and re-run the `update` with the exact (lowercased) value from that list.
 
 ---
 
+## 5.5 Images: nothing changes in this deploy
+
+**There is no R2 step in this deploy, and no bucket to create.** Listing
+images continue to be stored as base64 `data:` URLs inside
+`auctions.image_urls`, exactly as they are on the live site today. Nothing
+about image storage changes when you deploy.
+
+Why, given that base64-in-Postgres is what took this project to 21GB of
+Supabase egress against a 5GB allowance: enabling Cloudflare R2 requires a
+payment method on the Cloudflare account, and this is a university society's
+project, not anybody's personal one. So the `[[r2_buckets]]` block in
+`wrangler.toml` is **commented out**. A Worker naming a bucket that does not
+exist fails to deploy outright, which is why it must stay commented out until
+a bucket actually exists.
+
+The R2 implementation itself is still in the tree, still tested, and dormant.
+With no binding bound, the Worker degrades on purpose rather than erroring:
+
+| Route | With no bucket | With a bucket |
+|---|---|---|
+| `POST /api/images` | `503 IMAGE_STORAGE_UNAVAILABLE` | `200 {url, key}` |
+| `GET /images/:key` | `404 IMAGE_NOT_FOUND` | the image bytes |
+| `POST /api/admin/migrate-images` | `503 IMAGE_STORAGE_UNAVAILABLE` | runs a batch |
+
+The client reads that `503` code and stores the image inline instead, which is
+what it did before R2 existed. **Listing creation works normally.** Both
+`data:` URLs and `/images/<key>` paths are accepted by the validator in every
+combination, so nothing is a one-way door in either direction.
+
+Link previews are unaffected: with every listing's first image a `data:` URL,
+`og:image` falls back to the MSA logo for all of them — the same behaviour the
+live site has today. A `data:` URL is never emitted as `og:image`; every
+crawler rejects them.
+
+**The plan is to deploy without R2 and measure.** The polling fix in this same
+change set is on its own a large reduction in egress, and it may well be
+enough. See section 6 check 6 for what to watch, and **Appendix A** for how to
+turn R2 on later if it is not.
+
+---
+
 ## 6. Post-deploy verification
 
 Run every one of these. This is the only check standing in for the fact that
-none of the 280 automated tests ran against a real database.
+none of the automated tests ran against a real database.
 
 1. **Auction list envelope and payload shape:**
    ```
@@ -433,6 +501,49 @@ none of the 280 automated tests ran against a real database.
    Pass: an `<meta property="og:title" content="...">` tag containing that
    auction's actual title, not the generic site title.
 
+   Also check the image tag:
+   ```
+   curl -s https://msa-auction.msasoton.workers.dev/auction/<auction-id> | grep -i "og:image"
+   ```
+   Pass: `content="https://msa-auction.msasoton.workers.dev/MSA_Logo.png"`.
+   Every listing previews as the logo, because with R2 off every listing's
+   first image is a `data:` URL and those can never go in an `og:image`. Fail:
+   a tag containing `data:image` (which would put megabytes of base64 into a
+   page crawlers fetch), or no `og:image` tag at all (which turns today's logo
+   preview into a blank card in iMessage, Slack and WhatsApp).
+
+6. **Creating a listing with photos still works.** This is the one that
+   matters most in this deploy. Log into the live site as a test account and
+   create a listing with two or three photos attached.
+
+   Pass: the listing is created and its photos render on the homepage and on
+   the listing page. Fail: an error on submit mentioning image upload. If the
+   browser devtools Network tab shows `POST /api/images` returning `503
+   IMAGE_STORAGE_UNAVAILABLE`, **that on its own is expected and correct** —
+   there is no R2 bucket, and the client is meant to see that code and store
+   the image inline instead. What would be a genuine failure is the listing not
+   being created at all, or the request never falling back.
+
+7. **Watch Supabase egress for the next few days.** This is the measurement
+   the whole no-R2 decision rests on, so do not skip it.
+
+   Supabase dashboard → Project Settings → Usage → **Egress**. Note the figure
+   today, immediately after deploying, then check it again after 3 and 7 days.
+
+   The polling fix in this change set replaced a dead Socket.IO client that
+   was reconnecting constantly, and the auction list no longer carries image
+   payloads at all — between them that is the bulk of the 21GB. What you are
+   looking for:
+
+   | After a week | Means |
+   |---|---|
+   | Comfortably under the 5GB monthly allowance, and roughly flat day to day | Done. No R2 needed. Leave it as it is. |
+   | Under the allowance but climbing steadily as listings accumulate | Fine for now. Re-check monthly, and keep Appendix A in mind for when the society grows. |
+   | Still approaching or over 5GB | The remaining traffic really is the base64 images. Read **Appendix A** and decide whether attaching a payment method to the Cloudflare account is worth it. |
+
+   Daily egress divided by daily page views gives you a rough per-view cost; if
+   that number is in the megabytes, it is images, and Appendix A is the fix.
+
 ---
 
 ## 7. Rollback
@@ -468,7 +579,9 @@ suspect, and the rollback SQL is in section 3.4.
 | Admin panel doesn't appear for your account | No row has `role = 'admin'` yet, or you logged in before appointing yourself | Re-run section 4, then log out and back in so the client fetches your current role |
 | Password reset links never arrive | There is no mail provider wired up yet — this is a known, interim gap | Use `GET /api/admin/reset-requests` (requires an admin token) to read the pending token and hand the reset link to the student directly |
 | Reporting a listing returns a 500 | Migration 003 wasn't run — the `reports` table doesn't exist | Run migration 003 (section 3.3) |
-| Listing photos have vanished from older auctions | Someone ran `npm run dev` (or `npm start`) locally, which triggered `cleanupStaleImages()` against the production database | There is no recovery — the images are gone. Prevent it going forward: never run the local server against these credentials; see the warning at the top of this document |
+| Listing photos have vanished from older auctions | Someone ran the dev server with `ENABLE_STALE_IMAGE_CLEANUP=true` set, which sweeps every listing older than 90 days | There is no recovery — the images are gone. Remove that variable from whatever `.env` it is in; the default is off. See the warning at the top of this document |
+| Creating a listing fails on image upload | `POST /api/images` returning `503 IMAGE_STORAGE_UNAVAILABLE` is expected (there is no R2 bucket) and the client should fall back to storing the image inline — if it does not, the client is out of date | Redeploy the current `dist` build; the fallback lives in the client. Section 5.5 has the full contract |
+| Shared links preview with the MSA logo rather than the listing's photo | Expected with R2 off — every listing's first image is a `data:` URL and no crawler accepts one | Nothing to fix. It resolves for migrated listings if you ever do Appendix A |
 
 ---
 
@@ -479,7 +592,217 @@ suspect, and the rollback SQL is in section 3.4.
   admin to hand a reset link to a student directly (see the comment above the
   route in `workers/index.ts`); it is not something that should stay in a
   production API long-term.
-- **Outstanding work:** a real mail provider for password reset emails, and
-  moving image storage off base64-in-Postgres and onto something like
-  Cloudflare R2 — both because of the storage cost and because it removes the
-  single-copy-with-no-backup risk this document just warned you about.
+- **Measure Supabase egress before doing anything else about images.** Image
+  storage is still base64-in-Postgres and R2 is switched off (section 5.5).
+  That is a deliberate wait-and-see: the polling fix in this deploy may be
+  enough on its own. Follow section 6 check 7 for a week before deciding, and
+  only then read **Appendix A**.
+- **Outstanding work:** a real mail provider for password reset emails.
+
+---
+
+## Appendix A — OPTIONAL, LATER: moving images onto R2
+
+> **Not part of this deploy. Do not do any of this now.**
+>
+> Come back to this section only if, after watching Supabase egress for a few
+> days (section 6 check 6), it is still uncomfortably close to the 5GB
+> allowance. It requires adding a payment method to the Cloudflare account.
+
+R2 charges nothing for egress, so moving the image bytes there and keeping
+only a short `/images/<key>` path in the database removes image traffic from
+the Supabase bill entirely. Everything below is already implemented and
+tested; what follows is how to switch it on.
+
+No migration is needed for any of it. `image_urls` keeps the same jsonb type;
+only the strings inside it change shape.
+
+### A.1 Create the bucket, then uncomment the binding
+
+In this order, because a Worker that names a bucket which does not exist fails
+to deploy:
+
+```
+npx wrangler r2 bucket create msa-auction-images
+```
+
+Then uncomment these three lines in `wrangler.toml` (they are there, in a
+commented block that explains all of this too):
+
+```
+[[r2_buckets]]
+binding = "IMAGES"
+bucket_name = "msa-auction-images"
+```
+
+Then redeploy:
+
+```
+npx wrangler deploy
+```
+
+**No code change is required.** Not in the Worker, not in the client, not in
+the database.
+
+### A.2 What happens immediately after that deploy
+
+Nothing breaks, and nothing moves on its own. Specifically:
+
+- **Existing listings keep working untouched.** Their images are still
+  base64 `data:` URLs, still served out of Postgres, exactly as before.
+- **New uploads go to R2** from the moment the deploy lands. `POST
+  /api/images` starts returning `200` instead of `503`, so the client stops
+  falling back to inlining.
+- **Mixed state is now normal.** Until the backfill finishes, one listing can
+  hold a legacy `data:` URL and an `/images/<key>` path in the same array —
+  including within the same listing if a seller edits a half-migrated one.
+  Every read path handles both forms; this is tested, not assumed.
+- **Egress does not drop yet.** It drops as the backfill progresses. Until a
+  listing's images move, they still leave Postgres on every view.
+
+### A.3 Run the backfill to completion
+
+> ### ⚠ Run this at a quiet hour — when nobody is editing listings
+>
+> This is not a style preference. The backfill rewrites a listing's images,
+> and it guards that write on the listing's status and image count so that a
+> seller editing the same listing in the same moment is not silently
+> overwritten with the images they just replaced. That guard is deliberately
+> proportionate rather than airtight: it catches a status change or a change
+> in the number of images, but it would **not** catch a seller swapping one
+> photo for a different one in the fraction of a second between this job
+> reading the row and writing it back. `auctions` has no row-version column
+> that an edit bumps, and the value that would make the guard exact — the old
+> image array — is megabytes of base64 and cannot be sent as a query
+> parameter.
+>
+> Running when the site is idle is therefore the thing standing between a
+> concurrent edit and a silently reverted image set. Late night, or right
+> after you have told the committee you are doing maintenance. Do not run it
+> during an active auction evening.
+
+`POST /api/admin/migrate-images` converts one batch per call. It is admin
+only, idempotent, and resumable — it is driven entirely by what is still a
+`data:` URL in the database, so a row that has already moved is skipped
+rather than converted twice. Run it repeatedly until it stops making
+progress.
+
+With your admin token (the same bearer token the admin UI uses):
+
+```
+curl -s -X POST https://<your-worker-url>/api/admin/migrate-images \
+  -H "Authorization: Bearer <admin token>" \
+  -H "Content-Type: application/json" \
+  -d '{"limit": 25}'
+```
+
+`limit` counts **successful conversions**, defaults to 10 and is capped at
+50. Each response looks like:
+
+```json
+{ "migrated": 25, "remaining": 143, "failures": [],
+  "scan": { "fastPathMatched": 25, "fallbackScanned": 0, "listingsWithImages": 168 } }
+```
+
+#### Check the FIRST response before you start looping
+
+The loop below stops when `migrated` is `0`. Read that number on call one
+against `scan`, because `migrated: 0` on the very first call is **not**
+success on a database you know still holds base64 images.
+
+`scan` exists to tell those apart:
+
+| Field | Means |
+|---|---|
+| `fastPathMatched` | rows the indexed `image_url like 'data:%'` filter returned |
+| `fallbackScanned` | rows the slower full scan examined |
+| `listingsWithImages` | listings holding at least one image — counted **without** that filter |
+
+On the very first call, against a database that still holds base64 images,
+you should see **`migrated` greater than 0**, **`fastPathMatched` greater
+than 0**, and `listingsWithImages` roughly equal to your total number of
+listings with photos.
+
+**If `listingsWithImages` is large but `fastPathMatched` is `0`**, the
+indexed filter matched nothing. The backfill still works — the fallback scan
+picks the rows up, which is why `migrated` should still be above zero — but
+it is now reading every listing to find them, which costs the Supabase egress
+this whole exercise exists to save. Finish the run if you like, then report
+it. Do not read it as "already done".
+
+**If `migrated` is `0` AND `listingsWithImages` is `0`**, there is genuinely
+nothing to migrate.
+
+Once the first response looks right, loop:
+
+**Stop when `migrated` comes back `0` — not when `remaining` does.**
+
+That distinction matters. A row that can never be converted — corrupt base64,
+or bytes that are not actually a JPEG, PNG, WebP or GIF — stays in
+`remaining` forever. Looping until `remaining` is `0` would therefore never
+terminate. Looping until `migrated` is `0` means "no further progress is
+possible", which is the condition you actually want.
+
+When it stops, read the last few responses' `failures` arrays:
+
+```json
+{ "migrated": 0, "remaining": 2,
+  "failures": [ { "auctionId": "auc_x1", "error": "Inline image is not decodable base64 in a supported format." } ] }
+```
+
+Each entry names one listing that needs a human. In practice the fix is to
+ask the seller to re-upload, or to hide the listing. A failing row never
+aborts the batch and is never retried in a loop — it is reported and stepped
+over.
+
+You may also see:
+
+```
+"Listing changed while it was being migrated; left for the next run."
+```
+
+That is not an error — it is the guard described in the warning above doing
+its job. A seller edited that listing between the read and the write, so the
+migration declined to overwrite their newer images, and the next call picks it
+up. Seeing it more than once or twice means the site is busier than it should
+be for this job: stop, and come back at a quieter hour.
+
+### A.4 Confirm it worked
+
+1. `{"migrated": 0, "remaining": 0}` from the endpoint.
+2. Open a listing that existed before the deploy. Its images still render.
+3. In the browser devtools Network tab, its image requests go to
+   `/images/<uuid>.<ext>` and come back with
+   `cache-control: public, max-age=31536000, immutable`.
+4. Paste a **migrated** listing's URL into Discord or WhatsApp. The preview
+   now shows the listing's own photo — `og:image` finally emits a real
+   absolute URL rather than a base64 data URL that every crawler rejected.
+   Paste a **not-yet-migrated** listing's URL and you get the MSA logo, the
+   same as today. That fallback is deliberate: a base64 data URL can never be
+   previewed, but emitting nothing would turn today's logo preview into a
+   blank card for every listing still waiting on the backfill.
+5. Watch the Supabase egress figure over the following days. It should fall
+   to roughly the cost of the JSON API alone.
+
+### A.5 A note on `npm run dev`
+
+An R2 bucket is a Worker binding, and the Express dev server has no bindings.
+So even after you switch R2 on in production, `npm run dev` keeps returning
+`503 IMAGE_STORAGE_UNAVAILABLE` from `POST /api/images`, `404` from `GET
+/images/:key`, and `503` from `POST /api/admin/migrate-images` — exactly what
+the Worker returns with no binding bound. That is deliberate: the client's
+base64 fallback is driven by that error code, and a fallback that only fires in
+one of the two environments is a fallback nobody has tested.
+
+To exercise real image upload locally, use `npx wrangler dev`, which does
+provide the binding.
+
+Reading listings locally is unaffected: both storage forms render.
+
+### A.6 If you ever need to turn R2 back off
+
+Comment the `[[r2_buckets]]` block out again and redeploy. Listings already
+holding `/images/<key>` paths will show broken images for those entries — the
+bucket is gone — but nothing errors, nothing becomes uneditable, and new
+listings go straight back to storing base64. The validator accepts both forms
+unconditionally in both directions.
