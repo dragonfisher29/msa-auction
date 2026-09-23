@@ -9,6 +9,7 @@ import {
   bidLockUpdate,
   buildAuctionMetaTags,
   buildNotifications,
+  cleanupStaleImages,
   createAuctionReport,
   createPasswordResetRequest,
   fetchAuctionListPage,
@@ -25,6 +26,8 @@ import {
   isBannedUser,
   isBearerTokenAdmin,
   isFailure,
+  isStaleImageCleanupEnabled,
+  isStoredImagePath,
   listPendingResetRequests,
   listReportsForAdmin,
   mapAuctionSummaryRow,
@@ -45,6 +48,7 @@ import {
   toStringArray,
   USER_ROLE,
   validateImageUpload,
+  validateNewInlineImages,
   validateOptionalEmail,
   verifyAndUpgradePassword,
   type SharedFailure,
@@ -139,6 +143,21 @@ function makeError(message: string, code: string): { error: string; code: string
 /** Maps a `SharedFailure` from `workers/shared.ts` onto the wire format. */
 function failureResponse(failure: SharedFailure): Response {
   return jsonResponse(makeError(failure.message, failure.code), { status: failure.status });
+}
+
+/**
+ * What to persist in the `image_url` column, given a listing's resolved `imageUrls[0]`.
+ *
+ * Fix 1c: `image_url` is a legacy mirror of the first entry of `image_urls`, but it is not purely
+ * decorative - `buildAuctionMetaTags` resolves the Open Graph image from `AUCTION_META_COLUMNS`,
+ * which selects `image_url` alone (no `image_urls`), so an `/images/<key>` path still needs to
+ * land here for a listing's share link to preview correctly once R2 is on. A base64 `data:` URL
+ * is the opposite case: every reader (`mapAuctionRow` here and `buildAuctionMetaTags`'s own
+ * fallback) already falls back to `image_urls[0]`, and a `data:` URL is never usable as an
+ * `og:image` regardless, so writing the full image a second time bought nothing but egress.
+ */
+function imageUrlMirror(firstImage: string | undefined): string | null {
+  return typeof firstImage === 'string' && isStoredImagePath(firstImage) ? firstImage : null;
 }
 
 /** The single snake_case row -> camelCase Auction mapper used by every route. */
@@ -292,7 +311,17 @@ async function requireAdmin(supabase: any, request: Request): Promise<AuthResult
 /** Optimistic-lock retries before a concurrent bid is reported as a conflict. */
 const MAX_BID_ATTEMPTS = 3;
 
-function validateAuctionInput(raw: any) {
+/** The second `[triggers]` cron in wrangler.toml - see `scheduled()` below. */
+const STALE_IMAGE_CLEANUP_CRON = '0 3 * * *';
+
+/**
+ * `existingImageUrls` are the images already stored on the listing being edited (empty on
+ * create), passed straight through to `validateNewInlineImages` in `workers/shared.ts` - see
+ * there for the shape/size rules applied to a genuinely NEW image. An entry byte-identical to one
+ * already on the row is exempt, so an existing photo already sitting in the database never blocks
+ * an otherwise-unrelated edit to the title or price.
+ */
+function validateAuctionInput(raw: any, existingImageUrls: string[] = []) {
   if (!raw || typeof raw !== 'object') {
     return makeError('Invalid auction payload.', 'INVALID_PAYLOAD');
   }
@@ -349,6 +378,15 @@ function validateAuctionInput(raw: any) {
   // every PATCH.
   if (!normalizedImageUrls.every((value: string) => isAllowedImageRef(value))) {
     return makeError('Listing images must be uploaded through this site.', 'INVALID_IMAGE_URL');
+  }
+
+  // Server-side guard on a NEW inline image's shape and size (Fix 1b/1c, hardened in a later
+  // revision - see `validateNewInlineImages` in `workers/shared.ts` for what this actually
+  // checks and why). An entry byte-identical to one already stored on this listing is exempt, so
+  // editing an old listing never gets blocked by its own existing photos.
+  const newImageFailure = validateNewInlineImages(normalizedImageUrls, existingImageUrls);
+  if (newImageFailure) {
+    return makeError(newImageFailure.message, newImageFailure.code);
   }
 
   return {
@@ -973,8 +1011,10 @@ export default {
         }
 
         const rawBody = await request.json();
-        // Same validator as listing creation, run over row + patch merged.
-        const validated = validateAuctionInput(mergeAuctionEdit(row, rawBody));
+        // Same validator as listing creation, run over row + patch merged. The stored images are
+        // passed through too, so an existing (possibly larger, pre-compression) photo that is
+        // carried over unchanged is exempt from the new-upload shape/size checks - see `validateNewInlineImages`.
+        const validated = validateAuctionInput(mergeAuctionEdit(row, rawBody), toStringArray(row.image_urls ?? row.imageUrls));
         if ('error' in validated) {
           return jsonResponse(validated, { status: 400 });
         }
@@ -984,7 +1024,7 @@ export default {
           description: validated.description,
           phone_number: validated.phoneNumber,
           category: validated.category,
-          image_url: validated.imageUrls[0],
+          image_url: imageUrlMirror(validated.imageUrls[0]),
           image_urls: validated.imageUrls,
           starting_price: validated.parsedPrice,
           // No bids exist, so current_price tracks starting_price exactly.
@@ -1179,7 +1219,10 @@ export default {
             end_time: auction.endTime,
             status: auction.status,
             category: auction.category,
-            image_url: auction.imageUrl,
+            // The client's own copy of the just-created auction (returned below) keeps the full
+            // `imageUrl` it was given; only the persisted row's mirror column is pared down. See
+            // `imageUrlMirror`.
+            image_url: imageUrlMirror(auction.imageUrl),
             image_urls: auction.imageUrls,
             bids: auction.bids,
             winner_id: auction.winnerId,
@@ -1536,15 +1579,44 @@ export default {
   },
 
   /**
-   * Cron trigger (see `[triggers]` in wrangler.toml). Nothing else in
-   * production ends an auction, so without this every ended listing keeps its
-   * null winner columns forever.
+   * Cron trigger (see `[triggers]` in wrangler.toml, which now names two
+   * schedules). `event.cron` tells the two apart so each does exactly one job:
+   *
+   *   `* * * * *`  (every minute) -> settlement, as before. Nothing else in
+   *                                  production ends an auction, so without
+   *                                  this every ended listing keeps its null
+   *                                  winner columns forever.
+   *   `0 3 * * *`  (03:00 UTC     -> the stale-image sweep, gated on
+   *    daily)                        `ENABLE_STALE_IMAGE_CLEANUP` (see
+   *                                  `wrangler.toml` and `cleanupStaleImages`
+   *                                  in `workers/shared.ts`). Cloudflare cron
+   *                                  schedules always run in UTC.
+   *
+   * Anything else falls back to settlement too, so a manually-triggered test
+   * cron (which the dashboard lets an admin fire with no `cron` field at all)
+   * still does the safe, idempotent thing rather than nothing.
    */
-  async scheduled(_event: any, env: Record<string, any>, _ctx: any): Promise<void> {
+  async scheduled(event: any, env: Record<string, any>, _ctx: any): Promise<void> {
     const supabase = getSupabaseClient(env);
 
     if (!supabase) {
-      console.error('Scheduled settle skipped: Supabase env vars are not configured.');
+      console.error('Scheduled task skipped: Supabase env vars are not configured.');
+      return;
+    }
+
+    if (event?.cron === STALE_IMAGE_CLEANUP_CRON) {
+      if (!isStaleImageCleanupEnabled(env)) {
+        return;
+      }
+
+      try {
+        const cleaned = await cleanupStaleImages(supabase);
+        if (cleaned > 0) {
+          console.log(`[Cleanup] Blanked images on ${cleaned} stale auction(s).`);
+        }
+      } catch (error) {
+        console.error('Scheduled stale image cleanup failed:', error);
+      }
       return;
     }
 

@@ -31,10 +31,13 @@ vi.mock('@supabase/supabase-js', () => ({
 
 import worker from '../../workers/index';
 import {
+  estimateDataUrlBytes,
   IMAGE_BACKFILL_UNAVAILABLE_MESSAGE,
   IMAGE_PATH_PATTERN,
   IMAGE_STORAGE_UNAVAILABLE_MESSAGE,
+  isStrictNewDataImageUrl,
   MAX_IMAGE_BYTES,
+  MAX_INLINE_IMAGE_BYTES,
   buildAuctionMetaTags,
   injectAuctionMeta,
   migrateAuctionImages,
@@ -466,6 +469,317 @@ describe('listing creation image validation', () => {
 
     expect(response.status).toBe(400);
     expect(((await response.json()) as any).code).toBe('INVALID_IMAGE_URL');
+  });
+});
+
+/* ========================================================================== */
+/* 4b. Fix 1b: server-side size cap on a NEW inline image                     */
+/* ========================================================================== */
+
+describe('the 300KB cap on a new inline data: image', () => {
+  /** A `data:` URL whose decoded payload is exactly `sizeBytes` long. */
+  function dataUrlOfSize(sizeBytes: number): string {
+    return `data:image/jpeg;base64,${Buffer.alloc(sizeBytes, 1).toString('base64')}`;
+  }
+
+  async function create(imageUrls: any[]) {
+    return worker.fetch(
+      new Request('https://msa-auction.test/api/auctions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${SELLER.token}` },
+        body: JSON.stringify({
+          title: 'A thing',
+          description: 'Some description',
+          phoneNumber: '0100000000',
+          startingPrice: 10,
+          durationMinutes: 60,
+          imageUrls,
+        }),
+      }),
+      env(),
+    );
+  }
+
+  it('rejects a brand new listing whose inline image decodes to over 300KB', async () => {
+    seed([]);
+
+    const response = await create([dataUrlOfSize(300 * 1024 + 1)]);
+    const body = (await response.json()) as any;
+
+    expect(response.status).toBe(400);
+    expect(body.code).toBe('IMAGE_TOO_LARGE');
+  });
+
+  it('accepts a new listing whose inline image decodes to exactly 300KB', async () => {
+    seed([]);
+
+    const response = await create([dataUrlOfSize(300 * 1024)]);
+
+    expect(response.status).toBe(201);
+  });
+
+  it('does not apply the cap to an /images/<key> path, only to data: URLs', async () => {
+    seed([]);
+
+    const response = await create([R2_PATH_A]);
+
+    expect(response.status).toBe(201);
+  });
+
+  it('rejects an edit that swaps in a new oversized inline image', async () => {
+    seed([auctionRow({ image_urls: [PNG_DATA_URL] })]);
+    const oversized = dataUrlOfSize(300 * 1024 + 1);
+
+    const response = await worker.fetch(
+      new Request('https://msa-auction.test/api/auctions/auc_01', {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${SELLER.token}` },
+        body: JSON.stringify({ imageUrls: [oversized] }),
+      }),
+      env(),
+    );
+    const body = (await response.json()) as any;
+
+    expect(response.status).toBe(400);
+    expect(body.code).toBe('IMAGE_TOO_LARGE');
+  });
+
+  it('accepts an edit that carries over an existing oversized image unchanged', async () => {
+    // This row predates the 300KB cap - its stored image is already over it.
+    const oversizedExisting = dataUrlOfSize(300 * 1024 + 1);
+    const db = seed([auctionRow({ image_urls: [oversizedExisting] })]);
+
+    const response = await worker.fetch(
+      new Request('https://msa-auction.test/api/auctions/auc_01', {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${SELLER.token}` },
+        // The image is not mentioned in the patch, so mergeAuctionEdit carries the stored
+        // (oversized) array through unchanged - only the title actually changes.
+        body: JSON.stringify({ title: 'Renamed lamp' }),
+      }),
+      env(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(db.rows('auctions')[0].image_urls).toEqual([oversizedExisting]);
+    expect(db.rows('auctions')[0].title).toBe('Renamed lamp');
+  });
+});
+
+/* ========================================================================== */
+/* 4b-2. V1 revision: the size-cap bypass via a malformed data: URL           */
+/* ========================================================================== */
+
+/**
+ * `estimateDataUrlBytes` used to return 0 for any `data:image/...` value that wasn't in the
+ * EXACT `data:<type>;base64,<payload>` shape - an extra `;name=`/`;charset=` parameter, or no
+ * `;base64,` marker at all, made its regex fail to match. Since `isDataImageUrl` (the whitelist
+ * check) accepts anything starting `data:image/`, all three of those forms sailed through
+ * `validateAuctionInput` as a "0 byte" image, no matter how large the payload actually was. This
+ * section pins the fix: `isStrictNewDataImageUrl` rejects all three outright for a NEW image, and
+ * `estimateDataUrlBytes` itself no longer returns 0 for any of them either.
+ */
+describe('the size-cap bypass via a malformed data: URL (fixed)', () => {
+  const THREE_MB_BASE64 = Buffer.alloc(3 * 1024 * 1024, 1).toString('base64');
+  const SMALL_BASE64 = Buffer.alloc(1024, 1).toString('base64');
+
+  const MALFORMED_FORMS = [
+    { label: 'an extra ;name= parameter', dataUrl: (base64: string) => `data:image/jpeg;name=x.jpg;base64,${base64}` },
+    { label: 'an extra ;charset= parameter', dataUrl: (base64: string) => `data:image/jpeg;charset=utf-8;base64,${base64}` },
+    // Not base64 at all - no `;base64,` marker - which `estimateDataUrlBytes`'s old regex also
+    // failed to match, the same way it failed on the two forms above.
+    { label: 'an unencoded (non-base64) data URL', dataUrl: (payload: string) => `data:image/svg+xml,${payload}` },
+  ];
+
+  async function create(imageUrls: any[]) {
+    return worker.fetch(
+      new Request('https://msa-auction.test/api/auctions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${SELLER.token}` },
+        body: JSON.stringify({
+          title: 'A thing',
+          description: 'Some description',
+          phoneNumber: '0100000000',
+          startingPrice: 10,
+          durationMinutes: 60,
+          imageUrls,
+        }),
+      }),
+      env(),
+    );
+  }
+
+  it('accepts the plain, well-formed form when small', async () => {
+    seed([]);
+
+    const response = await create([`data:image/jpeg;base64,${SMALL_BASE64}`]);
+
+    expect(response.status).toBe(201);
+  });
+
+  it('rejects the plain, well-formed form when over 300KB (unchanged behaviour)', async () => {
+    seed([]);
+
+    const response = await create([`data:image/jpeg;base64,${THREE_MB_BASE64}`]);
+    const body = (await response.json()) as any;
+
+    expect(response.status).toBe(400);
+    expect(body.code).toBe('IMAGE_TOO_LARGE');
+  });
+
+  for (const form of MALFORMED_FORMS) {
+    it(`rejects ${form.label}, even a small payload`, async () => {
+      seed([]);
+
+      const response = await create([form.dataUrl(SMALL_BASE64)]);
+      const body = (await response.json()) as any;
+
+      expect(response.status).toBe(400);
+      expect(body.code).toBe('INVALID_IMAGE_URL');
+    });
+
+    it(`rejects ${form.label} at 3MB (the bypass this closes)`, async () => {
+      seed([]);
+
+      const response = await create([form.dataUrl(THREE_MB_BASE64)]);
+      const body = (await response.json()) as any;
+
+      expect(response.status).toBe(400);
+      // Whether this comes back as INVALID_IMAGE_URL (shape rejected outright) or
+      // IMAGE_TOO_LARGE (shape accepted but sized as huge) is an implementation detail; what
+      // matters, and what the old code got wrong, is that it must NOT be a 201.
+      expect(['INVALID_IMAGE_URL', 'IMAGE_TOO_LARGE']).toContain(body.code);
+    });
+  }
+});
+
+describe('isStrictNewDataImageUrl', () => {
+  it('accepts the exact shape compressImageToBlob emits', () => {
+    expect(isStrictNewDataImageUrl('data:image/jpeg;base64,QUFB')).toBe(true);
+    expect(isStrictNewDataImageUrl('data:image/png;base64,QUFB')).toBe(true);
+    expect(isStrictNewDataImageUrl('data:image/webp;base64,QUFB')).toBe(true);
+    expect(isStrictNewDataImageUrl('data:image/gif;base64,QUFB')).toBe(true);
+  });
+
+  it('rejects an extra ;name= or ;charset= parameter', () => {
+    expect(isStrictNewDataImageUrl('data:image/jpeg;name=x.jpg;base64,QUFB')).toBe(false);
+    expect(isStrictNewDataImageUrl('data:image/jpeg;charset=utf-8;base64,QUFB')).toBe(false);
+  });
+
+  it('rejects a data URL with no ;base64, marker at all', () => {
+    expect(isStrictNewDataImageUrl('data:image/svg+xml,<svg></svg>')).toBe(false);
+  });
+
+  it('rejects an unsupported subtype even in the strict shape', () => {
+    expect(isStrictNewDataImageUrl('data:image/svg+xml;base64,QUFB')).toBe(false);
+  });
+
+  it('rejects a non-string and a non-data-url', () => {
+    expect(isStrictNewDataImageUrl(undefined)).toBe(false);
+    expect(isStrictNewDataImageUrl('/images/11111111-2222-4333-8444-555555555555.png')).toBe(false);
+  });
+});
+
+describe('estimateDataUrlBytes fails safe on a malformed data:image/ value', () => {
+  it('never returns 0 for a value that starts data:image/ but is not the exact <type>;base64, shape', () => {
+    const malformed = [
+      `data:image/jpeg;name=x.jpg;base64,${Buffer.alloc(1024, 1).toString('base64')}`,
+      `data:image/jpeg;charset=utf-8;base64,${Buffer.alloc(1024, 1).toString('base64')}`,
+      'data:image/svg+xml,<svg width="1" height="1"></svg>',
+    ];
+
+    for (const value of malformed) {
+      expect(estimateDataUrlBytes(value)).toBeGreaterThan(0);
+    }
+  });
+
+  it('still measures the well-formed shape correctly', () => {
+    const base64 = Buffer.alloc(1024, 1).toString('base64');
+    expect(estimateDataUrlBytes(`data:image/jpeg;base64,${base64}`)).toBe(1024);
+  });
+
+  it('returns 0 for a value that is not a data:image/ URL at all', () => {
+    expect(estimateDataUrlBytes('/images/11111111-2222-4333-8444-555555555555.png')).toBe(0);
+    expect(estimateDataUrlBytes('https://evil.example/tracker.png')).toBe(0);
+    expect(estimateDataUrlBytes(undefined)).toBe(0);
+  });
+
+  it('the fail-safe estimate for a malformed value is at least the true payload size (never an under-count)', () => {
+    const threeMbBase64 = Buffer.alloc(3 * 1024 * 1024, 1).toString('base64');
+    const malformed = `data:image/jpeg;name=x.jpg;base64,${threeMbBase64}`;
+
+    expect(estimateDataUrlBytes(malformed)).toBeGreaterThan(MAX_INLINE_IMAGE_BYTES);
+  });
+});
+
+/* ========================================================================== */
+/* 4c. Fix 1c: the image_url mirror column                                    */
+/* ========================================================================== */
+
+describe('the image_url mirror column on write', () => {
+  it('is left null on create when the first image is a base64 data: URL', async () => {
+    const db = seed([]);
+
+    const response = await worker.fetch(
+      new Request('https://msa-auction.test/api/auctions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${SELLER.token}` },
+        body: JSON.stringify({
+          title: 'A thing',
+          description: 'Some description',
+          phoneNumber: '0100000000',
+          startingPrice: 10,
+          durationMinutes: 60,
+          imageUrls: [PNG_DATA_URL],
+        }),
+      }),
+      env(),
+    );
+
+    expect(response.status).toBe(201);
+    const row = db.rows('auctions')[0];
+    expect(row.image_url).toBeNull();
+    // The full image is still available from image_urls[0] - nothing reads it from image_url.
+    expect(row.image_urls).toEqual([PNG_DATA_URL]);
+  });
+
+  it('still writes the /images/<key> path on create, since buildAuctionMetaTags reads image_url alone', async () => {
+    const db = seed([]);
+
+    const response = await worker.fetch(
+      new Request('https://msa-auction.test/api/auctions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${SELLER.token}` },
+        body: JSON.stringify({
+          title: 'A thing',
+          description: 'Some description',
+          phoneNumber: '0100000000',
+          startingPrice: 10,
+          durationMinutes: 60,
+          imageUrls: [R2_PATH_A],
+        }),
+      }),
+      env(),
+    );
+
+    expect(response.status).toBe(201);
+    expect(db.rows('auctions')[0].image_url).toBe(R2_PATH_A);
+  });
+
+  it('is set back to null on an edit that replaces an R2 path with a data: URL', async () => {
+    const db = seed([auctionRow({ image_urls: [R2_PATH_A], image_url: R2_PATH_A })]);
+
+    const response = await worker.fetch(
+      new Request('https://msa-auction.test/api/auctions/auc_01', {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${SELLER.token}` },
+        body: JSON.stringify({ imageUrls: [PNG_DATA_URL] }),
+      }),
+      env(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(db.rows('auctions')[0].image_url).toBeNull();
   });
 });
 

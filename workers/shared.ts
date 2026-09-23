@@ -302,6 +302,91 @@ export async function settleEndedAuctions(supabase: any, options: SettleOptions 
   return settled;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Stale image cleanup - shared between the Worker's daily cron and the local  */
+/* dev server (`maintenance.ts`, which re-exports these).                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The gate. Only the exact string `true` turns the sweep on, in either runtime.
+ *
+ * Deliberately strict rather than truthy: `ENABLE_STALE_IMAGE_CLEANUP=false`,
+ * `=0` and `=no` must all mean off, and anyone who typed one of those was
+ * plainly trying to say off. An unset variable is off, which is the default.
+ */
+export const STALE_IMAGE_CLEANUP_ENV = 'ENABLE_STALE_IMAGE_CLEANUP';
+
+/** A listing is in scope once this long has passed since its `end_time`. */
+export const STALE_IMAGE_GRACE_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Per-run cap on how many listings one sweep blanks, so a large backlog cannot turn one cron
+ * tick (or one dev-server startup sweep) into an unbounded UPDATE.
+ *
+ * Kept well under what would risk an over-long request URL: the UPDATE below matches by
+ * `.in('id', ids)`, and PostgREST puts that id list in the URL's query string rather than the
+ * body, so a large enough batch could bump into a URL length limit somewhere in the request path
+ * (proxies, browsers-as-clients, etc). 100 ids of this project's `auc_<millis>_<base36>` id shape
+ * keeps that URL well short of any such limit, and at once a day that is still ample throughput
+ * for a ~300-member community's listing volume.
+ */
+export const STALE_IMAGE_CLEANUP_BATCH_LIMIT = 100;
+
+export function isStaleImageCleanupEnabled(env: Record<string, string | undefined> | undefined | null): boolean {
+  return String(env?.[STALE_IMAGE_CLEANUP_ENV] ?? '').trim().toLowerCase() === 'true';
+}
+
+/**
+ * Blanks `image_url`/`image_urls` on every ENDED, CANCELLED or HIDDEN listing whose `end_time`
+ * is more than `STALE_IMAGE_GRACE_MS` ago and that still has at least one image. IRREVERSIBLE:
+ * images are base64 inside Postgres, so the row is the only copy and there is no backup.
+ *
+ * An ACTIVE listing is never touched, regardless of age - `.neq('status', AUCTION_STATUS.active)`
+ * is what keeps it out of both the SELECT and the UPDATE below.
+ *
+ * Deliberately reads no image column. The first query selects only `id`, and the UPDATE writes
+ * blindly by that id list - the whole point of this sweep is to stop spending egress on images
+ * nobody can see any more, so the sweep itself must not spend any reading them.
+ */
+export async function cleanupStaleImages(supabase: any, now: number = Date.now()): Promise<number> {
+  try {
+    const cutoff = now - STALE_IMAGE_GRACE_MS;
+
+    const { data, error } = await supabase
+      .from('auctions')
+      .select('id')
+      .neq('status', AUCTION_STATUS.active)
+      .lt('end_time', cutoff)
+      .gt('image_count', 0)
+      .limit(STALE_IMAGE_CLEANUP_BATCH_LIMIT);
+
+    if (error || !Array.isArray(data) || data.length === 0) {
+      return 0;
+    }
+
+    const ids = data.map((row: any) => row.id).filter((id: unknown) => typeof id === 'string' || typeof id === 'number');
+    if (ids.length === 0) {
+      return 0;
+    }
+
+    const { error: updateError } = await supabase
+      .from('auctions')
+      .update({ image_url: null, image_urls: [] })
+      .in('id', ids);
+
+    if (updateError) {
+      console.error('Failed to clean up stale images:', updateError);
+      return 0;
+    }
+
+    console.log(`[Maintenance] Cleaned stale images for ${ids.length} auction(s) ended more than 30 days ago.`);
+    return ids.length;
+  } catch (err) {
+    console.error('Failed to clean up stale images:', err);
+    return 0;
+  }
+}
+
 function latestOwnBidTimestamp(auction: ActivityAuction, userId: string): number | null {
   let latest: number | null = null;
   for (const bid of auction.bids ?? []) {
@@ -2147,6 +2232,77 @@ export function isDataImageUrl(value: unknown): boolean {
 }
 
 /**
+ * The EXACT shape a NEW inline image must have to be accepted at all: `compressImageToBlob`
+ * (`src/lib/images.ts`) always emits `data:image/<jpeg|png|webp|gif>;base64,<payload>` with no
+ * other parameters, and this is the only shape `estimateDataUrlBytes` below can size correctly.
+ *
+ * `isDataImageUrl` above stays deliberately permissive - it also has to accept whatever odd but
+ * long-standing value is already sitting in an old row, via `mergeAuctionEdit`. This is the
+ * narrower gate applied only to a genuinely NEW entry in `validateAuctionInput` (see the call
+ * site in `workers/index.ts`), which is why a listing can still be edited as long as an existing
+ * oddly-shaped image is carried over byte-for-byte rather than replaced.
+ *
+ * Rejecting anything else here is also what closes the size-cap bypass `estimateDataUrlBytes`
+ * used to have: `data:image/jpeg;name=x.jpg;base64,<payload>`, `data:image/jpeg;charset=utf-8;
+ * base64,<payload>`, and an unencoded `data:image/svg+xml,<payload>` (no `;base64,` at all) each
+ * used to make that function's regex fail to match and silently return 0 - i.e. "free" storage
+ * for an arbitrarily large inline image. None of those match this pattern, so all three are now
+ * refused outright as a NEW image, at any size.
+ */
+const STRICT_NEW_DATA_IMAGE_PATTERN = /^data:image\/(jpeg|png|webp|gif);base64,[a-z0-9+/]+={0,2}$/i;
+
+export function isStrictNewDataImageUrl(value: unknown): boolean {
+  return typeof value === 'string' && STRICT_NEW_DATA_IMAGE_PATTERN.test(value.trim());
+}
+
+/**
+ * Hard ceiling on a NEW inline `data:` image, enforced in `validateAuctionInput`. Now that
+ * `compressImageToBlob` targets ~100-150KB per photo (see `src/lib/images.ts`), anything still
+ * arriving above this is either an old, uncompressed client or a payload crafted by hand -
+ * either way it is the size Supabase egress was being spent on and it is refused outright,
+ * EXCEPT when it is byte-identical to an image already stored on the listing being edited (see
+ * the call site in `workers/index.ts`).
+ */
+export const MAX_INLINE_IMAGE_BYTES = 300 * 1024;
+
+/**
+ * The decoded byte length of a `data:` URL's payload, computed from the base64 TEXT length
+ * rather than by decoding it - this runs on every listing create/edit, so it stays a cheap
+ * length calculation rather than an `atob` over what could be a multi-megabyte string.
+ *
+ * FAILS SAFE rather than returning 0 for anything that merely claims to be an image but isn't in
+ * the exact `data:<type>;base64,<payload>` shape this function knows how to measure - an extra
+ * `;name=...`/`;charset=...` parameter, or no `;base64,` marker at all (e.g. an unencoded
+ * `data:image/svg+xml,<xml>`). `validateAuctionInput` already refuses all of those outright for a
+ * NEW image via `isStrictNewDataImageUrl`, so this defends the same ground a second way: `0`
+ * bytes for an unparseable "image" used to mean "free, no size limit applies", which is precisely
+ * the bypass this exists to close. `value.length` is a real, if loose, upper bound on the decoded
+ * size of anything base64-shaped, so treating it as the size is conservative, never an
+ * under-count. A value that is not a `data:image/...` string at all (an `/images/<key>` path, or
+ * anything the whitelist would reject on other grounds) still returns 0 - it is not a size this
+ * function is meant to be measuring in the first place.
+ */
+export function estimateDataUrlBytes(value: unknown): number {
+  if (typeof value !== 'string') {
+    return 0;
+  }
+
+  const trimmed = value.trim();
+  const match = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+)?;base64,([\s\S]*)$/i.exec(trimmed);
+  if (!match) {
+    return isDataImageUrl(trimmed) ? trimmed.length : 0;
+  }
+
+  const base64 = (match[2] ?? '').replace(/\s+/g, '');
+  if (!base64) {
+    return 0;
+  }
+
+  const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.floor((base64.length * 3) / 4) - padding);
+}
+
+/**
  * The whitelist `validateAuctionInput` applies to every image entry.
  *
  * An arbitrary `https://` URL is NOT acceptable. Storing one would let listing
@@ -2156,6 +2312,50 @@ export function isDataImageUrl(value: unknown): boolean {
  */
 export function isAllowedImageRef(value: unknown): boolean {
   return isStoredImagePath(value) || isDataImageUrl(value);
+}
+
+/** What `validateNewInlineImages` returns when it finds a problem. */
+export interface NewInlineImageFailure {
+  message: string;
+  code: string;
+}
+
+/**
+ * The size/shape guard on every NEW inline image in a listing (Fix 1b/1c and the V1 revision
+ * that closed the size-cap bypass). Shared between the Worker (`workers/index.ts`) and the local
+ * dev server (`server.ts`) so the two never drift - both call this from their own
+ * `validateAuctionInput`, over the SAME `normalizedImageUrls` that whitelist check
+ * (`isAllowedImageRef`) already accepted.
+ *
+ * `existingImageUrls` are the images already stored on the listing being edited (empty on
+ * create). An entry byte-identical to one of them is exempt from both checks below, so an old
+ * listing's existing photo - whatever shape or size it happens to be - never blocks an otherwise
+ * unrelated edit; only a genuinely NEW entry has to pass.
+ *
+ * Returns `null` when every new entry is acceptable, or the `{ message, code }` to surface as a
+ * 400 otherwise.
+ */
+export function validateNewInlineImages(
+  imageUrls: readonly string[],
+  existingImageUrls: readonly string[] = [],
+): NewInlineImageFailure | null {
+  const existingSet = new Set(existingImageUrls);
+
+  for (const value of imageUrls) {
+    if (existingSet.has(value) || !isDataImageUrl(value)) {
+      continue;
+    }
+
+    if (!isStrictNewDataImageUrl(value)) {
+      return { message: 'Listing images must be uploaded through this site.', code: 'INVALID_IMAGE_URL' };
+    }
+
+    if (estimateDataUrlBytes(value) > MAX_INLINE_IMAGE_BYTES) {
+      return { message: 'Images must be 300KB or smaller. Please choose a smaller photo.', code: 'IMAGE_TOO_LARGE' };
+    }
+  }
+
+  return null;
 }
 
 /**

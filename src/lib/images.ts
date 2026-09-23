@@ -86,7 +86,7 @@ export function __resetImageCacheForTests(): void {
  * short `/images/<key>` path the server hands back is ever sent in `imageUrls`.
  */
 
-export const MAX_IMAGE_DIMENSION = 1600;
+export const MAX_IMAGE_DIMENSION = 1024;
 /** Mirrors the server's 5 MB cap on `POST /api/images` -- checked client-side too, so a caller
  *  gets an immediate answer instead of waiting on a round trip that was always going to fail. */
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -103,9 +103,164 @@ const readFileAsDataUrl = (file: File) => new Promise<string>((resolve, reject) 
 });
 
 /**
+ * JPEG quality passed to `canvas.toBlob` on the first attempt. Tuned so a typical 12MP phone
+ * photo, once scaled down to `MAX_IMAGE_DIMENSION`, lands around 100-150KB rather than the
+ * ~1.9MB a barely-compressed upload used to cost in `image_urls`. A photo that is still too
+ * detailed at this quality is retried at a lower one -- see `IMAGE_COMPRESSION_LADDER` below.
+ */
+export const IMAGE_OUTPUT_QUALITY = 0.7;
+
+/**
+ * The client-side target for a compressed image's decoded byte size, checked against
+ * `Blob.size` -- which, for a blob later base64-encoded into a `data:` URL (see `blobToDataUrl`),
+ * IS the decoded byte size the server's `estimateDataUrlBytes` would compute: base64 encoding is
+ * a lossless, size-preserving round trip, so comparing `blob.size` here is exactly the comparison
+ * `estimateDataUrlBytes(dataUrl) > MAX_INLINE_IMAGE_BYTES` makes server-side, just without paying
+ * for the base64 encode first.
+ *
+ * Deliberately below the server's `MAX_INLINE_IMAGE_BYTES` (see `workers/shared.ts`), not equal
+ * to it: the two are allowed to drift apart in exactly one direction (client stricter than
+ * server) and a unit test pins that inequality so they can never cross.
+ */
+export const CLIENT_IMAGE_TARGET_BYTES = 280 * 1024;
+
+/**
+ * The long-edge scale factor and resulting dimensions for a source image, capped at
+ * `MAX_IMAGE_DIMENSION`. Pulled out of `compressImageToBlob` so the arithmetic can be unit
+ * tested without a real `<canvas>` (jsdom does not implement one).
+ */
+export function computeScaledDimensions(
+  width: number,
+  height: number,
+  maxDimension: number = MAX_IMAGE_DIMENSION,
+): { width: number; height: number } {
+  const scale = Math.min(1, maxDimension / Math.max(width, height));
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  };
+}
+
+/** One point on the compression ladder: what to draw at, and what quality to encode with. */
+export interface CompressionAttempt {
+  quality: number;
+  maxDimension: number;
+}
+
+/**
+ * Quality steps tried, in order, before falling back to a smaller `maxDimension`. Chosen so the
+ * first attempt is `IMAGE_OUTPUT_QUALITY` (the size that is already right for almost every
+ * photo) and each retry after that is a meaningfully bigger size cut, not a marginal one.
+ */
+const COMPRESSION_QUALITY_STEPS = [IMAGE_OUTPUT_QUALITY, 0.6, 0.5, 0.4] as const;
+
+/**
+ * Dimension steps tried once every quality step has been exhausted at the current size. Only
+ * reached by an unusually detailed photo (e.g. a busy, high-contrast scene) that is still over
+ * `CLIENT_IMAGE_TARGET_BYTES` at the lowest quality step.
+ */
+const COMPRESSION_DIMENSION_STEPS = [MAX_IMAGE_DIMENSION, 800] as const;
+
+/**
+ * Every attempt `compressImageToBlob` will try, in order: all quality steps at
+ * `MAX_IMAGE_DIMENSION` first, then all quality steps again at 800px. Flattened into one ladder
+ * so the retry loop is just "index + 1", and so `planNextCompressionStep` (below) can be a pure
+ * function of an index rather than needing to re-derive "what comes after quality 0.4 at 1024px".
+ */
+export const IMAGE_COMPRESSION_LADDER: CompressionAttempt[] = COMPRESSION_DIMENSION_STEPS.flatMap((maxDimension) =>
+  COMPRESSION_QUALITY_STEPS.map((quality) => ({ quality, maxDimension })),
+);
+
+export type CompressionPlan =
+  | { action: 'accept' }
+  | { action: 'retry'; attemptIndex: number; step: CompressionAttempt }
+  | { action: 'giveUp' };
+
+/**
+ * Pure retry planner: given the size a just-encoded blob came out to and which rung of
+ * `IMAGE_COMPRESSION_LADDER` produced it, decides what `compressImageToBlob` does next.
+ *
+ * `accept`  -- the blob is small enough to use as-is.
+ * `retry`   -- try the next, more aggressive rung.
+ * `giveUp`  -- every rung has been tried and the photo is still over target; the caller should
+ *              surface a friendly error rather than submit something the server will 400.
+ *
+ * No canvas, no `Blob`, no I/O -- this is why it is unit-testable without jsdom's missing canvas
+ * support, and it is the only place the retry DECISION lives; `compressImageToBlob` just acts on
+ * whatever this returns.
+ */
+export function planNextCompressionStep(
+  attemptIndex: number,
+  sizeBytes: number,
+  targetBytes: number = CLIENT_IMAGE_TARGET_BYTES,
+): CompressionPlan {
+  if (sizeBytes <= targetBytes) {
+    return { action: 'accept' };
+  }
+
+  const nextIndex = attemptIndex + 1;
+  if (nextIndex >= IMAGE_COMPRESSION_LADDER.length) {
+    return { action: 'giveUp' };
+  }
+
+  return { action: 'retry', attemptIndex: nextIndex, step: IMAGE_COMPRESSION_LADDER[nextIndex] };
+}
+
+/**
+ * Draws `image` onto a fresh canvas at `step.maxDimension` and encodes it as a JPEG at
+ * `step.quality`. Split out of `compressImageToBlob` so the retry loop there can call it once per
+ * rung of the ladder without repeating the canvas setup.
+ *
+ * White background first: a transparent PNG/WEBP/GIF re-encoded straight to JPEG would otherwise
+ * turn every transparent pixel black.
+ */
+function encodeAttempt(image: HTMLImageElement, step: CompressionAttempt, fileName: string): Promise<Blob> {
+  const canvas = document.createElement('canvas');
+  const { width: targetWidth, height: targetHeight } = computeScaledDimensions(
+    image.width,
+    image.height,
+    step.maxDimension,
+  );
+
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
+
+  const context = canvas.getContext('2d');
+  if (!context) {
+    return Promise.reject(new Error(`Could not create a preview for ${fileName}.`));
+  }
+
+  context.fillStyle = '#ffffff';
+  context.fillRect(0, 0, targetWidth, targetHeight);
+  context.drawImage(image, 0, 0, targetWidth, targetHeight);
+
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          reject(new Error(`Could not compress ${fileName}.`));
+          return;
+        }
+        resolve(blob);
+      },
+      'image/jpeg',
+      step.quality,
+    );
+  });
+}
+
+/**
  * Compresses one picked file to at most `MAX_IMAGE_DIMENSION`px on its long edge, returning the
  * result as a `Blob` ready to POST as raw bytes (as opposed to the base64 data URL the old
  * flow embedded directly in the listing payload).
+ *
+ * The output is ALWAYS a JPEG, regardless of the source type. If the first attempt still comes
+ * out over `CLIENT_IMAGE_TARGET_BYTES` -- an unusually detailed photo at 1024px and quality 0.7
+ * can -- `planNextCompressionStep` walks `IMAGE_COMPRESSION_LADDER` down through lower qualities
+ * and then smaller dimensions until the blob fits, so the server's `MAX_INLINE_IMAGE_BYTES` guard
+ * (see `workers/shared.ts`) never has a reason to 400 a file this function accepted. If nothing
+ * on the ladder gets under target, this throws a friendly error instead of returning a blob the
+ * server would reject.
  */
 export async function compressImageToBlob(file: File): Promise<Blob> {
   if (!ACCEPTED_IMAGE_TYPES.includes(file.type)) {
@@ -125,37 +280,26 @@ export async function compressImageToBlob(file: File): Promise<Blob> {
     img.src = source;
   });
 
-  const canvas = document.createElement('canvas');
-  const scale = Math.min(1, MAX_IMAGE_DIMENSION / Math.max(image.width, image.height));
-  const targetWidth = Math.max(1, Math.round(image.width * scale));
-  const targetHeight = Math.max(1, Math.round(image.height * scale));
+  let attemptIndex = 0;
 
-  canvas.width = targetWidth;
-  canvas.height = targetHeight;
+  while (true) {
+    const step = IMAGE_COMPRESSION_LADDER[attemptIndex];
+    const blob = await encodeAttempt(image, step, file.name);
+    const plan = planNextCompressionStep(attemptIndex, blob.size);
 
-  const context = canvas.getContext('2d');
-  if (!context) {
-    throw new Error(`Could not create a preview for ${file.name}.`);
+    if (plan.action === 'accept') {
+      return blob;
+    }
+
+    if (plan.action === 'giveUp') {
+      throw new Error(
+        `${file.name} is too detailed to compress under this site's size limit, even at reduced quality. ` +
+          `Please choose a smaller or simpler photo.`,
+      );
+    }
+
+    attemptIndex = plan.attemptIndex;
   }
-
-  context.drawImage(image, 0, 0, targetWidth, targetHeight);
-
-  const mimeType = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
-  const quality = file.size > 1_000_000 ? 0.72 : 0.85;
-
-  return new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob(
-      (blob) => {
-        if (!blob) {
-          reject(new Error(`Could not compress ${file.name}.`));
-          return;
-        }
-        resolve(blob);
-      },
-      mimeType,
-      quality,
-    );
-  });
 }
 
 /** Thin wrapper around `URL.createObjectURL`, kept here so component tests can mock it instead

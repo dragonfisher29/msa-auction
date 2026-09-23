@@ -333,6 +333,66 @@ describe('settlement ignores cancelled listings', () => {
   });
 });
 
+describe('scheduled() dispatches on event.cron', () => {
+  const STALE_END = NOW - 31 * 24 * 60 * 60 * 1000;
+
+  function staleRow(overrides: Record<string, any> = {}) {
+    return auctionRow({
+      status: 'ended',
+      end_time: STALE_END,
+      image_url: 'data:image/png;base64,aaa',
+      image_urls: ['data:image/png;base64,aaa', 'data:image/png;base64,bbb'],
+      image_count: 2,
+      ...overrides,
+    });
+  }
+
+  it('the minute cron settles and does not touch images, even on a stale ended row', async () => {
+    const db = seed([
+      auctionRow({ status: 'active', end_time: NOW - 1000, bids: [bid({ amount: 400 })], current_price: 400 }),
+      staleRow({ id: 'auc_stale' }),
+    ]);
+
+    await worker.scheduled({ cron: '* * * * *' }, { ...ENV, ENABLE_STALE_IMAGE_CLEANUP: 'true' }, { waitUntil: () => {} });
+
+    const settled = db.rows('auctions').find((row: any) => row.id === 'auc_1');
+    expect(settled.status).toBe('ended');
+    expect(settled.winner_id).toBe(OTHER.id);
+
+    // The daily job never ran off the minute cron, so the stale row's images survive.
+    const stale = db.rows('auctions').find((row: any) => row.id === 'auc_stale');
+    expect(stale.image_urls).toEqual(['data:image/png;base64,aaa', 'data:image/png;base64,bbb']);
+  });
+
+  it('the daily cron cleans stale images and does not settle anything', async () => {
+    const db = seed([
+      auctionRow({ status: 'active', end_time: NOW - 1000, bids: [bid({ amount: 400 })], current_price: 400 }),
+      staleRow({ id: 'auc_stale' }),
+    ]);
+
+    await worker.scheduled({ cron: '0 3 * * *' }, { ...ENV, ENABLE_STALE_IMAGE_CLEANUP: 'true' }, { waitUntil: () => {} });
+
+    // Settlement did not run off the daily cron: the ended-but-unsettled row stays untouched.
+    const unsettled = db.rows('auctions').find((row: any) => row.id === 'auc_1');
+    expect(unsettled.status).toBe('active');
+    expect(unsettled.winner_id).toBeNull();
+
+    const stale = db.rows('auctions').find((row: any) => row.id === 'auc_stale');
+    expect(stale.image_url).toBeNull();
+    expect(stale.image_urls).toEqual([]);
+  });
+
+  it('the daily cron does nothing when ENABLE_STALE_IMAGE_CLEANUP is not "true"', async () => {
+    const db = seed([staleRow({ id: 'auc_stale' })]);
+
+    await worker.scheduled({ cron: '0 3 * * *' }, ENV, { waitUntil: () => {} });
+
+    const stale = db.rows('auctions').find((row: any) => row.id === 'auc_stale');
+    expect(stale.image_urls).toEqual(['data:image/png;base64,aaa', 'data:image/png;base64,bbb']);
+    expect(db.operations).toEqual([]);
+  });
+});
+
 /* ========================================================================== */
 /* 2. The listing cap counts active listings only                             */
 /* ========================================================================== */

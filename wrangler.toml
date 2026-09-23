@@ -56,6 +56,13 @@ not_found_handling = "single-page-application"
 SUPABASE_URL = "https://ygyvsowniuoszlsahrvl.supabase.co"
 MAX_LISTINGS_PER_USER = "20"
 
+# Owner-approved retention: once a listing is no longer active (ended, cancelled or hidden) and
+# it has been more than 30 days since its end_time, its photos are permanently deleted -- see
+# cleanupStaleImages in workers/shared.ts, run daily by the second [triggers] cron below. This is
+# a real, irreversible DELETE with no backup (images are base64 inside Postgres). To turn it off,
+# set this to "false" and merge to main; an active listing is never touched regardless.
+ENABLE_STALE_IMAGE_CLEANUP = "true"
+
 # SUPABASE_SERVICE_ROLE_KEY is a SECRET and must never appear in [vars] --
 # not even as a placeholder. It bypasses all Supabase row-level security.
 # Set it as an encrypted Worker secret instead:
@@ -64,11 +71,16 @@ MAX_LISTINGS_PER_USER = "20"
 # At runtime the secret arrives on the same `env` object as the [vars] above,
 # so workers/index.ts needs no change.
 
-# Runs the `scheduled` handler in workers/index.ts once a minute to settle
-# auctions whose end_time has passed. Without this nothing in production ever
-# ends an auction or records a winner.
+# Two schedules, both handled by `scheduled()` in workers/index.ts, which tells them apart by
+# `event.cron`:
+#   "* * * * *"  -- every minute, settles auctions whose end_time has passed. Without this
+#                   nothing in production ever ends an auction or records a winner.
+#   "0 3 * * *"  -- once a day at 03:00 UTC (Cloudflare cron schedules always run in UTC, not
+#                   local time), runs the stale-image cleanup sweep (gated on
+#                   ENABLE_STALE_IMAGE_CLEANUP above).
+# Free-tier Cloudflare Workers allows up to 5 cron triggers per account; this uses 2.
 [triggers]
-crons = ["* * * * *"]
+crons = ["* * * * *", "0 3 * * *"]
 
 [observability]
 enabled = true

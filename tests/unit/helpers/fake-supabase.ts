@@ -7,7 +7,7 @@
  * without touching a real database.
  */
 
-export type FilterOp = 'eq' | 'is' | 'lte' | 'neq' | 'or' | 'gt' | 'in' | 'like';
+export type FilterOp = 'eq' | 'is' | 'lte' | 'lt' | 'neq' | 'or' | 'gt' | 'in' | 'like';
 
 export interface RecordedFilter {
   op: FilterOp;
@@ -299,6 +299,15 @@ function matchesFilter(row: any, filter: RecordedFilter): boolean {
     return Array.isArray(filter.value) && filter.value.includes(actual);
   }
 
+  // Postgres `<` is NULL-blind, like `>` above.
+  if (filter.op === 'lt') {
+    if (actual === null || actual === undefined) {
+      return false;
+    }
+    const numeric = Number.isFinite(Number(actual)) && Number.isFinite(Number(filter.value));
+    return numeric ? Number(actual) < Number(filter.value) : String(actual) < String(filter.value);
+  }
+
   return Number(actual) <= Number(filter.value);
 }
 
@@ -405,6 +414,11 @@ class FakeQuery {
 
   gt(column: string, value: any) {
     this.filters.push({ op: 'gt', column, value });
+    return this;
+  }
+
+  lt(column: string, value: any) {
+    this.filters.push({ op: 'lt', column, value });
     return this;
   }
 

@@ -8,97 +8,61 @@
  * of that. Now the destructive part and the decision to run it are two separate,
  * importable functions.
  *
- * Nothing here runs in production. The Cloudflare Worker never imports this
- * file; only `server.ts` does.
+ * The sweep itself (`cleanupStaleImages`) now lives in `workers/shared.ts`, so
+ * the Worker's daily cron and this dev-server path run the exact same code
+ * instead of two copies that could quietly drift - see `scheduled()` in
+ * `workers/index.ts` for the Worker side. This file re-exports it, plus the
+ * repeating-timer wrapper (`startStaleImageCleanup`) that only ever made sense
+ * for a long-lived Node process, not a Worker invocation.
  */
-import { toStringArray } from './workers/shared';
+import {
+  cleanupStaleImages,
+  isStaleImageCleanupEnabled,
+  STALE_IMAGE_CLEANUP_BATCH_LIMIT,
+  STALE_IMAGE_CLEANUP_ENV,
+  STALE_IMAGE_GRACE_MS,
+} from './workers/shared';
+
+export {
+  cleanupStaleImages,
+  isStaleImageCleanupEnabled,
+  STALE_IMAGE_CLEANUP_BATCH_LIMIT,
+  STALE_IMAGE_CLEANUP_ENV,
+  STALE_IMAGE_GRACE_MS,
+};
 
 /* -------------------------------------------------------------------------- */
-/* Stale image cleanup                                                         */
+/* Stale image cleanup - the repeating local sweep                            */
 /* -------------------------------------------------------------------------- */
 
 /**
- * WHY THIS IS BEHIND A FLAG, AND WHY THE FLAG DEFAULTS TO OFF.
+ * WHY THIS IS BEHIND A FLAG, AND WHY THE FLAG DEFAULTS TO OFF (LOCALLY).
  *
- * `cleanupStaleImages` finds every auction created more than 90 days ago and
- * sets `image_url = null`, `image_urls = '[]'`. It is a real DELETE of the only
- * copy of those photos:
+ * `cleanupStaleImages` finds every ended/cancelled/hidden listing whose
+ * `end_time` is more than 30 days ago and still has images, and blanks
+ * `image_url`/`image_urls` on it. It is a real DELETE of the only copy of
+ * those photos:
  *
  *   - Images are base64 `data:` URLs inside Postgres. The row IS the image.
  *     There is no object store holding a second copy, and no backup.
- *   - `.env`, `.dev.vars` and `wrangler.toml` all point at the SAME Supabase
- *     project. There is no separate development database. "Local" here means
- *     the process is local; the data it writes to is production.
+ *   - `.env` and `.dev.vars` point at the SAME Supabase project `wrangler.toml`
+ *     does. There is no separate development database. "Local" here means the
+ *     process is local; the data it writes to is production.
  *
- * Put together: running `npm run dev` or `npm start` on a laptop permanently
- * destroyed the photos on every production listing older than 90 days, on
- * startup, with no prompt and nothing to undo it with.
+ * `wrangler.toml` now runs this sweep daily in production on purpose (see
+ * `[vars] ENABLE_STALE_IMAGE_CLEANUP` there, and `scheduled()` in
+ * `workers/index.ts`) - that is a deliberate, owner-approved retention policy,
+ * not the accident this comment is about. The accident was `npm run dev` or
+ * `npm start` on a laptop running the SAME sweep against the SAME database
+ * unprompted, on every startup, with no way to undo it.
  *
- * So it now runs only when someone asks for it by name, and asking is a
- * deliberate act: set ENABLE_STALE_IMAGE_CLEANUP=true in the environment. The
- * function itself is unchanged and is kept on purpose - the problem was never
- * what it does, it was that it did it unbidden against live data.
+ * So locally it still runs only when someone asks for it by name: set
+ * ENABLE_STALE_IMAGE_CLEANUP=true in `.env`. That variable is read from
+ * `process.env` here, never from `wrangler.toml`, so enabling the Worker's
+ * daily cron does not also turn this on for whoever's laptop happens to run
+ * `npm run dev` next.
  */
-export const STALE_IMAGE_CLEANUP_ENV = 'ENABLE_STALE_IMAGE_CLEANUP';
-
-/** Listings older than this are in scope for the sweep. */
-export const STALE_IMAGE_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
-
-/** How often the sweep repeats once enabled. */
 export const STALE_IMAGE_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
-
-/**
- * The gate. Only the exact string `true` turns it on.
- *
- * Deliberately strict rather than truthy: `ENABLE_STALE_IMAGE_CLEANUP=false`,
- * `=0` and `=no` must all mean off, and anyone who typed one of those was
- * plainly trying to say off. An unset variable is off, which is the default
- * every developer gets.
- */
-export function isStaleImageCleanupEnabled(env: Record<string, string | undefined>): boolean {
-  return String(env?.[STALE_IMAGE_CLEANUP_ENV] ?? '').trim().toLowerCase() === 'true';
-}
-
-/**
- * Blanks the images on every auction older than `STALE_IMAGE_MAX_AGE_MS`.
- *
- * IRREVERSIBLE. See the note on `STALE_IMAGE_CLEANUP_ENV` above. Call this
- * through `startStaleImageCleanup` rather than directly, so the gate applies.
- */
-export async function cleanupStaleImages(supabase: any, now: number = Date.now()): Promise<number> {
-  try {
-    const ninetyDaysAgo = now - STALE_IMAGE_MAX_AGE_MS;
-    const { data, error } = await supabase
-      .from('auctions')
-      .select('id, created_at, image_url, image_urls')
-      .lt('created_at', ninetyDaysAgo);
-
-    if (error || !data) return 0;
-
-    let cleanedCount = 0;
-    for (const row of data) {
-      const hasMainImage = typeof row.image_url === 'string' && row.image_url.trim().length > 0;
-      const imageUrls = toStringArray(row.image_urls);
-      if (hasMainImage || imageUrls.length > 0) {
-        await supabase
-          .from('auctions')
-          .update({
-            image_url: null,
-            image_urls: '[]',
-          })
-          .eq('id', row.id);
-        cleanedCount++;
-      }
-    }
-    if (cleanedCount > 0) {
-      console.log(`[Maintenance] Cleaned stale images for ${cleanedCount} auction(s) older than 90 days.`);
-    }
-    return cleanedCount;
-  } catch (err) {
-    console.error('Failed to clean up stale images:', err);
-    return 0;
-  }
-}
 
 export interface StaleImageCleanupOptions {
   supabase: any;
@@ -131,16 +95,18 @@ export function startStaleImageCleanup(options: StaleImageCleanupOptions): Stale
 
   if (!isStaleImageCleanupEnabled(env)) {
     log(
-      `[Maintenance] Stale image cleanup is DISABLED. Listings older than 90 days keep their photos. ` +
-        `Set ${STALE_IMAGE_CLEANUP_ENV}=true to enable it -- it permanently deletes those photos from the ` +
-        `Supabase project this server is pointed at, and there is no backup to restore them from.`,
+      `[Maintenance] Stale image cleanup is DISABLED on this local server. Ended/cancelled/hidden listings ` +
+        `keep their photos. Set ${STALE_IMAGE_CLEANUP_ENV}=true in .env to enable it here too -- it permanently ` +
+        `deletes photos, more than 30 days after a listing ends, from the Supabase project this server is ` +
+        `pointed at, and there is no backup to restore them from. (This is separate from the Worker's own daily ` +
+        `cron, which already runs this sweep in production.)`,
     );
     return { enabled: false, timer: null };
   }
 
   log(
-    `[Maintenance] Stale image cleanup is ENABLED via ${STALE_IMAGE_CLEANUP_ENV}. Photos on listings older ` +
-      `than 90 days will be deleted now and every 6 hours. This cannot be undone.`,
+    `[Maintenance] Stale image cleanup is ENABLED via ${STALE_IMAGE_CLEANUP_ENV}. Photos on ended/cancelled/hidden ` +
+      `listings more than 30 days past their end_time will be deleted now and every 6 hours. This cannot be undone.`,
   );
 
   void cleanupStaleImages(options.supabase);
