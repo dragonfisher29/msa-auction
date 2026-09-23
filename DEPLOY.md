@@ -2,8 +2,15 @@
 
 This is a step-by-step runbook for shipping the current working tree to
 production (`https://msa-auction.msasoton.workers.dev/`). Follow it in order.
-Every command is copy-pasteable. Do not skip the verification line after a
-step — if it does not match, stop and fix it before moving on.
+Do not skip the verification line after a step — if it does not match, stop
+and fix it before moving on.
+
+**Deploys go through the Cloudflare dashboard, not a CLI.** The Worker is
+connected to this repo's GitHub via Cloudflare **Workers Builds**: every push
+or merge to `main` triggers a build and deploy on Cloudflare's own servers.
+You never run a deploy command yourself. The only exception is `npx wrangler
+dev` for local development (Appendix A.5), which is unrelated to shipping to
+production.
 
 ---
 
@@ -15,64 +22,110 @@ step — if it does not match, stop and fix it before moving on.
 dev` talks to production, not a sandbox. Every row you touch locally is a row
 a student can see.
 
-### The photo-deleting sweep is now gated off — keep it that way
+### The photo-deleting sweep now runs daily, in production, on purpose
 
-`server.ts` used to run `cleanupStaleImages()` on startup and then again every
-6 hours. It selects every auction with `created_at` older than 90 days and,
-for any that still has an image, sets `image_url = null` and `image_urls =
-'[]'`. Combined with the shared database above, that meant **starting the dev
-server permanently deleted photos from every production listing older than 90
-days, seconds after the process launched.** Images are base64 data URLs stored
-directly in the `auctions` row, and there is no backup and no second copy, so
-once they are nulled out they are gone.
+`cleanupStaleImages()` (`workers/shared.ts`) finds every listing that is no
+longer active — ended, cancelled, or hidden, never one still running — whose
+`end_time` is more than 30 days in the past and that still has an image, and
+sets `image_url = null` and `image_urls = '[]'` on it. Images are base64 data
+URLs stored directly in the `auctions` row, and there is no backup and no
+second copy, so once they are nulled out they are gone. This is an
+**owner-approved retention policy**, not an accident: the committee agreed
+that a listing's photos do not need to survive a month after it ends. The
+committee should tell sellers this up front — e.g. in whatever page or message
+explains how listing a sold/expired item works.
 
-**That sweep no longer runs by default.** It is gated behind an environment
-variable and the default is off:
-
-```
-ENABLE_STALE_IMAGE_CLEANUP=true
-```
-
-Only the literal string `true` enables it. Unset — which is what you get from
-a fresh `.env.example` — means it never runs, and the server prints one line at
-startup confirming that:
+**It runs once a day in the Worker**, via the second cron in `wrangler.toml`'s
+`[triggers]` (`0 3 * * *`, i.e. 03:00 **UTC** — Cloudflare cron schedules
+always run in UTC, not local time), and is enabled through `[vars]`:
 
 ```
-[Maintenance] Stale image cleanup is DISABLED. Listings older than 90 days keep
-their photos. Set ENABLE_STALE_IMAGE_CLEANUP=true to enable it -- ...
+ENABLE_STALE_IMAGE_CLEANUP = "true"
 ```
 
-If you ever see the `ENABLED` version of that line instead, stop the server.
-Somebody put that variable in a `.env` file and it is about to delete photos
-from production. The gate lives in `maintenance.ts`; the function itself is
-unchanged and kept deliberately, so it is available if the society ever
-genuinely wants a retention policy — but turning it on is then a decision
-someone makes on purpose, not a side effect of running `npm run dev`.
+Only the literal string `"true"` enables it. **To turn it off:** set that to
+`"false"` in `wrangler.toml` and merge to `main` — the next deploy carries the
+change. An active listing is never touched, no matter how old, regardless of
+this setting.
+
+**The local dev server has its own, separate copy of the same gate**, read
+from `.env` (not `wrangler.toml`) and **off by default** — see
+`STALE_IMAGE_CLEANUP_ENV` in `maintenance.ts`. This is deliberate: `.env`,
+`.dev.vars`, and `wrangler.toml` all point at the exact same Supabase project
+(see the warning above), so a dev-server sweep running unprompted against
+production is a much worse failure mode than a daily production cron running
+the policy the committee actually asked for. Leave `.env`'s
+`ENABLE_STALE_IMAGE_CLEANUP` unset unless you are deliberately testing this
+locally against production data (you almost never want that — see the DANGER
+note above).
 
 **Nothing in this document ever asks you to run `npm run dev` or `npm
 start`.** Only use `npm run lint`, `npm test`, and `npm run build` — none of
 them open a database connection or execute `server.ts`; `npm run build` only
-bundles it into a file, it does not run it. The gate removes the worst
-consequence of an accidental `npm run dev`; it does not make it a good idea.
+bundles it into a file, it does not run it.
 
 ---
 
 ## 1. What this deploy contains, and what has (and hasn't) been verified
 
-This ships a large, previously-undeployed change set: four new database
-migrations, image payloads removed from the auction list response, password
-reset, admin/moderation tooling, and a fix to the bid optimistic lock (money
-columns move from `double precision` to `numeric(12,2)`, guarded by a new
-`bid_version` counter instead of a float comparison).
+This ships a large change set: five database migrations, image payloads
+removed from both the auction list **and** the bid response (images now load
+once via the dedicated images route, which is a large cut in Supabase
+egress), a hardened settlement job, tighter bid/cancel/edit rules, seller
+phone numbers gated to signed-in users, and row level security enabled on the
+core tables. In detail:
+
+- **No route but the images route returns image data.** `GET /api/auctions`,
+  `GET /api/auctions/:id`, and the bid response all carry only `imageCount` (or
+  no image field at all) — a card or detail view fetches photos separately from
+  `GET /api/auctions/:id/images`, and that response is cached for the rest of
+  the session.
+- **Settlement is more robust.** The cron job reads its columns by name, caps
+  each run at 20 auctions, and one failing row is logged and skipped rather
+  than blocking the rest of the batch.
+- **Lazy settle was removed from `GET /api/auctions`, `/api/notifications`, and
+  `/api/users/me/activity`.** Only the single-auction read (`GET
+  /api/auctions/:id`) still settles on demand. Practical effect: a win/loss
+  notification, or an auction disappearing from someone's "My Bids" list as
+  settled, can now lag up to about a minute behind the actual end time, until
+  the once-a-minute cron catches it.
+- **Bids are rejected** on a cancelled or hidden listing, and if the listing's
+  status or `end_time` changed between the bidder loading the page and
+  submitting the bid.
+- **Cancel and edit are refused once `end_time` has passed**, even if the
+  cron hasn't settled the row yet.
+- **The seller's phone number is gone from the public list** and only appears
+  on the auction detail response for a signed-in, authenticated request.
+- **`migrations/005_enable_rls.sql` is new** — see section 3.5. It enables row
+  level security on `users`, `auctions`, and `reports` with no policies added;
+  safe because the Worker always authenticates with the service-role key,
+  which bypasses RLS.
+- **Migration 004 is required before this version**, same as before — see
+  section 3.4. **The owner has confirmed 004 is already applied on
+  production**, so this is a check, not a new step, for this deploy.
+- **New listing photos are much smaller.** Client-side compression now targets
+  1024px on the long edge (was 1600px) and always outputs JPEG, so a typical
+  phone photo lands around 100-150KB instead of up to ~1.9MB — see
+  `src/lib/images.ts`. The server also rejects a brand-new inline image over
+  300KB (400 `IMAGE_TOO_LARGE` on `POST`/`PATCH /api/auctions`), except
+  when it is byte-identical to an image already stored on that listing, so
+  editing an old, larger listing is never blocked by its own existing photos.
+  This does not touch or resize any image already stored.
+- **The `image_url` mirror column is no longer duplicated with a full base64
+  image.** On create/edit it is only written when the first image is a stored
+  `/images/<key>` path (needed for the Open Graph share preview once R2 is
+  on); a `data:` URL first image now leaves it `null`, and every reader falls
+  back to `image_urls[0]`. No migration touches existing rows.
+- **A second daily cron now runs the stale-image cleanup sweep in
+  production** — see "The photo-deleting sweep now runs daily" above.
 
 **Verified:** `npm run lint` (`tsc --noEmit`) exits 0, and `npm test`
-(`vitest run`) passes the whole suite — 357 tests at the time of writing. That
+(`vitest run`) passes the whole suite — 397 tests at the time of writing. That
 total moves as tests are added; what matters is that none fail and that the
 count does not go *down*.
 
 **NOT verified:** every one of those tests runs against an in-memory fake
-of Supabase (`tests/unit/helpers/fake-supabase.ts`), not real Postgres. None
-of the four migrations have ever been run against the live database. The bid
+of Supabase (`tests/unit/helpers/fake-supabase.ts`), not real Postgres. The bid
 lock in particular has never been exercised against real Postgres row
 locking, real PostgREST, or a real pence-denominated value. Treat the
 post-deploy verification checklist in section 6 as mandatory, not optional —
@@ -82,25 +135,29 @@ it is the only thing standing in for that missing coverage.
 
 ## 2. Pre-flight checklist
 
-Do all of this before touching the database or running `wrangler deploy`.
+**Remember: on this project, merging a branch to `main` on GitHub deploys it.**
+Do all of this before you open that merge — not after.
 
-1. **Have ready:** access to the Supabase SQL editor for this project, a
-   Cloudflare account authenticated for this Worker (`npx wrangler login` if
-   you haven't already), the value of the Supabase service role key (from the
-   Supabase dashboard → Project Settings → API), a test account username and
-   password you're willing to use for the post-deploy bid test, and a second
-   test account for the same. Set aside 20-30 minutes uninterrupted — you do
-   not want to leave the migrations half-applied.
+1. **Have ready:** access to the Supabase SQL editor for this project, access
+   to the Cloudflare dashboard for this account, the value of the Supabase
+   service role key (from the Supabase dashboard → Project Settings → API), a
+   test account username and password you're willing to use for the
+   post-deploy bid test, and a second test account for the same. Set aside
+   20-30 minutes uninterrupted — you do not want to leave the migrations
+   half-applied.
 
-2. **Commit to a branch first.** Do not deploy out of an uncommitted working
-   tree. From the repo root:
+2. **Work on a branch, then open a pull request.** Do not push straight to
+   `main` — a push to `main` deploys immediately, before anyone has looked at
+   it. From the repo root:
    ```
    git checkout -b deploy/2026-09-20
    git add -A
-   git commit -m "Deploy: lifecycle, moderation, password reset, money fix"
+   git commit -m "Deploy: lifecycle, moderation, settlement hardening, RLS"
+   git push -u origin deploy/2026-09-20
    ```
-   (Adjust the branch name/date. Review `git status` before the `add -A` —
-   make sure nothing that looks like a secret is about to be staged.)
+   Then open a pull request on GitHub from that branch into `main`. (Adjust
+   the branch name/date. Review `git status` before the `add -A` — make sure
+   nothing that looks like a secret is about to be staged.)
 
 3. **Confirm the test suite passes locally:**
    ```
@@ -111,12 +168,10 @@ Do all of this before touching the database or running `wrangler deploy`.
    `Tests  357 passed (357)` (or all-passed with whatever the current total
    is — a failing or reduced count means don't proceed).
 
-4. **Record the current deployment**, so you have something to roll back to:
-   ```
-   npx wrangler deployments list
-   ```
-   Copy the version ID at the top of the list somewhere safe (a notes app, a
-   comment in your terminal history) before you deploy anything new.
+4. **Record the current deployment**, so you have something to roll back to.
+   Dashboard → **Workers & Pages → msa-auction → Deployments**. Copy the
+   version ID (or note the timestamp) at the top of the list somewhere safe
+   before you merge anything new.
 
 5. **Check the sub-penny condition ahead of migration 004** (full detail in
    section 3.4, but do this now so you're not stuck mid-run):
@@ -125,17 +180,19 @@ Do all of this before touching the database or running `wrangler deploy`.
    ```
    If this returns anything other than `0`, stop here — do not run migration
    004 — and ask before proceeding. See section 3.4 for what a non-zero
-   result means.
+   result means. If you have already confirmed 004 is applied on production
+   (see section 1), this check is informational only — it cannot be undone by
+   not merging.
 
-6. **Check for auctions that must not settle.** Deploying activates
-   settlement (see section 5's cron warning) for every already-expired
-   auction in one batch, immediately and irreversibly. Look at the live site
-   now for any listing that has already ended, or is about to, that should
-   NOT be resolved with a winner (e.g. it was a mistake, or the seller backed
-   out). If you find one, deal with it before you deploy — today's live site
-   has no cancel/hide feature yet, so this may mean asking a committee member
-   with direct Supabase access to update that one row's `status` column by
-   hand, or simply accepting it will settle.
+6. **Check for auctions that must not settle, before you merge.** Merging
+   this branch activates settlement's new rules for every already-expired
+   auction, and that resolution is irreversible. Look at the live site now
+   for any listing that has already ended, or is about to, that should NOT be
+   resolved with a winner (e.g. it was a mistake, or the seller backed out).
+   If you find one, deal with it before you merge — cancel or hide it from
+   the live site if it hasn't already ended, or ask a committee member with
+   Supabase dashboard access to update that one row's `status` column by
+   hand, or simply accept it will settle.
 
 ---
 
@@ -364,7 +421,7 @@ alter table public.reports disable row level security;
 There is deliberately no route in the application that grants admin — a
 self-service "make me admin" endpoint would be the whole vulnerability. You
 have to do this by hand, in the SQL editor, and it must happen before you
-deploy (the admin panel and moderation tools go live the moment the new
+merge (the admin panel and moderation tools go live the moment the new
 Worker ships, and you want an admin account ready to use them).
 
 1. Open `migrations/003_moderation_and_admin.sql` and find the commented-out
@@ -390,47 +447,79 @@ and re-run the `update` with the exact (lowercased) value from that list.
 
 ## 5. Build and deploy
 
-1. From the branch you committed in pre-flight step 2, build:
-   ```
-   npm run build
-   ```
-   This runs `vite build` (produces `./dist`, which `wrangler.toml` serves as
-   static assets) and bundles `server.ts` into `dist/server.cjs` for local
-   use — that bundling step does not execute anything, it's safe.
+Deploys run on Cloudflare's own build servers, triggered by a push or merge to
+`main` on GitHub. You never run a build or deploy command against production
+yourself.
 
-2. If this is the first time deploying this Worker, or the secret has never
-   been set, set the Supabase service role key as an encrypted secret (skip
-   if it's already configured in the Cloudflare dashboard for this Worker):
-   ```
-   npx wrangler secret put SUPABASE_SERVICE_ROLE_KEY
-   ```
-   Paste the key when prompted. Never put this value in `wrangler.toml` —
-   everything under `[vars]` there is plaintext, committed to git, and
-   visible in the dashboard.
+### 5.1 One-time setup — skip if Workers Builds is already connected
 
-3. **Read this before you run the deploy command.** `wrangler.toml` sets
-   `crons = ["* * * * *"]`. This is the first time this cron has ever been
-   active. Within about a minute of deploying — and possibly sooner, since
-   the auction list endpoint also settles on-demand on its first request —
-   every auction whose end time has already passed gets swept into `ended`
-   and assigned a winner, all at once. This is correct behaviour, but it is
-   irreversible: anything that must not settle needs to have been dealt with
-   in pre-flight step 6, before this point, not after.
+Check first: dashboard → **Workers & Pages → msa-auction → Settings →
+Builds**. If it already shows a connected GitHub repository, skip to 5.2.
+Otherwise:
 
-4. Deploy:
-   ```
-   npx wrangler deploy
-   ```
-   Watch the output for the deployed URL and a version ID; note the version
-   ID alongside the one you recorded in pre-flight step 4.
+1. In that same **Settings → Builds** tab, click **Connect** (or **Connect to
+   Git**).
+2. Choose **GitHub**, and authorize the Cloudflare Workers Builds GitHub App
+   for the `dragonfisher29/msa-auction` repository if prompted.
+3. Set **Production branch** to `main`.
+4. Set **Build command** to `npm run build`.
+5. Leave **Deploy command** at its default. Cloudflare runs it on its own
+   build infrastructure after the build succeeds — you never type this
+   command or watch it run locally.
+6. Set **Root directory** to `/`.
+7. Save. The **Worker name** shown in the dashboard for this project must be
+   exactly `msa-auction`, matching `name = "msa-auction"` in `wrangler.toml`
+   — if it doesn't match, builds fail.
 
-5. **Tell the society to reload.** Anyone with the site open in a tab from
-   before this deploy is running old client code that expects image data
-   directly in the auction list response. Against the new API they will see
-   placeholder images and at most 24 listings until they refresh the page.
-   Post a heads-up (Discord, WhatsApp, wherever the committee already talks
-   to members) asking people to reload if anything looks broken, before the
-   bug reports start arriving.
+### 5.2 Every deploy: set the secret (only if it isn't already set)
+
+Dashboard → **Workers & Pages → msa-auction → Settings → Variables and
+Secrets → Add → Secret**, name `SUPABASE_SERVICE_ROLE_KEY`, paste the key,
+save. Skip this if it's already configured — check the same list first.
+
+Never put this value in `wrangler.toml`'s `[vars]` block — everything there
+is plaintext, committed to git, and visible in the dashboard. Note the
+reverse direction too: `[vars]` in `wrangler.toml` is the source of truth for
+plaintext configuration and **overwrites** any plaintext variable you set in
+the dashboard on every build. So edit plaintext vars (`SUPABASE_URL`,
+`MAX_LISTINGS_PER_USER`) in `wrangler.toml`, and edit secrets only in the
+dashboard.
+
+### 5.3 Read this before you merge the pull request
+
+`wrangler.toml` sets `crons = ["* * * * *", "0 3 * * *"]` — two schedules,
+both handled by `scheduled()` in `workers/index.ts`, which tells them apart by
+`event.cron` (see the section above on the photo-deleting sweep). **Cloudflare
+cron schedules run in UTC**, not in the timezone whoever reads this happens to
+be in: `0 3 * * *` is 03:00 UTC every day, which is during the UK's early
+hours whether the clocks are on GMT or BST.
+
+- `* * * * *` (every minute) — settlement, unchanged in shape from before this
+  deploy but with different internals: batched, per-row error handling, and no
+  longer triggered lazily from the list/notifications/activity endpoints — see
+  section 1. Within about a minute of the merge landing — and possibly sooner,
+  since the auction detail endpoint still settles on demand on its first
+  request — every already-expired auction gets swept into `ended` under the
+  new rules, all at once. This is correct behaviour, but it is irreversible:
+  anything that must not settle needs to have been dealt with in pre-flight
+  step 6, **before** you merge, not after.
+- `0 3 * * *` (03:00 UTC daily) — the stale-image cleanup sweep, gated on
+  `ENABLE_STALE_IMAGE_CLEANUP` in `[vars]` (currently `"true"` — see the
+  section above). Also irreversible, on its own 30-day-after-`end_time`
+  schedule rather than triggered by this merge.
+
+### 5.4 Merge to deploy
+
+1. On GitHub, merge the pull request from your branch into `main`.
+2. Watch the build and deploy: dashboard → **Workers & Pages → msa-auction →
+   Deployments**. A new deployment appears for the commit you merged; open it
+   to follow the build log.
+3. Once it shows as live, note its version/deployment ID alongside the one
+   you recorded in pre-flight step 4.
+4. **Tell the society to reload.** Anyone with the site open in a tab from
+   before this deploy is running old client code. Post a heads-up (Discord,
+   WhatsApp, wherever the committee already talks to members) asking people
+   to reload if anything looks broken, before the bug reports start arriving.
 
 ---
 
@@ -468,10 +557,11 @@ Link previews are unaffected: with every listing's first image a `data:` URL,
 live site has today. A `data:` URL is never emitted as `og:image`; every
 crawler rejects them.
 
-**The plan is to deploy without R2 and measure.** The polling fix in this same
-change set is on its own a large reduction in egress, and it may well be
-enough. See section 6 check 6 for what to watch, and **Appendix A** for how to
-turn R2 on later if it is not.
+**The plan is to deploy without R2 and measure.** This change set removes
+image data from the detail and bid responses as well as the list — images now
+load once via the images route — which is on its own a large reduction in
+egress, and it may well be enough. See section 6 check 7 for what to watch,
+and **Appendix A** for how to turn R2 on later if it is not.
 
 ---
 
@@ -522,10 +612,8 @@ none of the automated tests ran against a real database.
    lock is broken against real Postgres — stop and roll back immediately**
    (section 7), you should not leave this live.
 
-4. **Settlement is running.** Tail the live logs:
-   ```
-   npx wrangler tail
-   ```
+4. **Settlement is running.** Watch the live logs: dashboard → **Workers &
+   Pages → msa-auction → Logs** (real-time / observability logs).
    Within a minute (sooner if an auction has already expired), expect a line
    like `[Settle] Ended N auction(s).` Pass: that line appears. Fail: nothing
    after several minutes with a known-expired auction sitting there — check
@@ -587,9 +675,14 @@ none of the automated tests ran against a real database.
 ## 7. Rollback
 
 To revert the Worker to the version you recorded in pre-flight step 4:
-```
-npx wrangler rollback <version-id>
-```
+dashboard → **Workers & Pages → msa-auction → Deployments**, find that
+version in the list, and choose **Rollback**.
+
+**A later merge to `main` will redeploy the new code again.** A rollback in
+the dashboard only changes what's live right now — if the branch you merged
+is still sitting on `main`, the next push or merge (by anyone) puts the new
+version straight back. If the rollback needs to stick, also revert the merge
+commit on GitHub.
 
 **Migrations 001, 002, and 003 are purely additive** (new nullable columns,
 a new table, new indexes) — they are safe to leave in place no matter which
@@ -617,8 +710,9 @@ suspect, and the rollback SQL is in section 3.4.
 | Admin panel doesn't appear for your account | No row has `role = 'admin'` yet, or you logged in before appointing yourself | Re-run section 4, then log out and back in so the client fetches your current role |
 | Password reset links never arrive | There is no mail provider wired up yet — this is a known, interim gap | Use `GET /api/admin/reset-requests` (requires an admin token) to read the pending token and hand the reset link to the student directly |
 | Reporting a listing returns a 500 | Migration 003 wasn't run — the `reports` table doesn't exist | Run migration 003 (section 3.3) |
-| Listing photos have vanished from older auctions | Someone ran the dev server with `ENABLE_STALE_IMAGE_CLEANUP=true` set, which sweeps every listing older than 90 days | There is no recovery — the images are gone. Remove that variable from whatever `.env` it is in; the default is off. See the warning at the top of this document |
-| Creating a listing fails on image upload | `POST /api/images` returning `503 IMAGE_STORAGE_UNAVAILABLE` is expected (there is no R2 bucket) and the client should fall back to storing the image inline — if it does not, the client is out of date | Redeploy the current `dist` build; the fallback lives in the client. Section 5.5 has the full contract |
+| Listing photos have vanished from an ended/cancelled/hidden auction | Expected: the daily cleanup sweep runs in production 30 days after `end_time`, by design — see the section near the top of this document | Not a bug. If it should not have run, set `ENABLE_STALE_IMAGE_CLEANUP = "false"` in `wrangler.toml` and merge to `main` |
+| Listing photos have vanished from an ACTIVE auction, or from something less than 30 days old | Someone ran the local dev server with `ENABLE_STALE_IMAGE_CLEANUP=true` in `.env`, or the Worker's rule/cutoff has a bug | There is no recovery — the images are gone. Remove that variable from `.env` (the local default is off) and check `cleanupStaleImages` in `workers/shared.ts` for a regression |
+| Creating a listing fails on image upload | `POST /api/images` returning `503 IMAGE_STORAGE_UNAVAILABLE` is expected (there is no R2 bucket) and the client should fall back to storing the image inline — if it does not, the client is out of date | Merge `main` again to redeploy the current client build; the fallback lives in the client. Section 5.5 has the full contract |
 | Shared links preview with the MSA logo rather than the listing's photo | Expected with R2 off — every listing's first image is a `data:` URL and no crawler accepts one | Nothing to fix. It resolves for migrated listings if you ever do Appendix A |
 
 ---
@@ -632,9 +726,9 @@ suspect, and the rollback SQL is in section 3.4.
   production API long-term.
 - **Measure Supabase egress before doing anything else about images.** Image
   storage is still base64-in-Postgres and R2 is switched off (section 5.5).
-  That is a deliberate wait-and-see: the polling fix in this deploy may be
-  enough on its own. Follow section 6 check 7 for a week before deciding, and
-  only then read **Appendix A**.
+  That is a deliberate wait-and-see: removing image data from the detail and
+  bid responses in this deploy may be enough on its own. Follow section 6
+  check 7 for a week before deciding, and only then read **Appendix A**.
 - **Outstanding work:** a real mail provider for password reset emails.
 
 ---
@@ -644,7 +738,7 @@ suspect, and the rollback SQL is in section 3.4.
 > **Not part of this deploy. Do not do any of this now.**
 >
 > Come back to this section only if, after watching Supabase egress for a few
-> days (section 6 check 6), it is still uncomfortably close to the 5GB
+> days (section 6 check 7), it is still uncomfortably close to the 5GB
 > allowance. It requires adding a payment method to the Cloudflare account.
 
 R2 charges nothing for egress, so moving the image bytes there and keeping
@@ -660,29 +754,26 @@ only the strings inside it change shape.
 In this order, because a Worker that names a bucket which does not exist fails
 to deploy:
 
-```
-npx wrangler r2 bucket create msa-auction-images
-```
-
-Then uncomment these three lines in `wrangler.toml` (they are there, in a
-commented block that explains all of this too):
-
-```
-[[r2_buckets]]
-binding = "IMAGES"
-bucket_name = "msa-auction-images"
-```
-
-Then redeploy:
-
-```
-npx wrangler deploy
-```
+1. Add a payment method to the Cloudflare account (dashboard → **Manage
+   Account → Billing**) — R2 requires one even to stay inside the free
+   allowance.
+2. Dashboard → **R2 → Create bucket**. Name it `msa-auction-images`.
+3. In `wrangler.toml`, uncomment these three lines (they are there, in a
+   commented block that explains all of this too):
+   ```
+   [[r2_buckets]]
+   binding = "IMAGES"
+   bucket_name = "msa-auction-images"
+   ```
+4. Commit that change, push it through a pull request, and merge to `main`.
+   With Workers Builds, `wrangler.toml` is the source of truth for bindings —
+   the binding only takes effect once this merge deploys, not when the bucket
+   is created.
 
 **No code change is required.** Not in the Worker, not in the client, not in
 the database.
 
-### A.2 What happens immediately after that deploy
+### A.2 What happens immediately after that merge deploys
 
 Nothing breaks, and nothing moves on its own. Specifically:
 
@@ -822,7 +913,7 @@ be for this job: stop, and come back at a quieter hour.
 5. Watch the Supabase egress figure over the following days. It should fall
    to roughly the cost of the JSON API alone.
 
-### A.5 A note on `npm run dev`
+### A.5 A note on `npm run dev` (local development only)
 
 An R2 bucket is a Worker binding, and the Express dev server has no bindings.
 So even after you switch R2 on in production, `npm run dev` keeps returning
@@ -832,15 +923,17 @@ the Worker returns with no binding bound. That is deliberate: the client's
 base64 fallback is driven by that error code, and a fallback that only fires in
 one of the two environments is a fallback nobody has tested.
 
-To exercise real image upload locally, use `npx wrangler dev`, which does
-provide the binding.
+To exercise real image upload locally (**local development only — this never
+touches production**), run `npx wrangler dev` instead of `npm run dev`; it
+does provide the binding.
 
 Reading listings locally is unaffected: both storage forms render.
 
 ### A.6 If you ever need to turn R2 back off
 
-Comment the `[[r2_buckets]]` block out again and redeploy. Listings already
-holding `/images/<key>` paths will show broken images for those entries — the
-bucket is gone — but nothing errors, nothing becomes uneditable, and new
-listings go straight back to storing base64. The validator accepts both forms
+Comment the `[[r2_buckets]]` block out again in `wrangler.toml`, commit,
+push, and merge to `main` to redeploy. Listings already holding
+`/images/<key>` paths will show broken images for those entries — the bucket
+is gone — but nothing errors, nothing becomes uneditable, and new listings go
+straight back to storing base64. The validator accepts both forms
 unconditionally in both directions.
