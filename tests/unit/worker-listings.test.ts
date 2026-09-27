@@ -1192,6 +1192,21 @@ describe('GET /auction/:id - Open Graph injection', () => {
     expect(html).toContain('<meta property="og:url" content="https://msa-auction.test/auction/auc_1" />');
   });
 
+  it('treats $-patterns in listing text literally ($`, $&, $\', $$ are not replacement tokens)', async () => {
+    const title = "Lamp $` and $& and $' and $$ deal";
+    seed([listingRow({ title, description: 'Desc $`', price: 10 })]);
+
+    const { html } = await fetchShare('/auction/auc_1', assetsEnv());
+
+    // Escaped only for HTML (the apostrophe), otherwise verbatim - not expanded into page text.
+    expect(html).toContain('<title>Lamp $` and $&amp; and $&#39; and $$ deal - £10 | MSA Auction</title>');
+    // `$\`` would have spliced everything before </head> in again: exactly one doctype, one <head>.
+    expect(html.match(/<!doctype html>/gi)).toHaveLength(1);
+    expect(html.match(/<head>/g)).toHaveLength(1);
+    expect(html.match(/<title>/g)).toHaveLength(1);
+    expect(html.match(/<\/head>/g)).toHaveLength(1);
+  });
+
   it('shows pence as two digits', async () => {
     seed([listingRow({ price: 12.5 })]);
 

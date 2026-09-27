@@ -936,7 +936,10 @@ export function injectAuctionMeta(html: string, meta: AuctionMetaTags): string {
   const stripped = html.replace(STATIC_TITLE_PATTERN, '').replace(STATIC_META_PATTERN, '');
 
   if (/<\/head>/i.test(stripped)) {
-    return stripped.replace(/<\/head>/i, `  ${block}\n  </head>`);
+    // A replacer FUNCTION, not a string: a replacement string interprets `$&`, `` $` ``, `$'` and
+    // `$$`, and `block` carries listing text a seller typed. "Lamp $` offer" as a string would
+    // splice the whole HTML before </head> into the page; returned from a function it is inert.
+    return stripped.replace(/<\/head>/i, () => `  ${block}\n  </head>`);
   }
 
   return `${block}\n${stripped}`;
