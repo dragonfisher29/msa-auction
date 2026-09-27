@@ -1,6 +1,8 @@
 import { createClient } from '@supabase/supabase-js';
 import {
   AUCTION_DETAIL_COLUMNS,
+  AUCTION_FIRST_IMAGE_COLUMNS,
+  AUCTION_IMAGES_COLUMNS,
   AUCTION_META_COLUMNS,
   AUCTION_OWNER_COLUMNS,
   AUCTION_STATE_COLUMNS,
@@ -16,6 +18,8 @@ import {
   fetchSellerListings,
   hashPassword,
   hideAuction,
+  imageCacheControl,
+  imageListChanged,
   IMAGE_BACKFILL_UNAVAILABLE_MESSAGE,
   IMAGE_CACHE_CONTROL,
   IMAGE_PATH_PREFIX,
@@ -26,6 +30,7 @@ import {
   isBannedUser,
   isBearerTokenAdmin,
   isFailure,
+  isLiveListing,
   isStaleImageCleanupEnabled,
   isStoredImagePath,
   listingBaselineFromRow,
@@ -792,25 +797,42 @@ export default {
       }
 
       try {
-        const { data: row, error } = await supabase
+        // `?first=1` (browse cards): only image 0, extracted in Postgres, so the
+        // rest never leave the database. Without it (the detail gallery): all.
+        const firstOnly = url.searchParams.get('first') === '1';
+
+        // Typed `any`: postgrest-js infers a row type from a literal select string and does not
+        // model the `alias:column->>N` form, so it would not know about `first_image`.
+        const { data: row, error }: { data: any; error: any } = await supabase
           .from('auctions')
-          .select('id,image_urls,status')
+          .select(firstOnly ? AUCTION_FIRST_IMAGE_COLUMNS : AUCTION_IMAGES_COLUMNS)
           .eq('id', auctionImagesMatch[1])
           .maybeSingle();
 
         if (error) throw error;
         if (!row) return jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 });
 
-        const isAdmin = await isBearerTokenAdmin(supabase, request.headers.get('authorization'));
+        // Only a hidden listing needs the admin lookup, so a normal image fetch
+        // costs one query, not two.
+        const isAdmin =
+          String(row.status) === AUCTION_STATUS.hidden &&
+          (await isBearerTokenAdmin(supabase, request.headers.get('authorization')));
         if (!isAuctionVisible(row, isAdmin)) {
           return jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 });
         }
 
-        // This is the heaviest response the API serves - let clients and the
-        // edge keep it briefly. A seller's image edit shows up within 5 minutes.
+        const imageUrls = firstOnly
+          ? typeof row.first_image === 'string' && row.first_image.trim() !== ''
+            ? [row.first_image]
+            : []
+          : toStringArray(row.image_urls);
+
+        // The heaviest response the API serves. A day in the browser cache when
+        // the request names the current images_version, otherwise 5 minutes -
+        // see imageCacheControl for why that can never serve a stale photo.
         return jsonResponse(
-          { imageUrls: toStringArray(row.image_urls) },
-          { headers: { 'Cache-Control': 'public, max-age=300' } },
+          { imageUrls },
+          { headers: { 'Cache-Control': imageCacheControl(row, url.searchParams.get('v')) } },
         );
       } catch (error) {
         return jsonResponse(getErrorMessageAndCode('Failed to load auction images.', 'FETCH_AUCTION_IMAGES_FAILED', error), {
@@ -828,11 +850,34 @@ export default {
       try {
         const auctionId = singleAuctionMatch[1];
 
+        // This route is reachable anonymously: NO Authorization header means an
+        // anonymous visitor. But a Bearer token that is PRESENT and does not
+        // resolve is a dead session - most often because signing in on another
+        // device rotated `users.token` - and is answered 401 SESSION_EXPIRED
+        // rather than silently downgraded to anonymous. Downgrading it made a
+        // signed-in client wait forever for a phone number the server had
+        // decided not to send, with nothing telling it to sign in again.
+        const authHeader = request.headers.get('authorization') ?? '';
+        let requester: any = null;
+        // `Headers` trims values, so "Bearer " + blank arrives as the bare word "Bearer":
+        // still a Bearer header, just one with no usable token.
+        if (authHeader === 'Bearer' || authHeader.startsWith('Bearer ')) {
+          const token = authHeader.slice('Bearer'.length).trim();
+          requester = token ? await getAuthenticatedUser(supabase, token) : null;
+          if (!requester) {
+            return jsonResponse(makeError('Your session has expired. Please sign in again.', 'SESSION_EXPIRED'), {
+              status: 401,
+            });
+          }
+        }
+        const isAdmin = isAdminUser(requester);
+
         // Slim row (no image payload) - see AUCTION_DETAIL_COLUMNS. Any
         // non-hidden listing is returned whatever its status; `status` (with
         // `expired` derived in mapListingRow) tells the UI Sold / Expired.
         // There is no settlement any more, so this read writes nothing.
-        const { data: row, error } = await supabase
+        // Typed `any`: the column list is a computed string, which postgrest-js cannot parse.
+        const { data: row, error }: { data: any; error: any } = await supabase
           .from('auctions')
           .select(AUCTION_DETAIL_COLUMNS)
           .eq('id', auctionId)
@@ -841,22 +886,6 @@ export default {
         if (error) throw error;
         if (!row) return jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 });
 
-        // Resolved once, from the same lookup: whether the caller is an admin
-        // (for the hidden-listing check below) and whether they are signed in
-        // at all (for whether phoneNumber goes on the wire). A missing or dead
-        // token resolves both to false
-        // rather than an error, exactly like isBearerTokenAdmin, since this
-        // route is intentionally reachable by an anonymous visitor.
-        const authHeader = request.headers.get('authorization') ?? '';
-        let requester: any = null;
-        if (authHeader.startsWith('Bearer ')) {
-          const token = authHeader.slice('Bearer '.length).trim();
-          if (token) {
-            requester = await getAuthenticatedUser(supabase, token);
-          }
-        }
-        const isAdmin = isAdminUser(requester);
-
         // A hidden listing is invisible to everyone but an admin - it must not
         // survive a takedown via its direct link. Reported the same as an
         // unknown id so a probe cannot tell "hidden" from "never existed".
@@ -864,9 +893,18 @@ export default {
           return jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 });
         }
 
-        // The seller's WhatsApp number goes on the wire only for a signed-in
-        // caller - an anonymous visitor viewing a listing cannot harvest it.
-        return jsonResponse({ auction: mapListingRow(row, { includePhone: Boolean(requester) }) });
+        // The seller's WhatsApp number goes on the wire only when all of:
+        //   - the caller is signed in (an anonymous visitor cannot harvest it),
+        //   - the caller is not banned (a ban must not keep this one door open),
+        //   - the listing is LIVE - or the caller is its seller or an admin. Once a
+        //     listing is sold, withdrawn, expired or taken down nobody needs to
+        //     contact the seller about it, so the number stops being published.
+        const includePhone =
+          Boolean(requester) &&
+          !isBannedUser(requester) &&
+          (isLiveListing(row) || requester.id === (row.seller_id ?? row.sellerId) || isAdmin);
+
+        return jsonResponse({ auction: mapListingRow(row, { includePhone }) });
       } catch (error) {
         return jsonResponse(getErrorMessageAndCode('Failed to load auction.', 'FETCH_AUCTION_FAILED', error), { status: 500 });
       }
@@ -920,6 +958,11 @@ export default {
           image_url: imageUrlMirror(validated.data.imageUrls[0]),
           image_urls: validated.data.imageUrls,
           price: validated.data.price,
+          // A new version only when the photos actually changed, so a title or
+          // price edit does not make every viewer re-download the images.
+          ...(imageListChanged(validated.data.imageUrls, toStringArray(row.image_urls ?? row.imageUrls))
+            ? { images_version: now }
+            : {}),
         };
 
         const { data: updated, error: updateError } = await guardLive(
@@ -1092,6 +1135,7 @@ export default {
           // still carries the full first image via `image_urls`.
           image_url: imageUrlMirror(validated.data.imageUrls[0]),
           image_urls: validated.data.imageUrls,
+          images_version: now,
           created_at: now,
           expires_at: now + listingTtlMs(env),
           sold_at: null,
@@ -1129,6 +1173,7 @@ export default {
           reporterId: auth.user.id,
           reason: body.reason,
           details: body.details,
+          reporterIsAdmin: isAdminUser(auth.user),
         });
 
         if (isFailure(result)) {

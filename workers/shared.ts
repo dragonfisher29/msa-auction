@@ -199,9 +199,11 @@ export async function cleanupStaleImages(supabase: any, now: number = Date.now()
       return 0;
     }
 
+    // images_version is bumped so a browser that cached these images under the old version
+    // stops being served them (see imageCacheControl).
     const { error: updateError } = await supabase
       .from('auctions')
-      .update({ image_url: null, image_urls: [] })
+      .update({ image_url: null, image_urls: [], images_version: now })
       .in('id', ids)
       .lt('expires_at', cutoff);
 
@@ -521,6 +523,7 @@ export const AUCTION_LIST_COLUMNS = [
   'status',
   'category',
   'image_count',
+  'images_version',
   'created_at',
   'expires_at',
   'sold_at',
@@ -539,6 +542,58 @@ export const AUCTION_DETAIL_COLUMNS = `${AUCTION_LIST_COLUMNS},phone_number`;
  * the response hands the edited listing straight back to the edit form.
  */
 export const AUCTION_OWNER_COLUMNS = `${AUCTION_DETAIL_COLUMNS},image_url,image_urls`;
+
+/** `GET /api/auctions/:id/images` - every image, plus what the visibility and cache checks need. */
+export const AUCTION_IMAGES_COLUMNS = 'id,status,images_version,image_urls';
+
+/**
+ * `GET /api/auctions/:id/images?first=1` - the FIRST image only, for a browse card.
+ *
+ * `first_image:image_urls->>0` is PostgREST's JSON-operator select with an alias: Postgres
+ * extracts element 0 of the jsonb array itself, and only that one string crosses the wire. The
+ * other images never leave the database, which is the point - a card shows one photo, and each
+ * inline photo is up to ~400 KB of base64 of Supabase egress.
+ */
+export const AUCTION_FIRST_IMAGE_COLUMNS = 'id,status,images_version,first_image:image_urls->>0';
+
+/** Served for a request whose `?v=` matches the listing's current images_version. */
+export const IMAGE_RESPONSE_CACHE_LONG = 'public, max-age=86400';
+/** Served for an unversioned or out-of-date request: the old 5-minute window. */
+export const IMAGE_RESPONSE_CACHE_SHORT = 'public, max-age=300';
+/** A hidden listing's images (only ever served to an admin) are never stored by any cache. */
+export const IMAGE_RESPONSE_CACHE_PRIVATE = 'private, no-store';
+
+/**
+ * The `Cache-Control` for an images response.
+ *
+ * A browser may keep a listing's images for a DAY only when the request named the listing's
+ * CURRENT images_version (`?v=`). The version changes whenever the images do, and clients read it
+ * off the (uncached) list/detail rows, so the next view after an edit asks for a new URL and a
+ * day-long cache can never pin an old photo. A request with no `v`, a malformed one, or an
+ * out-of-date one gets only the old 5-minute window, so a stale or older client degrades to
+ * today's behaviour rather than to a day of staleness.
+ */
+export function imageCacheControl(row: any, requestedVersion: string | null): string {
+  if (String(row?.status ?? '') === AUCTION_STATUS.hidden) {
+    return IMAGE_RESPONSE_CACHE_PRIVATE;
+  }
+
+  const current = toEpochMs(row?.images_version) ?? 0;
+  if (requestedVersion !== null && /^\d{1,16}$/.test(requestedVersion) && Number(requestedVersion) === current) {
+    return IMAGE_RESPONSE_CACHE_LONG;
+  }
+
+  return IMAGE_RESPONSE_CACHE_SHORT;
+}
+
+/** True when an edit's image list differs from what is stored (order matters: [0] is the cover). */
+export function imageListChanged(next: readonly string[], stored: readonly string[]): boolean {
+  if (next.length !== stored.length) {
+    return true;
+  }
+  // `!==` on two strings of equal length is a memcmp, not a scan per character in JS.
+  return next.some((value, index) => value !== stored[index]);
+}
 
 /** What the ownership / state checks on DELETE and mark-sold need, and nothing heavier. */
 export const AUCTION_STATE_COLUMNS = 'id,seller_id,status,expires_at';
@@ -581,6 +636,12 @@ export interface AuctionSummary {
   status: ListingStatus;
   category: string;
   imageCount: number;
+  /**
+   * Epoch ms of the last change to this listing's images; 0 = unchanged since v1. Clients pass it
+   * as `?v=` to `GET /api/auctions/:id/images` so the response can be cached for a day and still
+   * never be stale - see `imageCacheControl`.
+   */
+  imagesVersion: number;
   imageUrl?: string;
   imageUrls?: string[];
   createdAt: number;
@@ -620,6 +681,7 @@ export function mapListingRow(row: any, options: MapListingOptions = {}): Auctio
     status: deriveListingStatus(row, now),
     category: row.category ?? DEFAULT_LISTING_CATEGORY,
     imageCount,
+    imagesVersion: toEpochMs(row.images_version ?? row.imagesVersion) ?? 0,
     createdAt,
     // A NULL expiry (which migration 006's trigger prevents) is reported as the creation time:
     // consistent with the derived `expired` status such a row gets, rather than a 1970 date.
@@ -936,7 +998,10 @@ export function injectAuctionMeta(html: string, meta: AuctionMetaTags): string {
   const stripped = html.replace(STATIC_TITLE_PATTERN, '').replace(STATIC_META_PATTERN, '');
 
   if (/<\/head>/i.test(stripped)) {
-    return stripped.replace(/<\/head>/i, `  ${block}\n  </head>`);
+    // A replacer FUNCTION, not a string: a replacement string interprets `$&`, `` $` ``, `$'` and
+    // `$$`, and `block` carries listing text a seller typed. "Lamp $` offer" as a string would
+    // splice the whole HTML before </head> into the page; returned from a function it is inert.
+    return stripped.replace(/<\/head>/i, () => `  ${block}\n  </head>`);
   }
 
   return `${block}\n${stripped}`;
@@ -1753,7 +1818,15 @@ export interface CreateReportResult {
  */
 export async function createAuctionReport(
   supabase: any,
-  options: { auctionId: string; reporterId: string; reason: unknown; details?: unknown; now?: number },
+  options: {
+    auctionId: string;
+    reporterId: string;
+    reason: unknown;
+    details?: unknown;
+    now?: number;
+    /** Resolved from the reporter's DATABASE ROW by the caller. Only an admin may see a hidden listing. */
+    reporterIsAdmin?: boolean;
+  },
 ): Promise<SharedResult<CreateReportResult>> {
   const reason = typeof options.reason === 'string' ? options.reason.trim().toLowerCase() : '';
 
@@ -1768,7 +1841,7 @@ export async function createAuctionReport(
 
   const { data: auction, error: auctionError } = await supabase
     .from('auctions')
-    .select('id,title,seller_id,seller_name')
+    .select('id,title,seller_id,seller_name,status')
     .eq('id', options.auctionId)
     .maybeSingle();
 
@@ -1776,7 +1849,10 @@ export async function createAuctionReport(
     throw auctionError;
   }
 
-  if (!auction) {
+  // A hidden listing answers exactly like one that never existed, for everyone but an admin -
+  // the same rule as the detail route (`isAuctionVisible`). Otherwise this route would confirm a
+  // takedown exists and echo its title and seller back in `report`.
+  if (!auction || !isAuctionVisible(auction, Boolean(options.reporterIsAdmin))) {
     return fail(404, 'Auction not found', 'AUCTION_NOT_FOUND');
   }
 
@@ -2115,7 +2191,22 @@ export function isStoredImagePath(value: unknown): boolean {
  * long-standing `data:image/...` value.
  */
 export function isDataImageUrl(value: unknown): boolean {
-  return typeof value === 'string' && value.trim().toLowerCase().startsWith('data:image/');
+  // Lower-cases the 11-character prefix only. `value.toLowerCase()` would copy the whole string -
+  // megabytes of base64 - on every create and edit.
+  return typeof value === 'string' && value.trimStart().slice(0, 11).toLowerCase() === 'data:image/';
+}
+
+/** The strict prefix, tested against the first few dozen characters only - see below. */
+const STRICT_NEW_DATA_IMAGE_PREFIX = /^data:image\/(?:jpeg|png|webp|gif);base64,/i;
+
+/** Positions inspected at each end of the payload, and spread evenly through the middle. */
+const BASE64_SAMPLE_SIZE = 64;
+
+/** `A-Z a-z 0-9 + /` - the base64 alphabet, without padding. */
+function isBase64CharCode(code: number): boolean {
+  return (
+    (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || (code >= 48 && code <= 57) || code === 43 || code === 47
+  );
 }
 
 /**
@@ -2135,11 +2226,59 @@ export function isDataImageUrl(value: unknown): boolean {
  * used to make that function's regex fail to match and silently return 0 - i.e. "free" storage
  * for an arbitrarily large inline image. None of those match this pattern, so all three are now
  * refused outright as a NEW image, at any size.
+ *
+ * CPU BUDGET. This runs on every create/edit over up to ~1.2 MB of base64, inside a Workers free
+ * plan request capped at 10 ms of CPU. It used to be one anchored regex over the whole string
+ * (`^data:image/...;base64,[a-z0-9+/]+={0,2}$`), which walks every byte. It is now O(1):
+ *   - the exact prefix (type whitelist, no extra parameters) is matched on the first 32 chars;
+ *   - up to two `=` of padding are allowed, at the very end only;
+ *   - the base64 alphabet is checked on the first and last 64 payload chars and on 64 positions
+ *     spread evenly through the middle.
+ * The prefix check is the security-relevant part and stays exact: it is what closes the size-cap
+ * bypass above, and what keeps anything but a whitelisted raster type out. The sampled alphabet
+ * check is a sanity check, not a guarantee - a stray invalid character between two sample points
+ * gets through. That is acceptable because this string is only ever used as an `<img src>` (a
+ * corrupt `data:image/jpeg` payload fails to decode; it cannot execute), and its SIZE is measured
+ * from its length, which such a character can only over-estimate.
  */
-const STRICT_NEW_DATA_IMAGE_PATTERN = /^data:image\/(jpeg|png|webp|gif);base64,[a-z0-9+/]+={0,2}$/i;
-
 export function isStrictNewDataImageUrl(value: unknown): boolean {
-  return typeof value === 'string' && STRICT_NEW_DATA_IMAGE_PATTERN.test(value.trim());
+  if (typeof value !== 'string') {
+    return false;
+  }
+
+  const trimmed = value.trim();
+  const prefix = STRICT_NEW_DATA_IMAGE_PREFIX.exec(trimmed.slice(0, 32));
+  if (!prefix) {
+    return false;
+  }
+
+  const start = prefix[0].length;
+  let end = trimmed.length;
+  // Up to two `=` of padding, and only at the very end.
+  for (let padding = 0; padding < 2 && end > start && trimmed.charCodeAt(end - 1) === 61; padding += 1) {
+    end -= 1;
+  }
+
+  const payloadLength = end - start;
+  if (payloadLength <= 0) {
+    return false;
+  }
+
+  const headEnd = Math.min(end, start + BASE64_SAMPLE_SIZE);
+  for (let index = start; index < headEnd; index += 1) {
+    if (!isBase64CharCode(trimmed.charCodeAt(index))) return false;
+  }
+
+  for (let index = Math.max(start, end - BASE64_SAMPLE_SIZE); index < end; index += 1) {
+    if (!isBase64CharCode(trimmed.charCodeAt(index))) return false;
+  }
+
+  const stride = Math.max(1, Math.floor(payloadLength / BASE64_SAMPLE_SIZE));
+  for (let index = start; index < end; index += stride) {
+    if (!isBase64CharCode(trimmed.charCodeAt(index))) return false;
+  }
+
+  return true;
 }
 
 /**
@@ -2175,18 +2314,22 @@ export function estimateDataUrlBytes(value: unknown): number {
   }
 
   const trimmed = value.trim();
-  const match = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+)?;base64,([\s\S]*)$/i.exec(trimmed);
-  if (!match) {
+  // The header is matched on the first 128 characters only, and the payload is measured by
+  // arithmetic on the string length - no regex, copy or whitespace strip walks the payload (see
+  // the CPU note on `isStrictNewDataImageUrl`). Whitespace inside the payload is therefore counted
+  // as if it were data, which can only OVER-estimate: never an under-count, so never a bypass.
+  const header = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+)?;base64,/i.exec(trimmed.slice(0, 128));
+  if (!header) {
     return isDataImageUrl(trimmed) ? trimmed.length : 0;
   }
 
-  const base64 = (match[2] ?? '').replace(/\s+/g, '');
-  if (!base64) {
+  const payloadLength = trimmed.length - header[0].length;
+  if (payloadLength <= 0) {
     return 0;
   }
 
-  const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
-  return Math.max(0, Math.floor((base64.length * 3) / 4) - padding);
+  const padding = trimmed.endsWith('==') ? 2 : trimmed.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.floor((payloadLength * 3) / 4) - padding);
 }
 
 /**

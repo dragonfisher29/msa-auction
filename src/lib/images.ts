@@ -31,41 +31,77 @@ function sanitize(urls: unknown): string[] {
 }
 
 /**
- * Resolves the image URLs for one auction, fetching `GET /api/auctions/:id/images` at most once
- * per id (concurrent callers share the same in-flight request). A failed or non-OK response
- * resolves to `[]` and is NOT cached, so a transient network error can be retried the next time
- * the card comes into view rather than being stuck empty for the rest of the session.
+ * The listing's `imagesVersion` (epoch ms of its last photo change, 0 = unchanged since v1), or
+ * `undefined` when the row does not carry one. Read defensively because `AuctionItem` in
+ * `src/types.ts` does not declare the field yet.
  */
-export function fetchAuctionImages(auctionId: string): Promise<string[]> {
-  const cached = imageCache.get(auctionId);
+export function imagesVersionOf(auction: unknown): number | undefined {
+  const value = (auction as { imagesVersion?: unknown } | null)?.imagesVersion;
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+export interface FetchAuctionImagesOptions {
+  /**
+   * Only the cover photo (`?first=1`): what a browse card shows. The server extracts it in the
+   * database, so the listing's other photos are never downloaded for a card.
+   */
+  first?: boolean;
+  /**
+   * The listing's `imagesVersion`, sent as `?v=`. When it matches the server's current version
+   * the response may be cached by the browser for a day; a new version (the seller changed the
+   * photos) is a new URL, so it can never be served stale. Omitted = the short 5-minute cache.
+   */
+  version?: number;
+}
+
+/**
+ * Resolves the image URLs for one auction, fetching `GET /api/auctions/:id/images` at most once
+ * per (id, version, first-only) - concurrent callers share the same in-flight request. A cached
+ * FULL set also answers a first-only request, so opening a listing and scrolling back past its
+ * card costs nothing extra. A failed or non-OK response resolves to `[]` and is NOT cached, so a
+ * transient network error can be retried the next time the card comes into view rather than
+ * being stuck empty for the rest of the session.
+ */
+export function fetchAuctionImages(auctionId: string, options: FetchAuctionImagesOptions = {}): Promise<string[]> {
+  const first = Boolean(options.first);
+  const version = options.version;
+  const fullKey = `${auctionId}|${version ?? ''}|all`;
+  const key = first ? `${auctionId}|${version ?? ''}|first` : fullKey;
+
+  const cached = imageCache.get(key) ?? (first ? imageCache.get(fullKey)?.slice(0, 1) : undefined);
   if (cached) {
     return Promise.resolve(cached);
   }
 
-  const pending = inFlight.get(auctionId);
+  const pending = inFlight.get(key);
   if (pending) {
     return pending;
   }
 
+  const params = new URLSearchParams();
+  if (first) params.set('first', '1');
+  if (version !== undefined) params.set('v', String(version));
+  const query = params.toString();
+
   const request = (async () => {
     try {
-      const res = await apiFetch(`/api/auctions/${auctionId}/images`);
+      const res = await apiFetch(`/api/auctions/${auctionId}/images${query ? `?${query}` : ''}`);
       if (!res.ok) {
         return [];
       }
       const data = await res.json().catch(() => null);
       const urls = sanitize(data?.imageUrls);
-      imageCache.set(auctionId, urls);
+      imageCache.set(key, urls);
       return urls;
     } catch (err) {
       console.warn(`Could not load images for auction ${auctionId}:`, err);
       return [];
     } finally {
-      inFlight.delete(auctionId);
+      inFlight.delete(key);
     }
   })();
 
-  inFlight.set(auctionId, request);
+  inFlight.set(key, request);
   return request;
 }
 

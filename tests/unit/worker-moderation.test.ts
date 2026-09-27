@@ -419,6 +419,46 @@ describe('POST /api/auctions/:id/report', () => {
     expect(missing.status).toBe(404);
     expect(missing.body.code).toBe('AUCTION_NOT_FOUND');
   });
+
+  it('answers a hidden listing exactly like a missing one for a non-admin, echoing nothing about it', async () => {
+    const title = 'Taken-down scam lamp';
+    const db = seed({ auctions: [auctionRow({ status: 'hidden', title })] });
+
+    const hidden = await callJson('POST', '/api/auctions/auc_1/report', { token: MEMBER.token, body: { reason: 'scam' } });
+    const ghost = await callJson('POST', '/api/auctions/auc_ghost/report', { token: MEMBER.token, body: { reason: 'scam' } });
+
+    expect(hidden.status).toBe(404);
+    expect(hidden.body).toEqual(ghost.body);
+    expect(JSON.stringify(hidden.body)).not.toContain(title);
+    expect(JSON.stringify(hidden.body)).not.toContain(SELLER.name);
+    expect(db.rows('reports')).toHaveLength(0);
+  });
+
+  it('refuses a hidden listing even when the member already has an open report on it', async () => {
+    seed({
+      auctions: [auctionRow({ status: 'hidden' })],
+      reports: [
+        {
+          id: 'rep_1', auction_id: 'auc_1', reporter_id: MEMBER.id, reason: 'scam', details: null,
+          created_at: NOW - 1000, status: 'open', resolved_by: null, resolved_at: null,
+        },
+      ],
+    });
+
+    const result = await callJson('POST', '/api/auctions/auc_1/report', { token: MEMBER.token, body: { reason: 'scam' } });
+
+    expect(result.status).toBe(404);
+    expect(JSON.stringify(result.body)).not.toContain('Vintage lamp');
+  });
+
+  it('still lets an admin report a hidden listing', async () => {
+    seed({ auctions: [auctionRow({ status: 'hidden' })] });
+
+    const result = await callJson('POST', '/api/auctions/auc_1/report', { token: ADMIN.token, body: { reason: 'scam' } });
+
+    expect(result.status).toBe(200);
+    expect(result.body.report.auctionTitle).toBe('Vintage lamp');
+  });
 });
 
 describe('GET /api/admin/reports', () => {
@@ -615,13 +655,18 @@ describe('a hidden listing is invisible to everyone but an admin', () => {
     expect(result.body.auction).toMatchObject({ id: 'auc_1', status: 'hidden' });
   });
 
-  it('never errors out on a garbage or expired token - it just falls back to "not an admin"', async () => {
-    seed({ auctions: [auctionRow({ status: 'hidden' })] });
+  it('answers a dead token 401 before looking at the listing, so it is no oracle for hidden ids', async () => {
+    seed({ auctions: [auctionRow({ status: 'hidden' }), auctionRow({ id: 'auc_2' })] });
 
-    const result = await callJson('GET', '/api/auctions/auc_1', { token: 'tok_does_not_exist' });
+    const hidden = await callJson('GET', '/api/auctions/auc_1', { token: 'tok_does_not_exist' });
+    const visible = await callJson('GET', '/api/auctions/auc_2', { token: 'tok_does_not_exist' });
+    const missing = await callJson('GET', '/api/auctions/auc_ghost', { token: 'tok_does_not_exist' });
 
-    expect(result.status).toBe(404);
-    expect(result.body.code).toBe('AUCTION_NOT_FOUND');
+    for (const result of [hidden, visible, missing]) {
+      expect(result.status).toBe(401);
+      expect(result.body.code).toBe('SESSION_EXPIRED');
+    }
+    expect(hidden.body).toEqual(missing.body);
   });
 
   it('refuses to serve images for a hidden listing to a non-admin, but still serves them to an admin', async () => {

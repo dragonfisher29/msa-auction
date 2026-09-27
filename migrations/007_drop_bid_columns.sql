@@ -47,7 +47,7 @@
 --
 -- KEPT: everything the new Worker reads - id, title, description,
 -- phone_number, price, seller_id, seller_name, status, category, image_url,
--- image_urls, image_count, created_at, expires_at, sold_at, and the
+-- image_urls, image_count, images_version, created_at, expires_at, sold_at, and the
 -- hidden_reason / hidden_by / hidden_at takedown record.
 --
 -- NO DATABASE FUNCTIONS are dropped other than 006's trigger function: no
@@ -102,13 +102,27 @@ declare
   has_legacy boolean;
   affected integer;
 begin
-  select count(*) = 4 into has_legacy
+  select count(*) = 7 into has_legacy
     from information_schema.columns
    where table_schema = 'public' and table_name = 'auctions'
-     and column_name in ('starting_price', 'current_price', 'end_time', 'winner_id');
+     and column_name in ('starting_price', 'current_price', 'end_time', 'winner_id',
+                         'winning_bid', 'highest_bidder_id', 'bids');
 
   if has_legacy then
-    execute 'update public.auctions set price = coalesce(starting_price, current_price) where price is null';
+    -- LEGACY PRICE RULE - identical to 006 step 4a (winning bid, else current
+    -- highest bid, else starting price).
+    execute $sql$
+      update public.auctions
+         set price = case
+               when winner_id is not null
+                 then coalesce(winning_bid, current_price, starting_price)
+               when highest_bidder_id is not null
+                 or (jsonb_typeof(bids) = 'array' and jsonb_array_length(bids) > 0)
+                 then coalesce(current_price, starting_price)
+               else coalesce(starting_price, current_price)
+             end
+       where price is null
+    $sql$;
     get diagnostics affected = row_count;
     raise notice '007: backfilled price on % row(s)', affected;
 

@@ -6,8 +6,9 @@
 -- WHAT THIS DOES (ADDITIVE - nothing is dropped, no bid data is touched)
 --   1. Preflight: stops with a clear error, changing nothing, if the live
 --      `auctions` table does not look the way this file assumes.
---   2. Adds `auctions.price numeric(12,2)`, `auctions.expires_at bigint` and
---      `auctions.sold_at bigint`. Timestamps are epoch MILLISECONDS in a bigint,
+--   2. Adds `auctions.price numeric(12,2)`, `auctions.expires_at bigint`,
+--      `auctions.sold_at bigint` and `auctions.images_version bigint`.
+--      Timestamps are epoch MILLISECONDS in a bigint,
 --      matching every other timestamp in this schema (`created_at`, `end_time`,
 --      `hidden_at`, `users.reset_token_expires` - see 002 and 003).
 --   3. Drops NOT NULL (only where it exists) on the bid-era columns the new
@@ -15,7 +16,13 @@
 --      cannot fail on a constraint. Dropping NOT NULL is not destructive: no
 --      value changes, and the old Worker always writes these columns anyway.
 --   4. Backfills every existing row:
---        price      <- starting_price (the old starting price becomes the price)
+--        price (OWNER DECISION: a listing converts at what buyers had already
+--               bid, not at the seller's opening ask):
+--          had a winner     -> the winning bid (winning_bid, else current_price)
+--          has bids         -> the current highest bid (current_price)
+--          no bids          -> starting_price
+--          The same rule, `LEGACY PRICE RULE` below, is used by the backfill,
+--          the transitional trigger and 007's catch-up. Keep the three in step.
 --        active     -> expires_at = now + 30 days
 --        ended WITH a winner    -> status 'sold', sold_at = end_time,
 --                                  expires_at = end_time
@@ -48,10 +55,15 @@
 --   - a listing created in that window would have NULL price / expires_at and
 --     would be invisible on the new browse page;
 --   - an old-style edit of starting_price would leave price stale;
+--   - a bid the old Worker records in that window would not move the price,
+--     so the listing would convert below what the buyer had already offered;
 --   - an auction the old cron settles in that window would keep a 30-day
 --     expiry and no sold_at.
--- The trigger is a no-op for every write the NEW Worker makes (it always sets
--- price and expires_at itself and never writes starting_price or 'ended').
+-- The trigger is a no-op for every write the NEW Worker makes: it always sets
+-- price and expires_at itself, and never writes a bid-era column or 'ended'.
+-- The trigger only re-derives price on an UPDATE that changes a bid-era column
+-- (starting_price, current_price, winning_bid, winner_id, highest_bidder_id,
+-- bids) WITHOUT setting price itself - i.e. only for old-Worker writes.
 --
 -- SAFE TO RE-RUN. Columns and indexes use IF NOT EXISTS; every backfill only
 -- touches rows whose expires_at / price is still NULL; the trigger and the
@@ -80,7 +92,8 @@ declare
 begin
   foreach required_column in array array[
     'id', 'status', 'seller_id', 'created_at', 'end_time',
-    'starting_price', 'current_price', 'winner_id', 'image_count'
+    'starting_price', 'current_price', 'winning_bid', 'winner_id',
+    'highest_bidder_id', 'bids', 'image_count'
   ]
   loop
     select data_type into column_type
@@ -102,6 +115,11 @@ begin
     if required_column = 'status' and column_type <> 'text' and column_type <> 'character varying' then
       raise exception '006 preflight: public.auctions.status is %, expected text. Nothing was changed.', column_type;
     end if;
+
+    -- The legacy price rule reads the bid history with jsonb functions.
+    if required_column = 'bids' and column_type <> 'jsonb' then
+      raise exception '006 preflight: public.auctions.bids is %, expected jsonb. Nothing was changed.', column_type;
+    end if;
   end loop;
 end
 $$;
@@ -118,6 +136,14 @@ alter table public.auctions add column if not exists expires_at bigint;
 
 -- sold_at: epoch ms, set when the seller marks the listing sold. NULL otherwise.
 alter table public.auctions add column if not exists sold_at bigint;
+
+-- images_version: epoch ms of the last change to image_urls, set by the new
+-- Worker on create, on an edit that changes the images, and when the cleanup
+-- sweep blanks them. Clients put it in the image URL (`?v=`), so a browser may
+-- cache a listing's images for a day and still sees an edit immediately.
+-- NULL = unchanged since v1 (reported as 0). Nullable with no default, so
+-- adding it is metadata-only: no table rewrite, no backfill.
+alter table public.auctions add column if not exists images_version bigint;
 
 -- ---------------------------------------------------------------------------
 -- 3. Relax NOT NULL on the bid-era columns the new Worker does not write
@@ -176,9 +202,22 @@ $$;
 -- "now" in epoch milliseconds, the unit every timestamp column uses.
 -- 30 days = 2,592,000,000 ms.
 
--- 4a. The old starting price becomes the fixed price.
+-- 4a. LEGACY PRICE RULE (owner decision). A listing converts at what buyers had
+--     already offered: the winning bid if it had a winner, the current highest
+--     bid if it has bids, otherwise the starting price. "Has bids" is a highest
+--     bidder on record OR a non-empty bid history, because resolveWinner in the
+--     old Worker tolerated either one being missing. starting_price comes first
+--     for a no-bid row because a pre-004 row never bid on can hold a NULL
+--     current_price. Mirrored in msa_v1_transition_sync below and in 007.
 update public.auctions
-   set price = coalesce(starting_price, current_price)
+   set price = case
+         when winner_id is not null
+           then coalesce(winning_bid, current_price, starting_price)
+         when highest_bidder_id is not null
+           or (jsonb_typeof(bids) = 'array' and jsonb_array_length(bids) > 0)
+           then coalesce(current_price, starting_price)
+         else coalesce(starting_price, current_price)
+       end
  where price is null;
 
 -- 4b. Currently active auctions get a full 30 days from now as fixed-price listings.
@@ -244,14 +283,33 @@ set search_path = pg_catalog
 as $$
 declare
   now_ms bigint := (extract(epoch from clock_timestamp()) * 1000)::bigint;
+  -- LEGACY PRICE RULE - identical to step 4a. See there for the reasoning.
+  derived_price numeric(12,2) := case
+    when new.winner_id is not null
+      then coalesce(new.winning_bid, new.current_price, new.starting_price)
+    when new.highest_bidder_id is not null
+      or (jsonb_typeof(new.bids) = 'array' and jsonb_array_length(new.bids) > 0)
+      then coalesce(new.current_price, new.starting_price)
+    else coalesce(new.starting_price, new.current_price)
+  end;
 begin
-  -- price follows starting_price for rows the OLD Worker writes.
+  -- price tracks the bid-era columns for rows the OLD Worker writes:
+  --   - an old INSERT never sets price;
+  --   - an old UPDATE (edit of starting_price, a new bid, a settle) changes a
+  --     bid-era column and leaves price alone.
+  -- The NEW Worker never writes a bid-era column, so its own price is never
+  -- overridden here.
   if new.price is null then
-    new.price := coalesce(new.starting_price, new.current_price);
+    new.price := derived_price;
   elsif tg_op = 'UPDATE'
-        and new.starting_price is distinct from old.starting_price
-        and new.price is not distinct from old.price then
-    new.price := new.starting_price;
+        and new.price is not distinct from old.price
+        and (   new.starting_price    is distinct from old.starting_price
+             or new.current_price     is distinct from old.current_price
+             or new.winning_bid       is distinct from old.winning_bid
+             or new.winner_id         is distinct from old.winner_id
+             or new.highest_bidder_id is distinct from old.highest_bidder_id
+             or new.bids              is distinct from old.bids) then
+    new.price := coalesce(derived_price, new.price);
   end if;
 
   if new.status = 'ended' then

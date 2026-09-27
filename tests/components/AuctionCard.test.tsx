@@ -48,13 +48,13 @@ describe('AuctionCard image loading', () => {
     __resetImageCacheForTests();
   });
 
-  it('fetches GET /api/auctions/:id/images exactly once even when re-rendered with a new auction object', async () => {
+  it('fetches the cover photo only (?first=1) exactly once even when re-rendered with a new auction object', async () => {
     mockedApiFetch.mockImplementation(async (url: string) => {
-      if (url === '/api/auctions/auc_1/images') {
+      if (url === '/api/auctions/auc_1/images?first=1') {
         return {
           ok: true,
           status: 200,
-          json: async () => ({ imageUrls: ['https://example.test/one.jpg', 'https://example.test/two.jpg'] }),
+          json: async () => ({ imageUrls: ['https://example.test/one.jpg'] }),
         } as Response;
       }
       throw new Error(`Unexpected apiFetch call: ${url}`);
@@ -80,6 +80,32 @@ describe('AuctionCard image loading', () => {
       expect(screen.getByText('£999')).toBeInTheDocument();
     });
     expect(mockedApiFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('versions the request with imagesVersion, and fetches again only when the seller changes the photos', async () => {
+    const served: Record<string, string> = {
+      '/api/auctions/auc_1/images?first=1&v=100': 'https://example.test/old.jpg',
+      '/api/auctions/auc_1/images?first=1&v=200': 'https://example.test/new.jpg',
+    };
+    mockedApiFetch.mockImplementation(async (url: string) => {
+      if (url in served) {
+        return { ok: true, status: 200, json: async () => ({ imageUrls: [served[url]] }) } as Response;
+      }
+      throw new Error(`Unexpected apiFetch call: ${url}`);
+    });
+
+    const auction = { ...makeListRowAuction(), imagesVersion: 100 } as AuctionItem;
+    const { rerender } = render(<AuctionCard auction={auction} onSelect={() => {}} />);
+    await waitFor(() => expect((screen.getByAltText(auction.title) as HTMLImageElement).src).toBe('https://example.test/old.jpg'));
+
+    // Same version on a refreshed row: no new request.
+    rerender(<AuctionCard auction={{ ...auction, price: 5 } as AuctionItem} onSelect={() => {}} />);
+    expect(mockedApiFetch).toHaveBeenCalledTimes(1);
+
+    // New version (the photos changed): a new URL, so neither this cache nor the browser's can be stale.
+    rerender(<AuctionCard auction={{ ...auction, imagesVersion: 200 } as AuctionItem} onSelect={() => {}} />);
+    await waitFor(() => expect((screen.getByAltText(auction.title) as HTMLImageElement).src).toBe('https://example.test/new.jpg'));
+    expect(mockedApiFetch).toHaveBeenCalledTimes(2);
   });
 
   it('reserves the image slot from imageCount without fetching, and shows a "no photos" placeholder when it is 0', () => {

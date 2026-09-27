@@ -19,7 +19,8 @@ import {
 import { AuctionItem, User } from '../types';
 import { buildWhatsAppUrl, formatExpiresIn, formatListedAgo, formatPrice } from '../lib/formatters';
 import { apiFetchAuthed } from '../lib/api';
-import { fetchAuctionImages } from '../lib/images';
+import { AUTH_ERROR_CODES, readErrorCode } from '../lib/apiErrors';
+import { fetchAuctionImages, imagesVersionOf } from '../lib/images';
 import { getListingStatus, LISTING_STATUS_EXPLANATION, LISTING_STATUS_LABEL } from '../lib/listing';
 import { PLACEHOLDER_IMAGE_URL } from '../lib/placeholder';
 import { SITE_NAME } from '../lib/site';
@@ -82,8 +83,12 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
   const [isReportOpen, setIsReportOpen] = useState(false);
   // State of the one authed detail fetch below: the only way a signed-in buyer gets the
   // seller's phone number, and the moment we learn a listing opened from the grid has since
-  // been taken down.
-  const [contactState, setContactState] = useState<'idle' | 'loading' | 'failed'>('idle');
+  // been taken down. Every outcome of that fetch lands in a terminal state, so the contact area
+  // can never sit on the loading spinner forever:
+  //   failed      - network/server error; offers Try Again
+  //   expired     - 401 with an auth code: the stored session is dead (e.g. signed in elsewhere)
+  //   unavailable - 200, but the server withheld the number (it decides; see the detail route)
+  const [contactState, setContactState] = useState<'idle' | 'loading' | 'failed' | 'expired' | 'unavailable'>('idle');
   const [isGone, setIsGone] = useState(false);
 
   const touchStartXRef = useRef<number | null>(null);
@@ -136,6 +141,12 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
           setIsGone(true);
           return;
         }
+        if (res.status === 401) {
+          const code = readErrorCode(await res.json().catch(() => null));
+          if (cancelled) return;
+          setContactState(code && AUTH_ERROR_CODES.has(code) ? 'expired' : 'failed');
+          return;
+        }
         if (!res.ok) {
           setContactState('failed');
           return;
@@ -155,7 +166,10 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
         const merged = { ...auctionRef.current, ...fresh };
         setAuction(merged);
         onAuctionUpdatedRef.current(merged);
-        setContactState('idle');
+        // A signed-in 200 with no number is the server's decision, not a pending load - show that
+        // instead of spinning. (A listing that stopped being live leaves the contact area entirely.)
+        const freshHasPhone = typeof fresh.phoneNumber === 'string' && fresh.phoneNumber.trim() !== '';
+        setContactState(freshHasPhone ? 'idle' : 'unavailable');
       } catch (err) {
         console.warn('Could not load the seller contact details:', err);
         if (!cancelled) {
@@ -177,9 +191,11 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
   // whatever was already resolved alone.
   const [resolvedImages, setResolvedImages] = useState<string[] | null>(() => extractInlineImages(initialAuction));
 
-  // Re-resolves when the listing id changes or when imageCount changes (the clearest signal that
-  // inline data just became unavailable/available). fetchAuctionImages caches by id, so this
-  // stays free once resolved.
+  // Re-resolves when the listing id, its imageCount or its imagesVersion changes (the version is
+  // the server's signal that the photos themselves changed). The gallery needs every photo, so
+  // this fetches the full set; fetchAuctionImages caches on (id, version), so this stays free
+  // once resolved.
+  const imagesVersion = imagesVersionOf(auction);
   useEffect(() => {
     const inline = extractInlineImages(auction);
     if (inline) {
@@ -187,7 +203,7 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
       return;
     }
     let cancelled = false;
-    fetchAuctionImages(auction.id).then((urls) => {
+    fetchAuctionImages(auction.id, { version: imagesVersion }).then((urls) => {
       if (!cancelled) {
         setResolvedImages(urls);
       }
@@ -196,7 +212,7 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [auction.id, auction.imageCount]);
+  }, [auction.id, auction.imageCount, imagesVersion]);
 
   // Gallery source of truth: the resolved images, or the local placeholder when there are none.
   const galleryImages = useMemo(() => {
@@ -311,6 +327,32 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
               <RefreshCw className="w-3.5 h-3.5" />
               <span>Try Again</span>
             </button>
+          </div>
+        );
+      }
+      if (contactState === 'expired') {
+        // Signing in again replaces the token, which re-runs the detail fetch above.
+        return (
+          <div role="alert" className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-xs flex flex-wrap items-center gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0" />
+            <span className="min-w-0 flex-1">Your session has expired. Sign in again to see the seller's contact details.</span>
+            <button
+              id="contact-reauth-btn"
+              type="button"
+              onClick={onPromptAuth}
+              className="shrink-0 inline-flex items-center justify-center gap-1.5 px-3 min-h-[44px] rounded-xl bg-[#abc4ff] hover:bg-[#b6ccfe] border border-[#c1d3fe] text-[#1e293b] font-extrabold transition-colors cursor-pointer"
+            >
+              <LogIn className="w-3.5 h-3.5" />
+              <span>Sign In Again</span>
+            </button>
+          </div>
+        );
+      }
+      if (contactState === 'unavailable') {
+        return (
+          <div role="status" className="p-3 rounded-xl bg-[#edf2fb] border border-[#ccdbfd] text-xs font-semibold text-[#1e293b]/75 flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0" aria-hidden="true" />
+            <span>The seller's contact details aren't available for this listing.</span>
           </div>
         );
       }

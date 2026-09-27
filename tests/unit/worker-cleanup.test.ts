@@ -313,7 +313,7 @@ describe('scheduled()', () => {
     await worker.scheduled({ cron: '0 3 * * *' }, ENABLED, { waitUntil: () => {} });
 
     for (const payload of db.operations.filter((op) => op.op === 'update').map((op) => op.payload)) {
-      expect(Object.keys(payload).sort()).toEqual(['image_url', 'image_urls']);
+      expect(Object.keys(payload).sort()).toEqual(['image_url', 'image_urls', 'images_version']);
     }
   });
 });

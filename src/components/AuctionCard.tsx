@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { ArrowUpRight, CalendarDays, Star, Images, ImageOff, User as UserIcon } from 'lucide-react';
 import { AuctionItem } from '../types';
 import { formatListedAgo, formatPrice } from '../lib/formatters';
-import { fetchAuctionImages } from '../lib/images';
+import { fetchAuctionImages, imagesVersionOf } from '../lib/images';
 import { getListingStatus, LISTING_STATUS_LABEL } from '../lib/listing';
 import { PLACEHOLDER_IMAGE_URL } from '../lib/placeholder';
 import { useInViewport } from '../lib/useInViewport';
@@ -39,16 +39,18 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({
   const needsFetch = !inlineImages && knownImageCount > 0;
   const [containerRef, isInViewport] = useInViewport<HTMLDivElement>();
 
-  // Fetch at most once per listing id: the feed refresh hands this card a brand-new `auction`
-  // object each time, but the effect below only depends on `auction.id`, and `fetchAuctionImages`
-  // itself caches by id -- so refreshing a page of cards triggers zero additional image requests
-  // after the first load.
+  // Fetch at most once per (listing, photo version): the feed refresh hands this card a
+  // brand-new `auction` object each time, but the effect below only depends on the id and the
+  // version, and `fetchAuctionImages` caches on the same key -- so refreshing a page of cards
+  // triggers zero additional image requests after the first load. `first: true` asks for the
+  // cover photo only: a card never shows the others, so it never downloads them.
+  const imagesVersion = imagesVersionOf(auction);
   useEffect(() => {
     if (!needsFetch || !isInViewport) {
       return;
     }
     let cancelled = false;
-    fetchAuctionImages(auction.id).then((urls) => {
+    fetchAuctionImages(auction.id, { first: true, version: imagesVersion }).then((urls) => {
       if (!cancelled) {
         setFetchedImages(urls);
       }
@@ -57,7 +59,7 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [needsFetch, isInViewport, auction.id]);
+  }, [needsFetch, isInViewport, auction.id, imagesVersion]);
 
   const resolvedImages = inlineImages ?? fetchedImages;
   const primaryImageSrc = resolvedImages?.[0] || PLACEHOLDER_IMAGE_URL;
