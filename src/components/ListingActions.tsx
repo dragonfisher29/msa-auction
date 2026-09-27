@@ -31,7 +31,7 @@ export const ListingActions: React.FC<ListingActionsProps> = ({ auction, onEdit,
         type="button"
         onClick={onMarkSold}
         aria-label={`Mark ${auction.title} as sold`}
-        className="w-full inline-flex items-center justify-center gap-1.5 px-3 min-h-[44px] rounded-xl bg-emerald-600 hover:bg-emerald-700 text-xs font-extrabold text-white transition-colors cursor-pointer"
+        className="w-full inline-flex items-center justify-center gap-1.5 px-3 min-h-[44px] rounded-xl bg-emerald-700 hover:bg-emerald-800 text-xs font-extrabold text-white transition-colors cursor-pointer"
       >
         <CheckCircle2 className="w-3.5 h-3.5" />
         <span>Mark as Sold</span>

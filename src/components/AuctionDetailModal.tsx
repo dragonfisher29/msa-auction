@@ -325,14 +325,15 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
     return (
       <div className="space-y-2">
         {/* Rendered only when the seller's number parses to a usable wa.me target, so buyers
-            never land on WhatsApp's "invalid number" page. */}
+            never land on WhatsApp's "invalid number" page. green-700 rather than WhatsApp's own
+            #25D366: white text on that brand green is ~2:1, well under WCAG AA. */}
         {whatsAppUrl && (
           <a
             id="contact-whatsapp-btn"
             href={whatsAppUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className="w-full flex items-center justify-center gap-2 min-h-[48px] px-4 rounded-xl bg-[#25D366] hover:bg-[#1eb455] text-white text-sm font-extrabold shadow-xs transition-colors"
+            className="w-full flex items-center justify-center gap-2 min-h-[48px] px-4 rounded-xl bg-green-700 hover:bg-green-800 text-white text-sm font-extrabold shadow-xs transition-colors"
           >
             <MessageCircle className="w-4 h-4" />
             <span>Message the Seller on WhatsApp</span>
