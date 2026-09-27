@@ -376,6 +376,48 @@ describe('GET /api/auctions/:id', () => {
     expect(signedIn.body.auction.phoneNumber).toBe('0100000000');
   });
 
+  describe('who gets the phone number', () => {
+    const ADMIN = { id: 'usr_admin', name: 'Admin', username: 'admin', token: 'tok_admin', role: 'admin' };
+    const BANNED = { id: 'usr_banned', name: 'Banned', username: 'banned', token: 'tok_banned', banned_at: NOW - 1000, banned_reason: 'Spam' };
+
+    async function phoneFor(row: Record<string, any>, token: string): Promise<string | undefined> {
+      mocks.client = createFakeSupabase({ users: [SELLER, OTHER, ADMIN, BANNED], auctions: [row] });
+      const result = await callJson('GET', '/api/auctions/auc_1', { token });
+      expect(result.status).toBe(200);
+      return result.body.auction.phoneNumber;
+    }
+
+    it('a signed-in buyer sees it on a live listing', async () => {
+      expect(await phoneFor(listingRow(), OTHER.token)).toBe('0100000000');
+    });
+
+    it('a signed-in buyer does NOT see it once the listing is sold, cancelled or expired', async () => {
+      for (const overrides of [{ status: 'sold', sold_at: PAST }, { status: 'cancelled' }, { expires_at: PAST }]) {
+        expect(await phoneFor(listingRow(overrides), OTHER.token), JSON.stringify(overrides)).toBeUndefined();
+      }
+    });
+
+    it('the seller still sees their own number on a finished listing', async () => {
+      for (const overrides of [{ status: 'sold', sold_at: PAST }, { status: 'cancelled' }, { expires_at: PAST }]) {
+        expect(await phoneFor(listingRow(overrides), SELLER.token), JSON.stringify(overrides)).toBe('0100000000');
+      }
+    });
+
+    it('an admin sees it on any listing, including a hidden one', async () => {
+      for (const overrides of [{ status: 'sold', sold_at: PAST }, { status: 'hidden' }, { expires_at: PAST }, {}]) {
+        expect(await phoneFor(listingRow(overrides), ADMIN.token), JSON.stringify(overrides)).toBe('0100000000');
+      }
+    });
+
+    it('a banned account never sees it, even on a live listing', async () => {
+      expect(await phoneFor(listingRow(), BANNED.token)).toBeUndefined();
+    });
+
+    it('a banned SELLER does not get their own number back from this route either', async () => {
+      expect(await phoneFor(listingRow({ seller_id: BANNED.id }), BANNED.token)).toBeUndefined();
+    });
+  });
+
   it('answers a Bearer token that does not resolve with 401 SESSION_EXPIRED, not as anonymous', async () => {
     seed([listingRow()]);
 

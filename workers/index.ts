@@ -26,6 +26,7 @@ import {
   isBannedUser,
   isBearerTokenAdmin,
   isFailure,
+  isLiveListing,
   isStaleImageCleanupEnabled,
   isStoredImagePath,
   listingBaselineFromRow,
@@ -870,9 +871,18 @@ export default {
           return jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 });
         }
 
-        // The seller's WhatsApp number goes on the wire only for a signed-in
-        // caller - an anonymous visitor viewing a listing cannot harvest it.
-        return jsonResponse({ auction: mapListingRow(row, { includePhone: Boolean(requester) }) });
+        // The seller's WhatsApp number goes on the wire only when all of:
+        //   - the caller is signed in (an anonymous visitor cannot harvest it),
+        //   - the caller is not banned (a ban must not keep this one door open),
+        //   - the listing is LIVE - or the caller is its seller or an admin. Once a
+        //     listing is sold, withdrawn, expired or taken down nobody needs to
+        //     contact the seller about it, so the number stops being published.
+        const includePhone =
+          Boolean(requester) &&
+          !isBannedUser(requester) &&
+          (isLiveListing(row) || requester.id === (row.seller_id ?? row.sellerId) || isAdmin);
+
+        return jsonResponse({ auction: mapListingRow(row, { includePhone }) });
       } catch (error) {
         return jsonResponse(getErrorMessageAndCode('Failed to load auction.', 'FETCH_AUCTION_FAILED', error), { status: 500 });
       }
