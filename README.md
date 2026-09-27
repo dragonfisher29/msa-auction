@@ -1,6 +1,3 @@
-
-
-
 <div align="center">
   <img src="assets/MSA_Logo.png" alt="MSA Southampton logo" width="120" />
 
@@ -11,10 +8,10 @@
   <p><strong><a href="https://msa-auction.msasoton.workers.dev/">Open the marketplace →</a></strong></p>
 </div>
 
-<!-- Launch video: poster links to the mp4. For an inline player, drag docs/media/brag.mp4 into this file in GitHub's web editor and replace this block with the generated user-attachments URL. -->
-[![Watch the MSA Pasar Karat launch video](docs/media/brag.jpg)][(docs/media/brag.mp4)](https://github.com/user-attachments/assets/57ad3a8c-0db1-42cd-bd24-225f6fe1d15e
-)
-
+[![Watch the MSA Pasar Karat launch video]
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/57ad3a8c-0db1-42cd-bd24-225f6fe1d15e" width="600" controls></video>
+</div>
 ## Contents
 
 - [For members](#for-members)
