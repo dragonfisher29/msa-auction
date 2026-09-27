@@ -210,7 +210,7 @@ export const ResetPasswordView: React.FC<ResetPasswordViewProps> = ({
         onClick={onClose}
         className="w-full inline-flex items-center justify-center px-3 min-h-[44px] rounded-xl bg-[#d7e3fc] hover:bg-[#c1d3fe] text-xs font-bold text-[#1e293b] transition-colors cursor-pointer"
       >
-        Back to Auctions
+        Back to Browse
       </button>
     </div>
   );

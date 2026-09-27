@@ -17,15 +17,18 @@ export interface User {
   email?: string | null;
 }
 
-export interface Bid {
-  id: string;
-  auctionId: string;
-  userId: string;
-  userName: string;
-  amount: number;
-  timestamp: number;
-}
+/**
+ * Where a listing is in its life. The server derives `'expired'` itself (30 days after
+ * `createdAt`, see `expiresAt`), so the client only ever renders it. `'hidden'` is a committee
+ * takedown and never reaches a non-admin: `GET /api/auctions/:id` answers 404 for it.
+ */
+export type ListingStatus = 'active' | 'sold' | 'expired' | 'cancelled' | 'hidden';
 
+/**
+ * One fixed-price listing. Still called `AuctionItem` (and still served from `/api/auctions`)
+ * because the routes and the name predate the move away from bidding; nothing about it is an
+ * auction any more.
+ */
 export interface AuctionItem {
   id: string;
   title: string;
@@ -37,16 +40,15 @@ export interface AuctionItem {
    * authenticated detail fetch.
    */
   phoneNumber?: string;
-  startingPrice: number;
-  currentPrice: number;
+  /** Fixed asking price in GBP (pounds, up to two decimal places). */
+  price: number;
   sellerId: string;
   sellerName: string;
-  highestBidderId: string | null;
-  highestBidderName: string | null;
-  durationMinutes: number;
-  startTime: number;
-  endTime: number;
-  status: 'active' | 'ended' | 'cancelled' | 'hidden';
+  status: ListingStatus;
+  /** ms epoch. The listing drops off the browse page at this moment (30 days after creation). */
+  expiresAt: number;
+  /** ms epoch the seller marked it sold, or null while it is not sold. */
+  soldAt: number | null;
   category?: string;
   imageUrl?: string;
   imageUrls?: string[];
@@ -54,16 +56,12 @@ export interface AuctionItem {
    * Present instead of `imageUrls` on rows from the paginated `GET /api/auctions` list endpoint
    * AND on `GET /api/auctions/:id` (single-item detail) - neither ships any image data at all
    * (see `mapAuctionDetailRow` in `workers/index.ts`), to keep both the list page and the
-   * every-3s-polled detail modal light. `AuctionCard`/`AuctionDetailModal` use this to decide
-   * whether to fetch real image data from `GET /api/auctions/:id/images`, at most once per id.
+   * detail fetch light. `AuctionCard`/`AuctionDetailModal` use this to decide whether to fetch
+   * real image data from `GET /api/auctions/:id/images`, at most once per id.
    * `imageUrls`/`imageUrl` are only ever present on a row from that images route, from `POST
    * /api/auctions` (create), or from a `PATCH` (edit) response.
    */
   imageCount?: number;
-  bids: Bid[];
-  winnerId?: string | null;
-  winnerName?: string | null;
-  winningBid?: number | null;
   createdAt: number;
 }
 
@@ -76,20 +74,6 @@ export interface AuctionsPage {
 /** Shape returned by `GET /api/users/me/activity` (auth required). */
 export interface UserActivity {
   listings: AuctionItem[];
-  bids: AuctionItem[];
-  wins: AuctionItem[];
-}
-
-export type NotificationType = 'outbid' | 'won' | 'lost' | 'sold';
-
-/** One row of `GET /api/notifications` (auth required). `id` is stable across calls. */
-export interface AppNotification {
-  id: string;
-  type: NotificationType;
-  auctionId: string;
-  auctionTitle: string;
-  amount: number;
-  timestamp: number;
 }
 
 /** One row of `GET /api/admin/reports` (admin only). Mirrors `ReportView` in workers/shared.ts. */
@@ -119,28 +103,4 @@ export interface AdminResetRequest {
   email: string | null;
   token: string;
   expiresAt: number;
-}
-
-export interface PlaceBidPayload {
-  auctionId: string;
-  userId: string;
-  userName: string;
-  amount: number;
-}
-
-export interface BidUpdatePayload {
-  auctionId: string;
-  currentPrice: number;
-  highestBidderId: string;
-  highestBidderName: string;
-  bid: Bid;
-  auction: AuctionItem;
-}
-
-export interface AuctionEndedPayload {
-  auctionId: string;
-  winnerId: string | null;
-  winnerName: string | null;
-  winningBid: number | null;
-  auction: AuctionItem;
 }

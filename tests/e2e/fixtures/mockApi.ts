@@ -1,15 +1,8 @@
 import type { Page, Route } from '@playwright/test';
 import { demoAuctions } from './auctions';
-import type { AuctionItem, Bid } from '../../../src/types';
-
-export interface BidOverride {
-  status: number;
-  body: unknown;
-}
+import type { AuctionItem } from '../../../src/types';
 
 export interface MockApiOptions {
-  /** Force a specific status/body for the next bid POST against this auction id. */
-  bidOverrideByAuctionId?: Record<string, BidOverride>;
   /** Simulates object storage (R2) not being configured: every `POST /api/images` answers 503
    *  `IMAGE_STORAGE_UNAVAILABLE` instead of accepting the upload, matching what this deployment
    *  actually does until R2 is turned on. Lets e2e tests exercise `CreateListingModal`'s base64
@@ -17,38 +10,70 @@ export interface MockApiOptions {
   imageStorageUnavailable?: boolean;
 }
 
+/** One request the app made, as seen by the mock -- lets specs assert on request volume. */
+export interface RecordedRequest {
+  method: string;
+  pathname: string;
+  authed: boolean;
+}
+
 const DEFAULT_PAGE_LIMIT = 24;
+const LISTING_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** The only identity the mocked login/register hand out, and the owner of `auc_ellie_lamp`. */
+export const E2E_USER_ID = 'usr_e2e_tester';
 
 /** Mirrors the real `POST /api/images` contract's accepted `Content-Type`s and 5 MB cap. */
 const ACCEPTED_IMAGE_CONTENT_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 const MAX_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024;
 let imageUploadSeq = 0;
 
-/**
- * Strips the two image fields off a full `AuctionItem` and replaces them with `imageCount`,
- * matching what `GET /api/auctions` (the paginated list endpoint) actually returns in
- * production: no image data of any kind on a list row, by design, to keep the page payload
- * light. `GET /api/auctions/:id` (single item) and `GET /api/auctions/:id/images` are the only
- * two endpoints that still carry real image URLs.
- */
-function toListRow(auction: AuctionItem): Omit<AuctionItem, 'imageUrl' | 'imageUrls'> & { imageCount: number } {
-  const { imageUrl, imageUrls, ...rest } = auction;
-  const count = Array.isArray(imageUrls)
-    ? imageUrls.filter((url) => typeof url === 'string' && url.trim() !== '').length
-    : imageUrl
+function imageCountOf(auction: AuctionItem): number {
+  return Array.isArray(auction.imageUrls)
+    ? auction.imageUrls.filter((url) => typeof url === 'string' && url.trim() !== '').length
+    : auction.imageUrl
     ? 1
     : 0;
-  return { ...rest, imageCount: count };
 }
 
-/** Mirrors the real ordering: `end_time DESC, id DESC`, so ended listings sort to the tail. */
-function sortForListing(items: AuctionItem[]): AuctionItem[] {
-  return [...items].sort((a, b) => {
-    if (a.endTime !== b.endTime) {
-      return b.endTime - a.endTime;
-    }
-    return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
-  });
+/**
+ * Strips the image fields (and the phone number) off a full `AuctionItem` and replaces them with
+ * `imageCount`, matching what `GET /api/auctions` (the paginated list endpoint) actually returns
+ * in production: no image data and no contact details on a list row, by design.
+ */
+function toListRow(auction: AuctionItem) {
+  const { imageUrl, imageUrls, phoneNumber, ...rest } = auction;
+  return { ...rest, imageCount: imageCountOf(auction) };
+}
+
+/**
+ * `GET /api/auctions/:id` in production: no image data (only `imageCount`), and `phoneNumber`
+ * only for an authenticated caller.
+ */
+function toDetailRow(auction: AuctionItem, authed: boolean) {
+  const { imageUrl, imageUrls, phoneNumber, ...rest } = auction;
+  return authed ? { ...rest, phoneNumber, imageCount: imageCountOf(auction) } : { ...rest, imageCount: imageCountOf(auction) };
+}
+
+/** The status the server would report right now (it derives 'expired' itself). */
+function currentStatus(auction: AuctionItem): AuctionItem['status'] {
+  return auction.status === 'active' && auction.expiresAt <= Date.now() ? 'expired' : auction.status;
+}
+
+/** Mirrors the real feed: active listings only, newest first (`created_at DESC, id DESC`). */
+function browseFeed(items: AuctionItem[]): AuctionItem[] {
+  return items
+    .filter((a) => currentStatus(a) === 'active')
+    .sort((a, b) => {
+      if (a.createdAt !== b.createdAt) {
+        return b.createdAt - a.createdAt;
+      }
+      return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+    });
+}
+
+function json(route: Route, status: number, body: unknown) {
+  return route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
 }
 
 /**
@@ -56,26 +81,17 @@ function sortForListing(items: AuctionItem[]): AuctionItem[] {
  * so tests never touch Supabase or the deployed Cloudflare Worker.
  */
 export async function mockApi(page: Page, options: MockApiOptions = {}) {
-  const auctions: AuctionItem[] = demoAuctions.map((auction) => ({
-    ...auction,
-    bids: [...auction.bids],
-  }));
+  const auctions: AuctionItem[] = demoAuctions.map((auction) => ({ ...auction }));
+  const requests: RecordedRequest[] = [];
 
   await page.route('**/api/**', async (route: Route) => {
     const request = route.request();
     const method = request.method();
     const pathname = new URL(request.url()).pathname;
+    const authed = Boolean(request.headers()['authorization']);
+    requests.push({ method, pathname, authed });
 
-    if (method === 'GET' && pathname === '/api/health') {
-      return route.fulfill({
-        contentType: 'application/json',
-        body: JSON.stringify({
-          status: 'ok',
-          serverTime: Date.now(),
-          activeAuctions: auctions.filter((a) => a.status === 'active').length,
-        }),
-      });
-    }
+    const unauthorized = () => json(route, 401, { error: 'Unauthorized. [Code: UNAUTHORIZED]', code: 'UNAUTHORIZED' });
 
     if (method === 'GET' && pathname === '/api/auctions') {
       const url = new URL(request.url());
@@ -83,222 +99,117 @@ export async function mockApi(page: Page, options: MockApiOptions = {}) {
       const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 60) : DEFAULT_PAGE_LIMIT;
       const cursor = url.searchParams.get('cursor');
 
-      const ordered = sortForListing(auctions);
+      const ordered = browseFeed(auctions);
       let startIndex = 0;
       if (cursor) {
         startIndex = ordered.findIndex((a) => a.id === cursor) + 1;
         if (startIndex === 0) {
           // findIndex returned -1: the cursor doesn't match any known row.
-          return route.fulfill({
-            status: 400,
-            contentType: 'application/json',
-            body: JSON.stringify({ error: 'Invalid cursor. [Code: INVALID_CURSOR]', code: 'INVALID_CURSOR' }),
-          });
+          return json(route, 400, { error: 'Invalid cursor. [Code: INVALID_CURSOR]', code: 'INVALID_CURSOR' });
         }
       }
 
       const pageItems = ordered.slice(startIndex, startIndex + limit);
       const nextCursor = startIndex + limit < ordered.length ? pageItems[pageItems.length - 1]?.id ?? null : null;
 
-      return route.fulfill({
-        contentType: 'application/json',
-        body: JSON.stringify({ auctions: pageItems.map(toListRow), nextCursor }),
-      });
+      return json(route, 200, { auctions: pageItems.map(toListRow), nextCursor });
     }
 
     const imagesMatch = pathname.match(/^\/api\/auctions\/([^/]+)\/images$/);
     if (method === 'GET' && imagesMatch) {
       const auction = auctions.find((a) => a.id === imagesMatch[1]);
       if (!auction) {
-        return route.fulfill({
-          status: 404,
-          contentType: 'application/json',
-          body: JSON.stringify({ error: 'Auction not found' }),
-        });
+        return json(route, 404, { error: 'Listing not found' });
       }
-      const imageUrls = Array.isArray(auction.imageUrls)
-        ? auction.imageUrls
-        : auction.imageUrl
-        ? [auction.imageUrl]
-        : [];
-      return route.fulfill({
-        contentType: 'application/json',
-        body: JSON.stringify({ imageUrls }),
-      });
+      const imageUrls = Array.isArray(auction.imageUrls) ? auction.imageUrls : auction.imageUrl ? [auction.imageUrl] : [];
+      return json(route, 200, { imageUrls });
     }
 
-    // The R2 migration's upload endpoint: raw image bytes in, `{ url, key }` out. Requires auth
-    // like every other write endpoint here, even though auth itself isn't otherwise faked in
-    // this fixture -- a request with no Authorization header at all is refused, matching the
-    // real worker's `requireUser` gate.
+    // The R2 upload endpoint: raw image bytes in, `{ url, key }` out. Requires auth like every
+    // other write endpoint here -- a request with no Authorization header at all is refused,
+    // matching the real worker's `requireUser` gate.
     if (method === 'POST' && pathname === '/api/images') {
-      if (!request.headers()['authorization']) {
-        return route.fulfill({
-          status: 401,
-          contentType: 'application/json',
-          body: JSON.stringify({ error: 'Unauthorized. [Code: UNAUTHORIZED]', code: 'UNAUTHORIZED' }),
-        });
+      if (!authed) {
+        return unauthorized();
       }
 
       // Mirrors the real worker with R2 unbound (the actual state at this deploy, since the
-      // society cannot put a card on file with Cloudflare): every upload attempt, regardless of
-      // an otherwise-valid content type or size, is refused with this 503.
+      // society cannot put a card on file with Cloudflare).
       if (options.imageStorageUnavailable) {
-        return route.fulfill({
-          status: 503,
-          contentType: 'application/json',
-          body: JSON.stringify({
-            error: 'Image storage is not currently available. [Code: IMAGE_STORAGE_UNAVAILABLE]',
-            code: 'IMAGE_STORAGE_UNAVAILABLE',
-          }),
+        return json(route, 503, {
+          error: 'Image storage is not currently available. [Code: IMAGE_STORAGE_UNAVAILABLE]',
+          code: 'IMAGE_STORAGE_UNAVAILABLE',
         });
       }
 
       const contentType = (request.headers()['content-type'] || '').split(';')[0].trim();
       if (!ACCEPTED_IMAGE_CONTENT_TYPES.includes(contentType)) {
-        return route.fulfill({
-          status: 400,
-          contentType: 'application/json',
-          body: JSON.stringify({
-            error: 'Unsupported image type. [Code: UNSUPPORTED_IMAGE_TYPE]',
-            code: 'UNSUPPORTED_IMAGE_TYPE',
-          }),
-        });
+        return json(route, 400, { error: 'Unsupported image type. [Code: UNSUPPORTED_IMAGE_TYPE]', code: 'UNSUPPORTED_IMAGE_TYPE' });
       }
 
       const bodyBuffer = request.postDataBuffer();
       if (!bodyBuffer || bodyBuffer.length > MAX_IMAGE_UPLOAD_BYTES) {
-        return route.fulfill({
-          status: 413,
-          contentType: 'application/json',
-          body: JSON.stringify({ error: 'Image too large. [Code: IMAGE_TOO_LARGE]', code: 'IMAGE_TOO_LARGE' }),
-        });
+        return json(route, 413, { error: 'Image too large. [Code: IMAGE_TOO_LARGE]', code: 'IMAGE_TOO_LARGE' });
       }
 
       const key = `e2e_img_${Date.now()}_${++imageUploadSeq}`;
-      return route.fulfill({
-        status: 201,
-        contentType: 'application/json',
-        body: JSON.stringify({ url: `/images/${key}`, key }),
-      });
+      return json(route, 201, { url: `/images/${key}`, key });
     }
 
-    const editMatch = pathname.match(/^\/api\/auctions\/([^/]+)$/);
-    if (method === 'PATCH' && editMatch) {
-      const auction = auctions.find((a) => a.id === editMatch[1]);
-      if (!auction) {
-        return route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'Auction not found' }) });
+    // Owner-only writes share the same gate: signed in, the seller, and still active. The mock
+    // has exactly one identity (see the auth handlers below), so "the seller" means E2E_USER_ID.
+    const soldMatch = pathname.match(/^\/api\/auctions\/([^/]+)\/sold$/);
+    const itemMatch = pathname.match(/^\/api\/auctions\/([^/]+)$/);
+    const ownerWriteId =
+      method === 'POST' && soldMatch ? soldMatch[1] : (method === 'PATCH' || method === 'DELETE') && itemMatch ? itemMatch[1] : null;
+
+    if (ownerWriteId) {
+      if (!authed) {
+        return unauthorized();
       }
-      if (auction.status !== 'active') {
-        return route.fulfill({
-          status: 409,
-          contentType: 'application/json',
-          body: JSON.stringify({ error: 'Listing is not editable. [Code: LISTING_NOT_EDITABLE]', code: 'LISTING_NOT_EDITABLE' }),
+      const auction = auctions.find((a) => a.id === ownerWriteId);
+      if (!auction || auction.status === 'hidden') {
+        return json(route, 404, { error: 'Listing not found. [Code: AUCTION_NOT_FOUND]', code: 'AUCTION_NOT_FOUND' });
+      }
+      if (auction.sellerId !== E2E_USER_ID) {
+        return json(route, 403, { error: 'Only the seller can change this listing. [Code: NOT_LISTING_OWNER]', code: 'NOT_LISTING_OWNER' });
+      }
+      if (currentStatus(auction) !== 'active') {
+        return json(route, 409, { error: 'This listing is no longer active. [Code: LISTING_NOT_EDITABLE]', code: 'LISTING_NOT_EDITABLE' });
+      }
+
+      if (soldMatch) {
+        auction.status = 'sold';
+        auction.soldAt = Date.now();
+      } else if (method === 'DELETE') {
+        auction.status = 'cancelled';
+      } else {
+        const body = request.postDataJSON() as Partial<AuctionItem>;
+        Object.assign(auction, {
+          title: body.title ?? auction.title,
+          description: body.description ?? auction.description,
+          phoneNumber: body.phoneNumber ?? auction.phoneNumber,
+          category: body.category ?? auction.category,
+          imageUrls: body.imageUrls ?? auction.imageUrls,
+          price: body.price ?? auction.price,
         });
       }
-      if (auction.bids.length > 0) {
-        return route.fulfill({
-          status: 409,
-          contentType: 'application/json',
-          body: JSON.stringify({
-            error: 'This listing already has bids and can no longer be edited. You can cancel it instead. [Code: LISTING_HAS_BIDS]',
-            code: 'LISTING_HAS_BIDS',
-          }),
-        });
-      }
-      const body = request.postDataJSON() as Partial<AuctionItem>;
-      Object.assign(auction, {
-        title: body.title ?? auction.title,
-        description: body.description ?? auction.description,
-        phoneNumber: body.phoneNumber ?? auction.phoneNumber,
-        category: body.category ?? auction.category,
-        imageUrls: body.imageUrls ?? auction.imageUrls,
-        startingPrice: body.startingPrice ?? auction.startingPrice,
-      });
-      if (body.startingPrice !== undefined) {
-        auction.currentPrice = body.startingPrice;
-      }
-      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ auction }) });
+      return json(route, 200, { auction });
     }
 
-    if (method === 'DELETE' && editMatch) {
-      const auction = auctions.find((a) => a.id === editMatch[1]);
-      if (!auction) {
-        return route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'Auction not found' }) });
+    if (method === 'GET' && itemMatch) {
+      const auction = auctions.find((a) => a.id === itemMatch[1]);
+      // Hidden listings are indistinguishable from missing ones to a non-admin.
+      if (!auction || auction.status === 'hidden') {
+        return json(route, 404, { error: 'Listing not found. [Code: AUCTION_NOT_FOUND]', code: 'AUCTION_NOT_FOUND' });
       }
-      if (auction.status !== 'active') {
-        return route.fulfill({
-          status: 409,
-          contentType: 'application/json',
-          body: JSON.stringify({ error: 'Listing is not editable. [Code: LISTING_NOT_EDITABLE]', code: 'LISTING_NOT_EDITABLE' }),
-        });
-      }
-      auction.status = 'cancelled';
-      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ auction }) });
-    }
-
-    const bidMatch = pathname.match(/^\/api\/auctions\/([^/]+)\/bids$/);
-    if (method === 'POST' && bidMatch) {
-      const auctionId = bidMatch[1];
-      const override = options.bidOverrideByAuctionId?.[auctionId];
-      if (override) {
-        return route.fulfill({
-          status: override.status,
-          contentType: 'application/json',
-          body: JSON.stringify(override.body),
-        });
-      }
-
-      const auction = auctions.find((a) => a.id === auctionId);
-      if (!auction) {
-        return route.fulfill({
-          status: 404,
-          contentType: 'application/json',
-          body: JSON.stringify({ error: 'Auction not found' }),
-        });
-      }
-
-      // The real server identifies the bidder from the bearer token, not the request body (see
-      // the bid route in workers/index.ts), so the body only carries `amount`. This fixture
-      // mirrors that: the bidder is always the one identity `/api/auth/login` and `/register`
-      // hand out below, regardless of what (if anything) the body says.
-      const payload = request.postDataJSON() as { amount: number };
-      const newBid: Bid = {
-        id: `bid_e2e_${Date.now()}`,
-        auctionId,
-        userId: 'usr_e2e_tester',
-        userName: 'Ellie Tester',
-        amount: payload.amount,
-        timestamp: Date.now(),
-      };
-      auction.bids = [newBid, ...auction.bids];
-      auction.currentPrice = payload.amount;
-      auction.highestBidderId = newBid.userId;
-      auction.highestBidderName = newBid.userName;
-
-      return route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({ bid: newBid }),
-      });
-    }
-
-    if (method === 'GET' && editMatch) {
-      const auction = auctions.find((a) => a.id === editMatch[1]);
-      if (!auction) {
-        return route.fulfill({
-          status: 404,
-          contentType: 'application/json',
-          body: JSON.stringify({ error: 'Auction not found' }),
-        });
-      }
-      return route.fulfill({
-        contentType: 'application/json',
-        body: JSON.stringify({ auction }),
-      });
+      return json(route, 200, { auction: toDetailRow({ ...auction, status: currentStatus(auction) }, authed) });
     }
 
     if (method === 'POST' && pathname === '/api/auctions') {
+      if (!authed) {
+        return unauthorized();
+      }
       const body = request.postDataJSON() as Record<string, any>;
       const now = Date.now();
       const created: AuctionItem = {
@@ -306,81 +217,68 @@ export async function mockApi(page: Page, options: MockApiOptions = {}) {
         title: body.title,
         description: body.description,
         phoneNumber: body.phoneNumber,
-        startingPrice: body.startingPrice,
-        currentPrice: body.startingPrice,
-        sellerId: body.sellerId,
-        sellerName: body.sellerName,
-        highestBidderId: null,
-        highestBidderName: null,
-        durationMinutes: body.durationMinutes,
-        startTime: now,
-        endTime: now + body.durationMinutes * 60 * 1000,
+        price: body.price,
+        sellerId: E2E_USER_ID,
+        sellerName: body.sellerName ?? 'Ellie Tester',
         status: 'active',
+        expiresAt: now + LISTING_LIFETIME_MS,
+        soldAt: null,
         category: body.category,
         imageUrl: body.imageUrl,
         imageUrls: body.imageUrls,
-        bids: [],
-        winnerId: null,
-        winnerName: null,
-        winningBid: null,
         createdAt: now,
       };
       auctions.unshift(created);
-      return route.fulfill({
-        status: 201,
-        contentType: 'application/json',
-        body: JSON.stringify({ auction: created }),
+      return json(route, 201, { auction: created });
+    }
+
+    if (method === 'GET' && pathname === '/api/users/me/activity') {
+      if (!authed) {
+        return unauthorized();
+      }
+      return json(route, 200, {
+        listings: auctions
+          .filter((a) => a.sellerId === E2E_USER_ID)
+          .map((a) => ({ ...toListRow(a), phoneNumber: a.phoneNumber, status: currentStatus(a) })),
       });
+    }
+
+    if (method === 'GET' && pathname === '/api/auth/me') {
+      return authed ? json(route, 200, { user: { id: E2E_USER_ID, name: 'Ellie Tester', username: 'ellie', role: 'member' } }) : unauthorized();
     }
 
     if (method === 'POST' && pathname === '/api/auth/login') {
       const body = request.postDataJSON() as { username: string; password: string };
-      return route.fulfill({
-        contentType: 'application/json',
-        body: JSON.stringify({
-          // `role` and `email` mirror the real login response. A plain member, so the header's
-          // admin link stays hidden in these flows.
-          user: {
-            id: 'usr_e2e_tester',
-            name: 'Ellie Tester',
-            username: body.username,
-            email: null,
-            role: 'member',
-            token: 'tok_e2e',
-          },
-        }),
+      // `role` and `email` mirror the real login response. A plain member, so the header's
+      // admin link stays hidden in these flows.
+      return json(route, 200, {
+        user: {
+          id: E2E_USER_ID,
+          name: 'Ellie Tester',
+          username: body.username,
+          email: null,
+          role: 'member',
+          token: 'tok_e2e',
+        },
       });
     }
 
     if (method === 'POST' && pathname === '/api/auth/register') {
-      const body = request.postDataJSON() as {
-        username: string;
-        name: string;
-        password: string;
-        email?: string;
-      };
-      return route.fulfill({
-        status: 201,
-        contentType: 'application/json',
-        body: JSON.stringify({
-          user: {
-            id: 'usr_e2e_tester',
-            name: body.name,
-            username: body.username,
-            email: body.email ?? null,
-            role: 'member',
-            token: 'tok_e2e',
-          },
-        }),
+      const body = request.postDataJSON() as { username: string; name: string; password: string; email?: string };
+      return json(route, 201, {
+        user: {
+          id: E2E_USER_ID,
+          name: body.name,
+          username: body.username,
+          email: body.email ?? null,
+          role: 'member',
+          token: 'tok_e2e',
+        },
       });
     }
 
-    return route.fulfill({
-      status: 404,
-      contentType: 'application/json',
-      body: JSON.stringify({ error: `No mock handler for ${method} ${pathname}` }),
-    });
+    return json(route, 404, { error: `No mock handler for ${method} ${pathname}` });
   });
 
-  return { auctions };
+  return { auctions, requests };
 }

@@ -14,7 +14,7 @@ import {
  * The paginated list endpoint no longer ships any image data on a list row (see the API
  * contract in the project brief), so `AuctionCard` fetches images lazily, only once a card is
  * near the viewport. This cache is what makes "scroll back up" free: once an id has resolved,
- * every subsequent mount of that card (or the 5s list poll replacing its auction object) reuses
+ * every subsequent mount of that card (or the feed refresh replacing its listing object) reuses
  * the same array instead of hitting the network again.
  *
  * Deliberately module-level rather than component state: AuctionCard instances come and go as

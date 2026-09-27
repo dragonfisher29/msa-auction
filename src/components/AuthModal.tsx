@@ -12,6 +12,7 @@ import {
   KeyRound,
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
+import { SITE_NAME } from '../lib/site';
 import { User } from '../types';
 
 export type AuthModalMode = 'login' | 'register' | 'forgot';
@@ -113,7 +114,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   };
 
   const headingText =
-    mode === 'login' ? 'Sign In to MSA Auction' : mode === 'register' ? 'Create an Account' : 'Reset Your Password';
+    mode === 'login' ? `Sign In to ${SITE_NAME}` :mode === 'register' ? 'Create an Account' : 'Reset Your Password';
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-[#1e293b]/40 backdrop-blur-xs overflow-y-auto">

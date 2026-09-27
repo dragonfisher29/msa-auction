@@ -8,9 +8,9 @@
  * pass - these tests instead cover the pure logic `compressImageToBlob` was refactored to use
  * (`computeScaledDimensions`, `planNextCompressionStep`), plus the constants that describe its
  * behaviour (`MAX_IMAGE_DIMENSION`, `IMAGE_OUTPUT_QUALITY`, `CLIENT_IMAGE_TARGET_BYTES`). The
- * end-to-end "does it actually produce a JPEG blob at the right size" path is NOT covered by any
- * automated test in this repo (the existing e2e suite, `tests/e2e/auction-flow.spec.ts`, does not
- * touch image upload at all) - see the executor's report for what was checked manually instead.
+ * end-to-end path is only smoke-tested: `tests/e2e/listing-flow.spec.ts` uploads a 1x1 PNG through
+ * the real in-browser compression when creating a listing, but nothing asserts on the output
+ * blob's format or size.
  */
 import { describe, it, expect } from 'vitest';
 import {

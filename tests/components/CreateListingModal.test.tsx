@@ -1,6 +1,6 @@
 import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor, act } from '@testing-library/react';
+import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { CreateListingModal } from '../../src/components/CreateListingModal';
 import { AuctionItem, User } from '../../src/types';
@@ -68,23 +68,15 @@ function makeFullAuction(overrides: Partial<AuctionItem> = {}): AuctionItem {
     title: 'Vintage Film Camera',
     description: 'A well-loved vintage film camera, fully functional.',
     phoneNumber: '+44 7700 900000',
-    startingPrice: 100,
-    currentPrice: 100,
+    price: 100,
     sellerId: seller.id,
     sellerName: seller.name,
-    highestBidderId: null,
-    highestBidderName: null,
-    durationMinutes: 60,
-    startTime: NOW - 5 * 60 * 1000,
-    endTime: NOW + 60 * 60 * 1000,
     status: 'active',
+    expiresAt: NOW + 20 * 24 * 60 * 60 * 1000,
+    soldAt: null,
     category: 'Collectibles',
     imageUrl: 'https://example.test/camera-1.jpg',
     imageUrls: ['https://example.test/camera-1.jpg', 'https://example.test/camera-2.jpg'],
-    bids: [],
-    winnerId: null,
-    winnerName: null,
-    winningBid: null,
     createdAt: NOW - 10 * 60 * 1000,
     ...overrides,
   };
@@ -161,6 +153,11 @@ async function fillRequiredNonImageFields(user: ReturnType<typeof userEvent.setu
     'A working retro desk lamp, no chips or cracks.',
   );
   await user.type(document.getElementById('listing-phone-input') as HTMLInputElement, '+44 7700 900456');
+  await user.type(priceInput(), '25');
+}
+
+function priceInput(): HTMLInputElement {
+  return document.getElementById('listing-price-input') as HTMLInputElement;
 }
 
 describe('CreateListingModal (edit mode)', () => {
@@ -306,7 +303,7 @@ describe('CreateListingModal (edit mode)', () => {
     expect(submitBtn()).not.toBeDisabled();
   });
 
-  it('does not reset a typed title when the parent re-renders with a new initialAuction object of the same id (a poll tick)', async () => {
+  it('does not reset a typed title when the parent re-renders with a new initialAuction object of the same id', async () => {
     const full = makeFullAuction();
 
     mockedApiFetch.mockImplementation(async (url: string, init?: RequestInit) => {
@@ -333,9 +330,9 @@ describe('CreateListingModal (edit mode)', () => {
     await user.clear(titleInput);
     await user.type(titleInput, 'My unsaved edit');
 
-    // A new object, same id, with an updated currentPrice -- exactly what a 3s detail poll tick
-    // produces: a freshly-parsed response body, not the same reference, for the same listing.
-    const polled = { ...full, currentPrice: full.currentPrice + 10 };
+    // A new object, same id -- what the detail modal's own fetch or a feed refresh produces: a
+    // freshly-parsed response body, not the same reference, for the same listing.
+    const polled = { ...full, price: full.price + 10 };
     rerender(
       <CreateListingModal
         isOpen={true}
@@ -765,5 +762,116 @@ describe('CreateListingModal (IMAGE_STORAGE_UNAVAILABLE fallback)', () => {
     // Still only the one freshly-picked file ever reached uploadImage -- the two stored images
     // were never re-uploaded, whether storage is available or not.
     expect(mockedUploadImage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('CreateListingModal (price and field limits)', () => {
+  beforeEach(() => {
+    mockedApiFetch.mockReset();
+    mockedCompressImageToBlob.mockReset();
+    mockedCompressImageToBlob.mockImplementation(
+      async (file: File) => new Blob([`compressed:${file.name}`], { type: file.type || 'image/jpeg' }),
+    );
+    mockedUploadImage.mockReset();
+    mockedUploadImage.mockImplementation(async () => ({ url: '/images/img_price', key: 'img_price' }));
+  });
+
+  // Dispatching `submit` directly exercises the app's own validation: a real click would be
+  // stopped first by the browser's constraint validation on the input's min/max/step.
+  function submitForm() {
+    fireEvent.submit(submitBtn().closest('form') as HTMLFormElement);
+  }
+
+  it('has a single Price field (no starting price or duration) mirroring the server limits', () => {
+    renderCreateModal();
+
+    const input = priceInput();
+    expect(input).toBeInTheDocument();
+    expect(input.getAttribute('step')).toBe('0.01');
+    expect(input.getAttribute('min')).toBe('0.01');
+    expect(input.getAttribute('max')).toBe('100000');
+    expect(document.getElementById('listing-starting-price-input')).toBeNull();
+    expect(document.getElementById('listing-custom-duration-input')).toBeNull();
+    expect(screen.queryByText(/duration/i)).toBeNull();
+  });
+
+  it('caps title, description and phone at the server limits', () => {
+    renderCreateModal();
+
+    expect(document.getElementById('listing-title-input')).toHaveAttribute('maxLength', '100');
+    expect(document.getElementById('listing-description-input')).toHaveAttribute('maxLength', '2000');
+    expect(document.getElementById('listing-phone-input')).toHaveAttribute('maxLength', '30');
+  });
+
+  it('tells a new seller that listings expire after 30 days', () => {
+    renderCreateModal();
+    expect(document.getElementById('listing-lifetime-note')).toHaveTextContent(/expire 30 days after/i);
+  });
+
+  it.each([
+    ['0', /greater than £0/i],
+    ['-3', /greater than £0/i],
+    ['100000.01', /more than £100,000/i],
+    ['12.345', /two decimal places/i],
+  ])('refuses a price of %s with a friendly message and sends nothing', async (value, message) => {
+    renderCreateModal();
+    const user = userEvent.setup();
+    await fillRequiredNonImageFields(user);
+    await user.clear(priceInput());
+    await user.type(priceInput(), value);
+
+    submitForm();
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(message);
+    expect(mockedApiFetch).not.toHaveBeenCalled();
+  });
+
+  it('POSTs `price` in pounds -- and no startingPrice or durationMinutes', async () => {
+    mockedApiFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === '/api/auctions' && init?.method === 'POST') {
+        const body = JSON.parse(init!.body as string);
+        return { ok: true, status: 201, json: async () => ({ auction: { ...makeFullAuction(), ...body } }) } as Response;
+      }
+      throw new Error(`Unexpected apiFetch call: ${url} ${init?.method ?? 'GET'}`);
+    });
+
+    const { onCreated } = renderCreateModal();
+    const user = userEvent.setup();
+    await fillRequiredNonImageFields(user);
+    await user.clear(priceInput());
+    await user.type(priceInput(), '12.50');
+    await user.upload(imagesInput(), makeImageFile());
+    await waitFor(() => expect(submitBtn()).not.toBeDisabled());
+
+    await user.click(submitBtn());
+
+    await waitFor(() => expect(onCreated).toHaveBeenCalled());
+    const [, init] = mockedApiFetch.mock.calls.find(([url]) => url === '/api/auctions')!;
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body.price).toBe(12.5);
+    expect(body).not.toHaveProperty('startingPrice');
+    expect(body).not.toHaveProperty('durationMinutes');
+  });
+
+  it('edit mode: prefills the current price and PATCHes the new one', async () => {
+    const full = makeFullAuction({ price: 40 });
+    mockedApiFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === `/api/auctions/${full.id}` && init?.method === 'PATCH') {
+        return { ok: true, status: 200, json: async () => ({ auction: { ...full, price: 35 } }) } as Response;
+      }
+      throw new Error(`Unexpected apiFetch call: ${url} ${init?.method ?? 'GET'}`);
+    });
+
+    const { onUpdated } = renderEditModal(full);
+    await waitFor(() => expect(priceInput().value).toBe('40'));
+
+    const user = userEvent.setup();
+    await user.clear(priceInput());
+    await user.type(priceInput(), '35');
+    await user.click(submitBtn());
+
+    await waitFor(() => expect(onUpdated).toHaveBeenCalledWith(expect.objectContaining({ price: 35 })));
+    const [, init] = mockedApiFetch.mock.calls.find(([, i]) => (i as RequestInit)?.method === 'PATCH')!;
+    expect(JSON.parse((init as RequestInit).body as string).price).toBe(35);
   });
 });

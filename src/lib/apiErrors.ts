@@ -7,9 +7,9 @@
  * on newer endpoints; prefer that and fall back to parsing the suffix so a response that only
  * carries one of the two is still classified correctly.
  *
- * Originally lived only in AuctionDetailModal; factored out here so the listing edit/cancel
- * flows (CreateListingModal in edit mode, CancelListingModal) can classify errors the same way
- * without duplicating the parsing logic.
+ * Shared so the listing create/edit/sold/cancel flows (CreateListingModal, MarkSoldModal,
+ * CancelListingModal) and the admin panel classify errors the same way without duplicating the
+ * parsing logic.
  */
 
 export function stripErrorCode(message: string): string {
@@ -27,11 +27,10 @@ export function readErrorCode(data: any): string | null {
 /** Codes that mean "the session is not usable", as opposed to a request the server merely refused. */
 export const AUTH_ERROR_CODES = new Set(['UNAUTHORIZED', 'SESSION_EXPIRED']);
 
-/** `PATCH /api/auctions/:id` refuses to edit a listing that already has bids. */
-export const LISTING_HAS_BIDS = 'LISTING_HAS_BIDS';
-/** Returned by both PATCH and DELETE when the caller is not the listing's seller. */
+/** Returned by PATCH, DELETE and `POST /sold` when the caller is not the listing's seller. */
 export const NOT_LISTING_OWNER = 'NOT_LISTING_OWNER';
-/** Returned when the listing is no longer in a state that can be edited/cancelled (e.g. ended). */
+/** Returned (with a 409) when the listing is no longer active -- sold, expired or cancelled --
+ *  so it cannot be edited, cancelled or marked sold. Callers also treat a bare 409 this way. */
 export const LISTING_NOT_EDITABLE = 'LISTING_NOT_EDITABLE';
 /** Returned by `GET /api/auctions` when the `cursor` query param is malformed or stale. */
 export const INVALID_CURSOR = 'INVALID_CURSOR';

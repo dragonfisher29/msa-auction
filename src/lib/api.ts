@@ -19,7 +19,7 @@ export async function apiFetch(input: string, init?: RequestInit): Promise<Respo
 /**
  * The single place the session bearer token is turned into a request header.
  *
- * Every authenticated endpoint (create listing, place bid, account activity, notifications)
+ * Every authenticated endpoint (create/edit listing, mark sold, account activity, admin)
  * goes through here so there is exactly one mechanism to change if the scheme ever moves.
  * A missing token still produces the header (as `Bearer undefined` would have before) only
  * when a token is actually present -- otherwise the header is omitted entirely and the
