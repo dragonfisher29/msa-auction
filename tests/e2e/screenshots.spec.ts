@@ -35,7 +35,9 @@ test.describe('documentation screenshots', () => {
     await expect(page.locator('#tab-login-btn')).toBeVisible();
     await expect(page.locator('#auth-username-input')).toBeVisible();
 
-    await page.screenshot({ path: path.join(IMAGES_DIR, '02-sign-in.png'), fullPage: true });
+    // Viewport-only: fullPage would capture the modal backdrop only down to the viewport,
+    // leaving the page content below it undimmed in the screenshot.
+    await page.screenshot({ path: path.join(IMAGES_DIR, '02-sign-in.png') });
   });
 
   test('03 - Create Listing form, partially filled', async ({ page }) => {
@@ -53,7 +55,8 @@ test.describe('documentation screenshots', () => {
     await page.locator('#listing-price-input').fill('15');
     await page.locator('#listing-phone-input').fill('+44 7700 900123');
 
-    await page.screenshot({ path: path.join(IMAGES_DIR, '03-create-listing.png'), fullPage: true });
+    // Viewport-only: see the note on the 02 screenshot above.
+    await page.screenshot({ path: path.join(IMAGES_DIR, '03-create-listing.png') });
   });
 
   test('04 - listing detail modal with price and the WhatsApp contact button', async ({ page }) => {
@@ -65,7 +68,8 @@ test.describe('documentation screenshots', () => {
     await expect(page.locator('#listing-detail-price')).toBeVisible();
     await expect(page.locator('#contact-whatsapp-btn')).toBeVisible();
 
-    await page.screenshot({ path: path.join(IMAGES_DIR, '04-auction-detail.png'), fullPage: true });
+    // Viewport-only: see the note on the 02 screenshot above.
+    await page.screenshot({ path: path.join(IMAGES_DIR, '04-auction-detail.png') });
   });
 
   test('05 - seller marking their own listing as sold', async ({ page }) => {
@@ -77,7 +81,8 @@ test.describe('documentation screenshots', () => {
     await page.locator('#mark-sold-btn-auc_ellie_lamp').click();
     await expect(page.locator('#mark-sold-confirm-btn')).toBeVisible();
 
-    await page.screenshot({ path: path.join(IMAGES_DIR, '05-mark-sold.png'), fullPage: true });
+    // Viewport-only: see the note on the 02 screenshot above.
+    await page.screenshot({ path: path.join(IMAGES_DIR, '05-mark-sold.png') });
   });
 
   test('06 - search, category filter and sort applied together', async ({ page }) => {
