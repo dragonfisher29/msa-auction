@@ -128,7 +128,7 @@ test.describe('contacting a seller', () => {
     await expect(whatsApp).toBeVisible();
     await expect(whatsApp).toHaveAttribute(
       'href',
-      `https://wa.me/447700900444?text=${encodeURIComponent('Hi, I\'m interested in "IKEA Desk & Ergonomic Chair Bundle" on MSA Auction.')}`,
+      `https://wa.me/447700900444?text=${encodeURIComponent('Hi, I\'m interested in "IKEA Desk & Ergonomic Chair Bundle" on MSA Pasar Karat.')}`,
     );
     await expect(whatsApp).toHaveAttribute('target', '_blank');
     await expect(whatsApp).toHaveAttribute('rel', 'noopener noreferrer');

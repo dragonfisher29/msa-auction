@@ -5,7 +5,7 @@
  * Not used for storage keys (`msa_auction_user`, `msa_watchlist_ids`): renaming those would sign
  * every existing visitor out and wipe their watchlist for no visible gain.
  */
-export const SITE_NAME = 'MSA Auction';
+export const SITE_NAME = 'MSA Pasar Karat';
 
 /** One-line description used under the name in the header and in the footer. */
 export const SITE_TAGLINE = 'Buy and sell with fellow MSA Southampton members';

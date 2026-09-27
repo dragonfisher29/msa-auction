@@ -5,7 +5,7 @@
  * client is always passed in by the caller, which is what lets the unit tests
  * drive these helpers against an in-memory fake.
  *
- * PRODUCT MODEL (v1). MSA Auction is a fixed-price classifieds board, not an
+ * PRODUCT MODEL (v1). MSA Pasar Karat is a fixed-price classifieds board, not an
  * auction: a listing has one asking `price`, stays on the browse page until the
  * seller marks it sold, cancels it, or `LISTING_TTL_DAYS` pass since creation,
  * and buyers contact the seller on WhatsApp. There is no bidding, no settlement
@@ -957,7 +957,7 @@ export function buildAuctionMetaTags(row: any, pageUrl: string, now: number = Da
   const reference = String(row?.image_url ?? row?.imageUrl ?? '') || toStringArray(row?.image_urls)[0] || '';
 
   return {
-    title: priceLabel ? `${title} - ${priceLabel} | MSA Auction` : `${title} | MSA Auction`,
+    title: priceLabel ? `${title} - ${priceLabel} | MSA Pasar Karat` : `${title} | MSA Pasar Karat`,
     description: truncate(
       `${statusLabel}${priceLabel ? ` at ${priceLabel}` : ''}. ${String(row?.description ?? '')}`,
       META_DESCRIPTION_LIMIT,

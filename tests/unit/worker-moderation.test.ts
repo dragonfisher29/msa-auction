@@ -691,7 +691,7 @@ describe('a hidden listing is invisible to everyone but an admin', () => {
     const shell = `<!doctype html>
 <html>
   <head>
-    <title>MSA Auction</title>
+    <title>MSA Pasar Karat</title>
     <meta name="description" content="Real-time online auction platform." />
   </head>
   <body></body>

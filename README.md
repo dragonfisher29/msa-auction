@@ -1,12 +1,14 @@
 <div align="center">
   <img src="assets/MSA_Logo.png" alt="MSA Southampton logo" width="120" />
 
-  <h1>MSA Auction</h1>
+  <h1>MSA Pasar Karat</h1>
 
   <p>A fixed-price classifieds board for MSA Southampton (~300 members), built on React and Cloudflare Workers.</p>
 
   <p><strong>Live:</strong> <a href="https://msa-auction.msasoton.workers.dev/">https://msa-auction.msasoton.workers.dev/</a></p>
 </div>
+
+The Cloudflare Worker is still named `msa-auction` and the live URL keeps the `msa-auction.msasoton.workers.dev` domain — renaming either would break the deploy and the shared links already in circulation, so only the display name changed.
 
 ---
 
@@ -57,7 +59,7 @@ seller cancels it, or `LISTING_TTL_DAYS` days pass since it was created (default
 
 Open the site and you land on the browse grid. Each card shows the item photo, its asking price and category. If there are more listings than fit on the first page, a **Load More** button appears below the grid.
 
-![MSA Auction homepage showing the browse grid with listing cards, each displaying an item photo, price and category](docs/images/01-homepage.png)
+![MSA Pasar Karat homepage showing the browse grid with listing cards, each displaying an item photo, price and category](docs/images/01-homepage.png)
 
 ### 2. Create an account or sign in
 

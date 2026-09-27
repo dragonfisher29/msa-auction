@@ -1296,9 +1296,9 @@ const SHELL = `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <title>MSA Auction</title>
+    <title>MSA Pasar Karat</title>
     <meta name="description" content="Real-time online auction platform." />
-    <meta property="og:title" content="MSA Auction" />
+    <meta property="og:title" content="MSA Pasar Karat" />
     <meta property="og:description" content="Real-time online auction platform." />
     <meta property="og:type" content="website" />
     <meta property="og:image" content="/MSA_Logo.png" />
@@ -1353,7 +1353,7 @@ describe('GET /auction/:id - Open Graph injection', () => {
     const { html } = await fetchShare('/auction/auc_1', assetsEnv());
 
     expect(html.match(/<title>/g)).toHaveLength(1);
-    expect(html).toContain('<title>Vintage lamp - £250 | MSA Auction</title>');
+    expect(html).toContain('<title>Vintage lamp - £250 | MSA Pasar Karat</title>');
     expect(html).toContain('content="For sale at £250. A lamp"');
     expect(html).not.toContain('Bidding');
     expect(html.match(/property="og:image"/g)).toHaveLength(1);
@@ -1368,7 +1368,7 @@ describe('GET /auction/:id - Open Graph injection', () => {
     const { html } = await fetchShare('/auction/auc_1', assetsEnv());
 
     // Escaped only for HTML (the apostrophe), otherwise verbatim - not expanded into page text.
-    expect(html).toContain('<title>Lamp $` and $&amp; and $&#39; and $$ deal - £10 | MSA Auction</title>');
+    expect(html).toContain('<title>Lamp $` and $&amp; and $&#39; and $$ deal - £10 | MSA Pasar Karat</title>');
     // `$\`` would have spliced everything before </head> in again: exactly one doctype, one <head>.
     expect(html.match(/<!doctype html>/gi)).toHaveLength(1);
     expect(html.match(/<head>/g)).toHaveLength(1);
@@ -1381,7 +1381,7 @@ describe('GET /auction/:id - Open Graph injection', () => {
 
     const { html } = await fetchShare('/auction/auc_1', assetsEnv());
 
-    expect(html).toContain('<title>Vintage lamp - £12.50 | MSA Auction</title>');
+    expect(html).toContain('<title>Vintage lamp - £12.50 | MSA Pasar Karat</title>');
   });
 
   it('labels a sold and an expired listing as such', async () => {
