@@ -8,7 +8,6 @@
   <p><strong><a href="https://msa-auction.msasoton.workers.dev/">Open the marketplace →</a></strong></p>
 </div>
 
-[![Watch the MSA Pasar Karat launch video]
 <div align="center">
   <video src="https://github.com/user-attachments/assets/57ad3a8c-0db1-42cd-bd24-225f6fe1d15e" width="600" controls></video>
 </div>
