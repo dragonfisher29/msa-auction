@@ -62,6 +62,12 @@ export interface AuctionItem {
    * /api/auctions` (create), or from a `PATCH` (edit) response.
    */
   imageCount?: number;
+  /**
+   * Bumped (epoch ms) whenever the listing's photos change; 0 for listings untouched since v1.
+   * Sent as `?v=` to `GET /api/auctions/:id/images` so a cached response is only reused while it
+   * still matches. Present on list and detail rows.
+   */
+  imagesVersion?: number;
   createdAt: number;
 }
 

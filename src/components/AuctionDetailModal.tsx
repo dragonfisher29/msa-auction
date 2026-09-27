@@ -20,7 +20,7 @@ import { AuctionItem, User } from '../types';
 import { buildWhatsAppUrl, formatExpiresIn, formatListedAgo, formatPrice } from '../lib/formatters';
 import { apiFetchAuthed } from '../lib/api';
 import { AUTH_ERROR_CODES, readErrorCode } from '../lib/apiErrors';
-import { fetchAuctionImages, imagesVersionOf } from '../lib/images';
+import { fetchAuctionImages } from '../lib/images';
 import { getListingStatus, LISTING_STATUS_EXPLANATION, LISTING_STATUS_LABEL } from '../lib/listing';
 import { PLACEHOLDER_IMAGE_URL } from '../lib/placeholder';
 import { SITE_NAME } from '../lib/site';
@@ -195,7 +195,7 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
   // the server's signal that the photos themselves changed). The gallery needs every photo, so
   // this fetches the full set; fetchAuctionImages caches on (id, version), so this stays free
   // once resolved.
-  const imagesVersion = imagesVersionOf(auction);
+  const imagesVersion = auction.imagesVersion;
   useEffect(() => {
     const inline = extractInlineImages(auction);
     if (inline) {

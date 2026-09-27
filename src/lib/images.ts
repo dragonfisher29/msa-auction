@@ -30,16 +30,6 @@ function sanitize(urls: unknown): string[] {
     : [];
 }
 
-/**
- * The listing's `imagesVersion` (epoch ms of its last photo change, 0 = unchanged since v1), or
- * `undefined` when the row does not carry one. Read defensively because `AuctionItem` in
- * `src/types.ts` does not declare the field yet.
- */
-export function imagesVersionOf(auction: unknown): number | undefined {
-  const value = (auction as { imagesVersion?: unknown } | null)?.imagesVersion;
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
-}
-
 export interface FetchAuctionImagesOptions {
   /**
    * Only the cover photo (`?first=1`): what a browse card shows. The server extracts it in the

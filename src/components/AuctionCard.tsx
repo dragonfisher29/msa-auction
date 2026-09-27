@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { ArrowUpRight, CalendarDays, Star, Images, ImageOff, User as UserIcon } from 'lucide-react';
 import { AuctionItem } from '../types';
 import { formatListedAgo, formatPrice } from '../lib/formatters';
-import { fetchAuctionImages, imagesVersionOf } from '../lib/images';
+import { fetchAuctionImages } from '../lib/images';
 import { getListingStatus, LISTING_STATUS_LABEL } from '../lib/listing';
 import { PLACEHOLDER_IMAGE_URL } from '../lib/placeholder';
 import { useInViewport } from '../lib/useInViewport';
@@ -44,7 +44,7 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({
   // version, and `fetchAuctionImages` caches on the same key -- so refreshing a page of cards
   // triggers zero additional image requests after the first load. `first: true` asks for the
   // cover photo only: a card never shows the others, so it never downloads them.
-  const imagesVersion = imagesVersionOf(auction);
+  const imagesVersion = auction.imagesVersion;
   useEffect(() => {
     if (!needsFetch || !isInViewport) {
       return;
