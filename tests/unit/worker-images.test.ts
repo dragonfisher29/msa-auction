@@ -667,6 +667,36 @@ describe('isStrictNewDataImageUrl', () => {
     expect(isStrictNewDataImageUrl(undefined)).toBe(false);
     expect(isStrictNewDataImageUrl('/images/11111111-2222-4333-8444-555555555555.png')).toBe(false);
   });
+
+  it('still rejects non-image and non-raster data URLs under the O(1) check', () => {
+    for (const value of [
+      'data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==',
+      'data:application/octet-stream;base64,QUFB',
+      'data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=',
+      'data:image/jpeg;base64,',
+      'data:image/jpeg;base64,==',
+      'data:image/jpeg;base64,QUFB===',
+      'data:image/jpeg;base64, QUFB',
+      'data:image/jpeg;base64,QUFB"><script>alert(1)</script>',
+      'data:image/jpeg;base64,<svg onload=alert(1)>QUFB',
+    ]) {
+      expect(isStrictNewDataImageUrl(value), value).toBe(false);
+    }
+  });
+
+  it('accepts a large well-formed image, and catches bad characters at the ends and on sample points', () => {
+    const payload = Buffer.alloc(299 * 1024, 7).toString('base64');
+    expect(isStrictNewDataImageUrl(`data:image/jpeg;base64,${payload}`)).toBe(true);
+    expect(isStrictNewDataImageUrl(`DATA:IMAGE/JPEG;BASE64,${payload}`)).toBe(true);
+
+    // Position `start` is always sampled, as are the last 64 characters.
+    expect(isStrictNewDataImageUrl(`data:image/jpeg;base64,!${payload}`)).toBe(false);
+    expect(isStrictNewDataImageUrl(`data:image/jpeg;base64,${payload.slice(0, -10)}!!!!!!!!!!`)).toBe(false);
+    // A character on a middle sample point (index 0 of the payload + k * stride).
+    const stride = Math.floor(payload.length / 64);
+    const corrupted = `${payload.slice(0, stride * 30)}#${payload.slice(stride * 30 + 1)}`;
+    expect(isStrictNewDataImageUrl(`data:image/jpeg;base64,${corrupted}`)).toBe(false);
+  });
 });
 
 describe('estimateDataUrlBytes fails safe on a malformed data:image/ value', () => {

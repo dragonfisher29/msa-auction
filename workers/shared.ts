@@ -2118,7 +2118,22 @@ export function isStoredImagePath(value: unknown): boolean {
  * long-standing `data:image/...` value.
  */
 export function isDataImageUrl(value: unknown): boolean {
-  return typeof value === 'string' && value.trim().toLowerCase().startsWith('data:image/');
+  // Lower-cases the 11-character prefix only. `value.toLowerCase()` would copy the whole string -
+  // megabytes of base64 - on every create and edit.
+  return typeof value === 'string' && value.trimStart().slice(0, 11).toLowerCase() === 'data:image/';
+}
+
+/** The strict prefix, tested against the first few dozen characters only - see below. */
+const STRICT_NEW_DATA_IMAGE_PREFIX = /^data:image\/(?:jpeg|png|webp|gif);base64,/i;
+
+/** Positions inspected at each end of the payload, and spread evenly through the middle. */
+const BASE64_SAMPLE_SIZE = 64;
+
+/** `A-Z a-z 0-9 + /` - the base64 alphabet, without padding. */
+function isBase64CharCode(code: number): boolean {
+  return (
+    (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || (code >= 48 && code <= 57) || code === 43 || code === 47
+  );
 }
 
 /**
@@ -2138,11 +2153,59 @@ export function isDataImageUrl(value: unknown): boolean {
  * used to make that function's regex fail to match and silently return 0 - i.e. "free" storage
  * for an arbitrarily large inline image. None of those match this pattern, so all three are now
  * refused outright as a NEW image, at any size.
+ *
+ * CPU BUDGET. This runs on every create/edit over up to ~1.2 MB of base64, inside a Workers free
+ * plan request capped at 10 ms of CPU. It used to be one anchored regex over the whole string
+ * (`^data:image/...;base64,[a-z0-9+/]+={0,2}$`), which walks every byte. It is now O(1):
+ *   - the exact prefix (type whitelist, no extra parameters) is matched on the first 32 chars;
+ *   - up to two `=` of padding are allowed, at the very end only;
+ *   - the base64 alphabet is checked on the first and last 64 payload chars and on 64 positions
+ *     spread evenly through the middle.
+ * The prefix check is the security-relevant part and stays exact: it is what closes the size-cap
+ * bypass above, and what keeps anything but a whitelisted raster type out. The sampled alphabet
+ * check is a sanity check, not a guarantee - a stray invalid character between two sample points
+ * gets through. That is acceptable because this string is only ever used as an `<img src>` (a
+ * corrupt `data:image/jpeg` payload fails to decode; it cannot execute), and its SIZE is measured
+ * from its length, which such a character can only over-estimate.
  */
-const STRICT_NEW_DATA_IMAGE_PATTERN = /^data:image\/(jpeg|png|webp|gif);base64,[a-z0-9+/]+={0,2}$/i;
-
 export function isStrictNewDataImageUrl(value: unknown): boolean {
-  return typeof value === 'string' && STRICT_NEW_DATA_IMAGE_PATTERN.test(value.trim());
+  if (typeof value !== 'string') {
+    return false;
+  }
+
+  const trimmed = value.trim();
+  const prefix = STRICT_NEW_DATA_IMAGE_PREFIX.exec(trimmed.slice(0, 32));
+  if (!prefix) {
+    return false;
+  }
+
+  const start = prefix[0].length;
+  let end = trimmed.length;
+  // Up to two `=` of padding, and only at the very end.
+  for (let padding = 0; padding < 2 && end > start && trimmed.charCodeAt(end - 1) === 61; padding += 1) {
+    end -= 1;
+  }
+
+  const payloadLength = end - start;
+  if (payloadLength <= 0) {
+    return false;
+  }
+
+  const headEnd = Math.min(end, start + BASE64_SAMPLE_SIZE);
+  for (let index = start; index < headEnd; index += 1) {
+    if (!isBase64CharCode(trimmed.charCodeAt(index))) return false;
+  }
+
+  for (let index = Math.max(start, end - BASE64_SAMPLE_SIZE); index < end; index += 1) {
+    if (!isBase64CharCode(trimmed.charCodeAt(index))) return false;
+  }
+
+  const stride = Math.max(1, Math.floor(payloadLength / BASE64_SAMPLE_SIZE));
+  for (let index = start; index < end; index += stride) {
+    if (!isBase64CharCode(trimmed.charCodeAt(index))) return false;
+  }
+
+  return true;
 }
 
 /**
@@ -2178,18 +2241,22 @@ export function estimateDataUrlBytes(value: unknown): number {
   }
 
   const trimmed = value.trim();
-  const match = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+)?;base64,([\s\S]*)$/i.exec(trimmed);
-  if (!match) {
+  // The header is matched on the first 128 characters only, and the payload is measured by
+  // arithmetic on the string length - no regex, copy or whitespace strip walks the payload (see
+  // the CPU note on `isStrictNewDataImageUrl`). Whitespace inside the payload is therefore counted
+  // as if it were data, which can only OVER-estimate: never an under-count, so never a bypass.
+  const header = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+)?;base64,/i.exec(trimmed.slice(0, 128));
+  if (!header) {
     return isDataImageUrl(trimmed) ? trimmed.length : 0;
   }
 
-  const base64 = (match[2] ?? '').replace(/\s+/g, '');
-  if (!base64) {
+  const payloadLength = trimmed.length - header[0].length;
+  if (payloadLength <= 0) {
     return 0;
   }
 
-  const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
-  return Math.max(0, Math.floor((base64.length * 3) / 4) - padding);
+  const padding = trimmed.endsWith('==') ? 2 : trimmed.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.floor((payloadLength * 3) / 4) - padding);
 }
 
 /**
