@@ -1,41 +1,61 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   buildWhatsAppUrl,
-  formatCurrency,
-  formatCurrencyPrecise,
+  formatExpiresIn,
+  formatListedAgo,
+  formatPrice,
   formatTimeRemaining,
-  formatTimestamp,
 } from '../../src/lib/formatters';
 
-describe('formatCurrency', () => {
-  it('formats a whole pound amount with the £ symbol and no decimals', () => {
-    expect(formatCurrency(1234)).toBe('£1,234');
+describe('formatPrice', () => {
+  it('renders whole pounds with no decimals', () => {
+    expect(formatPrice(1234)).toBe('£1,234');
   });
 
   it('formats zero', () => {
-    expect(formatCurrency(0)).toBe('£0');
+    expect(formatPrice(0)).toBe('£0');
   });
 
-  it('rounds fractional amounts to the nearest whole pound', () => {
-    expect(formatCurrency(99.5)).toBe('£100');
-  });
-});
-
-describe('formatCurrencyPrecise', () => {
-  it('renders whole pounds with no decimals', () => {
-    expect(formatCurrencyPrecise(1234)).toBe('£1,234');
-  });
-
-  it('renders £99.50 with pence', () => {
-    expect(formatCurrencyPrecise(99.5)).toBe('£99.50');
+  it('never rounds pence away: £99.50 stays £99.50, not £100', () => {
+    expect(formatPrice(99.5)).toBe('£99.50');
   });
 
   it('renders £100.01 with pence', () => {
-    expect(formatCurrencyPrecise(100.01)).toBe('£100.01');
+    expect(formatPrice(100.01)).toBe('£100.01');
   });
 
   it('keeps thousands separators for large values', () => {
-    expect(formatCurrencyPrecise(1234567.5)).toBe('£1,234,567.50');
+    expect(formatPrice(1234567.5)).toBe('£1,234,567.50');
+  });
+});
+
+describe('formatListedAgo / formatExpiresIn', () => {
+  const NOW = new Date('2026-01-31T12:00:00.000Z').getTime();
+  const HOUR = 60 * 60 * 1000;
+  const DAY = 24 * HOUR;
+
+  it('says "today" for anything under a day old', () => {
+    expect(formatListedAgo(NOW - 23 * HOUR, NOW)).toBe('Listed today');
+    expect(formatListedAgo(NOW, NOW)).toBe('Listed today');
+  });
+
+  it('uses the singular for exactly one day and the plural beyond it', () => {
+    expect(formatListedAgo(NOW - DAY, NOW)).toBe('Listed 1 day ago');
+    expect(formatListedAgo(NOW - 12 * DAY - 5 * HOUR, NOW)).toBe('Listed 12 days ago');
+  });
+
+  it('never goes negative for a createdAt slightly in the future (clock skew)', () => {
+    expect(formatListedAgo(NOW + 5 * 60 * 1000, NOW)).toBe('Listed today');
+  });
+
+  it('rounds the time left up to whole days', () => {
+    expect(formatExpiresIn(NOW + 29 * DAY + HOUR, NOW)).toBe('Expires in 30 days');
+    expect(formatExpiresIn(NOW + 36 * HOUR, NOW)).toBe('Expires in 2 days');
+  });
+
+  it('says "within a day" under 24 hours and "Expired" once past', () => {
+    expect(formatExpiresIn(NOW + 3 * HOUR, NOW)).toBe('Expires within a day');
+    expect(formatExpiresIn(NOW - 1, NOW)).toBe('Expired');
   });
 });
 
@@ -51,10 +71,10 @@ describe('formatTimeRemaining', () => {
     vi.useRealTimers();
   });
 
-  it('reports an already-ended auction', () => {
+  it('reports an already-passed deadline as ended', () => {
     const info = formatTimeRemaining(NOW - 1000);
     expect(info).toEqual({
-      formatted: 'Auction Ended',
+      formatted: 'Ended',
       isEnded: true,
       isUrgent: false,
       hours: 0,
@@ -63,7 +83,7 @@ describe('formatTimeRemaining', () => {
     });
   });
 
-  it('reports an auction ending exactly now as ended', () => {
+  it('reports a deadline of exactly now as ended', () => {
     const info = formatTimeRemaining(NOW);
     expect(info.isEnded).toBe(true);
   });
@@ -103,23 +123,6 @@ describe('formatTimeRemaining', () => {
   it('flags anything under 5 minutes remaining as urgent, and anything at or above as not urgent', () => {
     expect(formatTimeRemaining(NOW + (5 * 60 * 1000) - 1).isUrgent).toBe(true);
     expect(formatTimeRemaining(NOW + (5 * 60 * 1000)).isUrgent).toBe(false);
-  });
-});
-
-describe('formatTimestamp', () => {
-  it('renders a locale time string with hours, minutes, and seconds', () => {
-    const result = formatTimestamp(new Date('2026-01-01T22:13:20.000Z').getTime());
-    expect(result).toMatch(/^\d{1,2}:\d{2}:\d{2}\s?([ap]\.?m\.?)?$/i);
-  });
-
-  it('matches the same locale formatting the implementation delegates to', () => {
-    const ts = 1700000000000;
-    const expected = new Date(ts).toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    });
-    expect(formatTimestamp(ts)).toBe(expected);
   });
 });
 

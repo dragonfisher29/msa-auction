@@ -1,11 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { startPolling, checkHealth } from '../../src/lib/realtime';
+import { startPolling } from '../../src/lib/realtime';
 
 function setVisibility(state: DocumentVisibilityState) {
   Object.defineProperty(document, 'visibilityState', {
     value: state,
     configurable: true,
   });
+}
+
+function becomeVisible() {
+  setVisibility('visible');
+  document.dispatchEvent(new Event('visibilitychange'));
 }
 
 describe('startPolling', () => {
@@ -19,12 +24,15 @@ describe('startPolling', () => {
     vi.restoreAllMocks();
   });
 
-  it('polls fn repeatedly on the interval', async () => {
+  it('polls fn repeatedly on the interval, starting one interval after it is started', async () => {
     const fn = vi.fn().mockResolvedValue('data');
     const onData = vi.fn();
     const stop = startPolling(fn, 1000, onData);
 
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fn).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
     expect(fn).toHaveBeenCalledTimes(1);
     expect(onData).toHaveBeenNthCalledWith(1, 'data');
 
@@ -37,7 +45,7 @@ describe('startPolling', () => {
     stop();
   });
 
-  it('does not overlap: skips a tick while the previous fn call is still pending', async () => {
+  it('never overlaps: the next run is scheduled only after the previous one finishes', async () => {
     let resolveFn: (value: string) => void = () => {};
     const fn = vi.fn().mockImplementation(
       () => new Promise<string>((resolve) => { resolveFn = resolve; }),
@@ -48,22 +56,24 @@ describe('startPolling', () => {
     await vi.advanceTimersByTimeAsync(1000);
     expect(fn).toHaveBeenCalledTimes(1);
 
-    // A second interval tick fires while the first call is still in flight.
-    await vi.advanceTimersByTimeAsync(1000);
+    // Well past another interval while the first call is still in flight: no second call.
+    await vi.advanceTimersByTimeAsync(5000);
     expect(fn).toHaveBeenCalledTimes(1);
 
     resolveFn('first-result');
     await vi.advanceTimersByTimeAsync(0);
     expect(onData).toHaveBeenCalledWith('first-result');
 
-    // Now that the in-flight call resolved, the next tick runs fn again.
-    await vi.advanceTimersByTimeAsync(1000);
+    // The next run is a full interval after the first one resolved -- no catch-up burst.
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fn).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
     expect(fn).toHaveBeenCalledTimes(2);
 
     stop();
   });
 
-  it('the returned stop function halts further polling', async () => {
+  it('the returned stop function halts further polling and detaches the wake listeners', async () => {
     const fn = vi.fn().mockResolvedValue('data');
     const onData = vi.fn();
     const stop = startPolling(fn, 1000, onData);
@@ -74,6 +84,9 @@ describe('startPolling', () => {
     stop();
 
     await vi.advanceTimersByTimeAsync(10000);
+    window.dispatchEvent(new Event('focus'));
+    becomeVisible();
+    await vi.advanceTimersByTimeAsync(0);
     expect(fn).toHaveBeenCalledTimes(1);
   });
 
@@ -96,27 +109,76 @@ describe('startPolling', () => {
     expect(onData).not.toHaveBeenCalled();
   });
 
-  it('skips ticks while the tab is hidden and fires immediately when it becomes visible again', async () => {
+  it('makes no requests at all while the tab is hidden, and fires immediately when it becomes visible again', async () => {
     setVisibility('hidden');
 
     const fn = vi.fn().mockResolvedValue('data');
     const onData = vi.fn();
     const stop = startPolling(fn, 1000, onData);
 
-    await vi.advanceTimersByTimeAsync(3000);
+    await vi.advanceTimersByTimeAsync(10000);
     expect(fn).not.toHaveBeenCalled();
 
-    setVisibility('visible');
-    document.dispatchEvent(new Event('visibilitychange'));
+    becomeVisible();
     await vi.advanceTimersByTimeAsync(0);
 
     expect(fn).toHaveBeenCalledTimes(1);
     expect(onData).toHaveBeenCalledWith('data');
 
+    // And the regular interval resumes from there.
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fn).toHaveBeenCalledTimes(2);
+
     stop();
   });
 
-  it('a rejected fn does not kill the interval; subsequent ticks still run', async () => {
+  it('refreshes on window focus once minGapMs has passed since the last run', async () => {
+    const fn = vi.fn().mockResolvedValue('data');
+    const onData = vi.fn();
+    const stop = startPolling(fn, 60_000, onData, { minGapMs: 30_000 });
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    window.dispatchEvent(new Event('focus'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(fn).toHaveBeenCalledTimes(1);
+
+    stop();
+  });
+
+  it('throttles wake events: focus + visibilitychange together, or a quick alt-tab, cost nothing extra', async () => {
+    const fn = vi.fn().mockResolvedValue('data');
+    const onData = vi.fn();
+    const stop = startPolling(fn, 60_000, onData, { minGapMs: 30_000 });
+
+    // Too soon after start (which counts as the caller's own initial fetch).
+    await vi.advanceTimersByTimeAsync(10_000);
+    window.dispatchEvent(new Event('focus'));
+    becomeVisible();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fn).not.toHaveBeenCalled();
+
+    // Past the gap: the pair of events fires exactly one request.
+    await vi.advanceTimersByTimeAsync(25_000);
+    window.dispatchEvent(new Event('focus'));
+    becomeVisible();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fn).toHaveBeenCalledTimes(1);
+
+    stop();
+  });
+
+  it('stays within one request per interval while left open and visible', async () => {
+    const fn = vi.fn().mockResolvedValue('data');
+    const stop = startPolling(fn, 60_000, vi.fn());
+
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(fn).toHaveBeenCalledTimes(10);
+
+    stop();
+  });
+
+  it('a rejected fn does not kill the loop; subsequent runs still happen', async () => {
     const fn = vi.fn()
       .mockRejectedValueOnce(new Error('boom'))
       .mockResolvedValueOnce('ok');
@@ -135,44 +197,5 @@ describe('startPolling', () => {
     expect(onData).toHaveBeenCalledWith('ok');
 
     stop();
-  });
-});
-
-describe('checkHealth', () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it('returns true only when the response is ok and the body status is "ok"', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ status: 'ok' }),
-    }));
-
-    await expect(checkHealth()).resolves.toBe(true);
-  });
-
-  it('returns false for a non-ok response', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: false,
-      json: async () => ({ status: 'ok' }),
-    }));
-
-    await expect(checkHealth()).resolves.toBe(false);
-  });
-
-  it('returns false for a wrong status string', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ status: 'degraded' }),
-    }));
-
-    await expect(checkHealth()).resolves.toBe(false);
-  });
-
-  it('returns false when fetch rejects', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network down')));
-
-    await expect(checkHealth()).resolves.toBe(false);
   });
 });

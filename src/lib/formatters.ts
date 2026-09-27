@@ -1,15 +1,9 @@
-export function formatCurrency(amount: number): string {
-  return new Intl.NumberFormat('en-GB', {
-    style: 'currency',
-    currency: 'GBP',
-    maximumFractionDigits: 0,
-  }).format(amount);
-}
+const DAY_MS = 24 * 60 * 60 * 1000;
 
-// Unlike formatCurrency (which always rounds to whole pounds for dashboard/headline display),
-// this shows pence when the amount actually has a fractional part. Used for bid-related
-// messages, where a rounded figure can misstate the real threshold or the real amount bid.
-export function formatCurrencyPrecise(amount: number): string {
+// A listing's asking price. Shows pence only when the amount actually has a fractional part:
+// £25 stays "£25", but £12.50 must never be rounded to "£13" -- it is the exact price a buyer
+// will be asked to pay.
+export function formatPrice(amount: number): string {
   // Intl's minimumFractionDigits is static, so it can't drop trailing pence on its own
   // (99.50 would render as "£99.5"). Decide the minimum from the actual value instead:
   // whole pounds get no decimals, anything with pence gets exactly two.
@@ -34,7 +28,7 @@ export function formatTimeRemaining(endTime: number): {
 
   if (diff <= 0) {
     return {
-      formatted: 'Auction Ended',
+      formatted: 'Ended',
       isEnded: true,
       isUrgent: false,
       hours: 0,
@@ -69,14 +63,37 @@ export function formatTimeRemaining(endTime: number): {
   };
 }
 
-export function formatTimestamp(timestamp: number): string {
-  const date = new Date(timestamp);
-  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+// Whole days between two instants, never negative. Floors, so "23 hours ago" is still today.
+function wholeDaysBetween(from: number, to: number): number {
+  return Math.max(0, Math.floor((to - from) / DAY_MS));
 }
 
-// formatTimestamp above is deliberately clock-only: it labels bids inside a live auction, where
-// the day is never in question. The moderation queue is the opposite case -- a report can sit
-// there for a week -- so it needs the date too. Same locale-default approach, one place.
+// "Listed today" / "Listed 1 day ago" / "Listed 12 days ago". Day granularity on purpose: a
+// classifieds board has no use for a ticking clock, and a static label needs no timer to
+// keep it honest.
+export function formatListedAgo(createdAt: number, now: number = Date.now()): string {
+  const days = wholeDaysBetween(createdAt, now);
+  if (days === 0) {
+    return 'Listed today';
+  }
+  return `Listed ${days} ${days === 1 ? 'day' : 'days'} ago`;
+}
+
+// "Expires within a day" / "Expires in 29 days" -- shown on the detail view so the 30-day
+// lifetime is never a surprise. Rounds up: 36 hours left reads "in 2 days", not "in 1".
+export function formatExpiresIn(expiresAt: number, now: number = Date.now()): string {
+  const remaining = expiresAt - now;
+  if (remaining <= 0) {
+    return 'Expired';
+  }
+  if (remaining < DAY_MS) {
+    return 'Expires within a day';
+  }
+  return `Expires in ${Math.ceil(remaining / DAY_MS)} days`;
+}
+
+// Locale date + time. The moderation queue needs the date as well as the time -- a report can
+// sit there for a week.
 export function formatDateTime(timestamp: number): string {
   const date = new Date(timestamp);
   return date.toLocaleString([], {

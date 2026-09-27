@@ -1,14 +1,14 @@
 /**
  * Whether one account has dismissed the "add a recovery email" prompt in AccountView.
  *
- * Keyed per user id, exactly like `notificationStorage.ts` and deliberately NOT like the
- * globally-keyed watchlist in `App.tsx`: two students sharing a library browser must not have
- * one's dismissal hide the prompt from the other, who may be the one account that still has no
- * email and therefore no way back in after a forgotten password.
+ * Keyed per user id, deliberately NOT like the globally-keyed watchlist in `App.tsx`: two
+ * students sharing a library browser must not have one's dismissal hide the prompt from the
+ * other, who may be the one account that still has no email and therefore no way back in after
+ * a forgotten password.
  *
- * Defensive on every path, for the same reasons as the notification store: localStorage throws
- * in private mode and with site data blocked, and a bad read must only cost the user a prompt
- * they can dismiss again -- never take the account page down.
+ * Defensive on every path: localStorage throws in private mode and with site data blocked, and a
+ * bad read must only cost the user a prompt they can dismiss again -- never take the account
+ * page down.
  */
 
 const KEY_PREFIX = 'msa_email_prompt_dismissed';
