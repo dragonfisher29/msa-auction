@@ -46,8 +46,10 @@ owner-approved retention policy (30 days after a listing's `expires_at`), not a 
 The product changed from a live auction to a fixed-price classifieds board — see the
 README for the full feature list. For deployment, the load-bearing differences are:
 
-- Two new migrations, `006_fixed_price_listings.sql` (additive) and
-  `007_drop_bid_columns.sql` (destructive, irreversible).
+- Two new migrations, `006_fixed_price_listings.sql` (adds columns and backfills —
+  and, per the owner's decision, converts live auctions with bids to sold at their
+  current highest bid, which is not reversible from inside the database — see section
+  5 step 3) and `007_drop_bid_columns.sql` (destructive, irreversible).
 - The Worker's cron triggers drop from two (`* * * * *` settlement, `0 3 * * *`
   cleanup) to one (`0 3 * * *` cleanup only) — `wrangler.toml` already reflects this.
 - A new `LISTING_TTL_DAYS` plaintext var controls how long a listing stays live.
@@ -128,7 +130,7 @@ select username, role from public.users where role = 'admin';
 ## 5. THE V1 CUT-OVER RUNBOOK
 
 Do these in order. Each step names what it changes and, where relevant, whether it
-can be undone. **Steps 2 and 6 touch the database and are the ones to slow down for.**
+can be undone. **Steps 3 and 7 touch the database and are the ones to slow down for.**
 
 ### Step 1 — Rotate the Supabase secret key, and disable legacy JWT keys
 
@@ -164,14 +166,59 @@ of no return for the leaked key** — that's intentional. If something breaks af
 disabling them, the fix is re-enabling the legacy keys in Supabase, not reverting
 Cloudflare.
 
-### Step 2 — Run migration 006, then its verification queries
+### Step 2 — Back up `auctions` before migration 006
+
+Migration 006 is not reversible from inside the database once it runs (see step 3's
+"Reversible?" note) — per the owner's decision, it converts live auctions that already
+have a bid to `'sold'` at their current highest bid. Take a backup first, in the
+**Supabase SQL Editor**, using the same backup-schema-with-RLS pattern migration 007's
+own header uses for `backup.auctions_pre007` (step 6):
+
+```sql
+create schema if not exists backup;
+create table backup.auctions_pre006 as table public.auctions;
+alter table backup.auctions_pre006 enable row level security;
+```
+
+Then confirm the row count matches:
+
+```sql
+select (select count(*) from public.auctions) as live_count,
+       (select count(*) from backup.auctions_pre006) as backup_count;
+```
+
+Expect the two numbers to be equal. Row level security is enabled with no policies for
+the same reason as `backup.auctions_pre007`: the rows contain sellers' phone numbers,
+and a copy sitting in `public` with RLS off would be readable by anyone holding the
+(non-secret) anon key.
+
+### Step 3 — Tell sellers and bidders first, then run migration 006
+
+**Before you run this**, bidding on the live site is ending for good. Post a notice
+(society WhatsApp/social channels) telling sellers and bidders of live auctions that
+bidding is closing and that every live listing with at least one bid will convert to
+**sold, at its current highest bid** the moment this migration runs — see below. Give
+people a reasonable window to place a final bid or walk away before you run it.
 
 **Supabase dashboard → SQL Editor.** Open `migrations/006_fixed_price_listings.sql`,
-read its header comment in full, copy the whole file, and run it. It is additive
-(adds `price`, `expires_at`, `sold_at`, backfills every row, adds indexes, installs a
-transitional trigger) and safe to re-run. It is safe to run **before** the new Worker
-deploys — the old (bidding) Worker keeps working against the same table while this is
-in place, kept correct by the transitional trigger.
+read its header comment in full, copy the whole file, and run it. It is **not purely
+additive** — besides adding `price`, `expires_at` and `sold_at`, adding indexes and
+installing a transitional trigger, it also: rewrites rows that ended with a winner to
+status `'sold'`; drops `NOT NULL` on the bid-era columns the new Worker no longer
+writes; drops any legacy `CHECK` constraint on `auctions.status` before the backfill
+runs (re-adding one, `NOT VALID`, afterwards, so an unexpected legacy status is still
+backfilled rather than aborting the migration); and, per the owner's decision, converts
+every **live** auction to a fixed-price listing as follows:
+
+- A live auction that already has at least one bid converts to `status = 'sold'`, at
+  its **current highest bid** (not the original starting price).
+- A live auction with no bids converts to a live listing at its **starting price**.
+- Every live auction — bid or no bid — gets a **fresh 30-day expiry** from the moment
+  006 runs, regardless of how long it had been live before.
+
+It is safe to run **before** the new Worker deploys — the old (bidding) Worker keeps
+working against the same table while this is in place, kept correct by the
+transitional trigger.
 
 Then run the verification queries from the bottom of that file (also reproduced
 here):
@@ -192,11 +239,13 @@ select count(*) from public.auctions
    and expires_at > (extract(epoch from now()) * 1000)::bigint;
 ```
 
-**Reversible?** Yes, by dropping the added columns/indexes/trigger — see the rollback
-notes at the end of this section. Nothing existing is modified destructively; this
-step only adds.
+**Reversible?** Only partly — see the rollback notes at the end of this section
+(step 8). Dropping the added columns/indexes/trigger undoes the additive part, but it
+does **not** restore rows rewritten to `'sold'`, the `NOT NULL` constraints that were
+dropped, or the original `status` `CHECK`. The only full restore is the backup taken
+**before** running 006, in step 2.
 
-### Step 3 — Merge `release/v1` into `main`
+### Step 4 — Merge `release/v1` into `main`
 
 This is what actually ships the new Worker — the Cloudflare Git-connected build
 deploys on every merge to `main`. On GitHub, open (or already have) a pull request
@@ -215,14 +264,18 @@ it's live, confirm two things in the dashboard before moving on:
   step, not a blocker, but confirm it landed as intended.
 
 **Reversible?** Rolling the Worker back to the previous deployment (dashboard →
-Deployments → pick the old version → **Rollback**) is immediate. See the rollback
-notes at the end of this section for what does and doesn't come back with it.
+Deployments → pick the old version → **Rollback**) is immediate, but it does not
+un-migrate the database: listings created under the new v1 client (which write
+`price`/`expires_at` and never `end_time`) will show as **Ended** in the old
+(bidding) UI, since that UI reads `end_time` to work out whether an auction is live.
+See the rollback notes at the end of this section for what does and doesn't come back
+with it.
 
-### Step 4 — Smoke test the live site
+### Step 5 — Smoke test the live site
 
 Do all of these against `https://msa-auction.msasoton.workers.dev/` before touching
-the database again (step 5). If anything here fails, stop and roll back the Worker
-(step 3's rollback) before you run migration 007 — 007 is not designed to run against
+the database again (step 6). If anything here fails, stop and roll back the Worker
+(step 4's rollback) before you run migration 007 — 007 is not designed to run against
 the old Worker.
 
 1. **Browse** — the homepage loads a grid of listings with prices, not a blank page
@@ -243,8 +296,11 @@ the old Worker.
 8. **Deep link to a missing listing** — open `/auction/<an-id-that-does-not-exist>`
    directly and confirm you see the "This listing is no longer available" notice,
    not a blank page or a crash.
+9. **Session expiry across devices** — sign in on a second device, then open a
+   listing on the first device and try to contact the seller. You should be asked to
+   sign in again there, not see an endless spinner.
 
-### Step 5 — Back up, per migration 007's own header
+### Step 6 — Back up, per migration 007's own header
 
 **Do this even though it feels redundant with migration 006 having just run.**
 Migration 007 is destructive and irreversible; its own header requires this backup as
@@ -268,15 +324,15 @@ with no policies — the rows contain sellers' phone numbers, and a copy sitting
 `public` with RLS off would be readable by anyone holding the (non-secret) anon key,
 which is exactly the hole migration 005 closed on the real table.
 
-### Step 6 — Run migration 007
+### Step 7 — Run migration 007
 
-**Only after step 4's smoke test has passed on the live, newly-deployed Worker.**
+**Only after step 5's smoke test has passed on the live, newly-deployed Worker.**
 Running this against the old (bidding) Worker breaks every page of the site — the old
 Worker reads columns this migration drops.
 
 **Supabase dashboard → SQL Editor.** Read `migrations/007_drop_bid_columns.sql`'s
 header in full — it repeats the backup requirement and states plainly that there is
-no "down" migration for the columns it drops, only the backup from step 5. Copy the
+no "down" migration for the columns it drops, only the backup from step 6. Copy the
 whole file and run it. Then run its own verification queries (reproduced here):
 
 ```sql
@@ -294,19 +350,20 @@ select status, count(*) from public.auctions group by 1 order by 1;
 `current_price`, `starting_price`, `highest_bidder_id`/`name`, `winner_id`/`name`,
 `winning_bid`, `duration_minutes`, `start_time`, `end_time` are gone for good once
 this commits. The only way back is restoring specific columns from
-`backup.auctions_pre007` (step 5) by hand, which is a manual, one-off SQL job, not a
+`backup.auctions_pre007` (step 6) by hand, which is a manual, one-off SQL job, not a
 migration file in this repo.
 
-### Step 7 — Rollback notes for each step above
+### Step 8 — Rollback notes for each step above
 
 | Step | Reversible? | How |
 | --- | --- | --- |
 | 1. Rotate secret key | Creating/setting the new key: yes. Disabling the legacy keys: **effectively no** — you would have to re-enable a key you deliberately revoked, defeating the point | Re-enable the legacy keys in Supabase if something depends on them; otherwise fix the dependency, don't undo the rotation |
-| 2. Migration 006 | Yes | `drop trigger if exists msa_v1_transition_sync on public.auctions; drop function if exists public.msa_v1_transition_sync(); alter table public.auctions drop column if exists price, drop column if exists expires_at, drop column if exists sold_at;` then drop the indexes it added (see the migration file) |
-| 3. Merge to `main` | Yes, immediately | Dashboard → Deployments → previous version → **Rollback**. A later merge to `main` (by anyone) redeploys the new code again — if the rollback needs to stick, also revert the merge commit on GitHub |
-| 4. Smoke test | N/A (read-only) | — |
-| 5. Backup | N/A (additive, harmless to leave) | Drop `backup.auctions_pre007` once you're confident you no longer need it |
-| 6. Migration 007 | **No**, not as a migration | Restore specific columns from `backup.auctions_pre007` by hand in the SQL Editor if you must; there is no scripted "down" for this file |
+| 2. Backup before 006 | N/A (additive, harmless to leave) | Drop `backup.auctions_pre006` once you're confident you no longer need it |
+| 3. Migration 006 | **Only partly** — the added columns/indexes/trigger can be dropped, but the rows rewritten to `'sold'` (at current highest bid), the dropped `NOT NULL`s and the dropped legacy `CHECK` do **not** come back this way | `drop trigger if exists msa_v1_transition_sync on public.auctions; drop function if exists public.msa_v1_transition_sync(); alter table public.auctions drop column if exists price, drop column if exists expires_at, drop column if exists sold_at;` then drop the indexes it added (see the migration file). For the rewritten data, restore from `backup.auctions_pre006` (step 2) by hand — that backup is the only full restore |
+| 4. Merge to `main` | Yes, immediately for the Worker code. **Not** for the database | Dashboard → Deployments → previous version → **Rollback**. A later merge to `main` (by anyone) redeploys the new code again — if the rollback needs to stick, also revert the merge commit on GitHub. Note: listings created under v1 will show as **Ended** in the old UI after this rollback, since the old client reads `end_time`, which v1 listings never set |
+| 5. Smoke test | N/A (read-only) | — |
+| 6. Backup before 007 | N/A (additive, harmless to leave) | Drop `backup.auctions_pre007` once you're confident you no longer need it |
+| 7. Migration 007 | **No**, not as a migration | Restore specific columns from `backup.auctions_pre007` by hand in the SQL Editor if you must; there is no scripted "down" for this file |
 
 ---
 
@@ -315,7 +372,7 @@ migration file in this repo.
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | Homepage is empty / `GET /api/auctions` returns 500 | Migration 001 (or 006) wasn't run before this deploy | Run the missing migration via the Supabase SQL Editor, then re-check the endpoint |
-| Every write to a listing (edit/sell/cancel) answers 500 mentioning `price` or `expires_at` | Migration 006 wasn't run before this Worker deployed | Run migration 006 (section 5, step 2) |
+| Every write to a listing (edit/sell/cancel) answers 500 mentioning `price` or `expires_at` | Migration 006 wasn't run before this Worker deployed | Run migration 006 (section 5, step 3) |
 | Admin panel doesn't appear for your account | No row has `role = 'admin'` yet, or you logged in before appointing yourself | Re-run section 4, then sign out and back in so the client fetches your current role |
 | Password reset links never arrive | No mail provider is configured — a known, permanent-for-now gap | Use `GET /api/admin/reset-requests` (admin token) to read the pending link and hand it to the student directly |
 | Reporting a listing returns 500 | Migration 003 wasn't run — the `reports` table doesn't exist | Run migration 003 (section 3) |

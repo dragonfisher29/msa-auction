@@ -31,13 +31,15 @@ not_found_handling = "single-page-application"
 # The client falls back to inlining the image itself, so listing creation works.
 #
 # TO TURN R2 ON LATER (only worth doing if Supabase egress is still too high)
-#
+# See DEPLOY.md, Appendix A ("OPTIONAL, LATER: moving images onto R2") for the
+# full steps. In short:
 #   1. Add a payment method to the Cloudflare account.
-#   2. npx wrangler r2 bucket create msa-auction-images
+#   2. Dashboard -> R2 -> Create bucket (Appendix A.1).
 #   3. Uncomment the three `[[r2_buckets]]` lines below.
-#   4. npx wrangler deploy
+#   4. Commit, open a pull request into `main`, and merge it -- the Cloudflare
+#      dashboard build deploys it (Appendix A.1); never `wrangler deploy` yourself.
 #   5. Run the backfill: POST /api/admin/migrate-images as an admin, repeatedly,
-#      until `migrated` comes back 0. See the appendix in DEPLOY.md.
+#      until `migrated` comes back 0 (Appendix A.3).
 #
 # NOTHING ELSE NEEDS CHANGING. No code edit, no migration, no client change --
 # the R2 implementation is still present and tested, it just has no bucket to
@@ -73,8 +75,9 @@ ENABLE_STALE_IMAGE_CLEANUP = "true"
 
 # SUPABASE_SERVICE_ROLE_KEY is a SECRET and must never appear in [vars] --
 # not even as a placeholder. It bypasses all Supabase row-level security.
-# Set it as an encrypted Worker secret instead:
-#   npx wrangler secret put SUPABASE_SERVICE_ROLE_KEY
+# Set it as an encrypted Worker secret through the Cloudflare dashboard instead
+# -- see DEPLOY.md, section 2 ("Environment and secrets") -- never with
+# `wrangler secret put`.
 # For local development put it in .dev.vars (git-ignored), not in this file.
 # At runtime the secret arrives on the same `env` object as the [vars] above,
 # so workers/index.ts needs no change.

@@ -26,7 +26,7 @@ seller cancels it, or `LISTING_TTL_DAYS` days pass since it was created (default
 **Browsing**
 
 - A browse grid of live listings, newest first, paginated with a **Load More** button (24 per page, keyset pagination via an opaque cursor).
-- Cards carry no image data — `GET /api/auctions` returns only an `imageCount`; the full `imageUrls` are fetched from `GET /api/auctions/:id/images` (cached 5 minutes) when a listing is opened.
+- Cards carry no image data — `GET /api/auctions` returns only an `imageCount`; `GET /api/auctions/:id/images` (cached 5 minutes) fetches the first image of each card as it scrolls into view, and all images when the listing is opened.
 - Search across title, description, category and seller name; filter by category; sort by newest, price low-to-high or price high-to-low. Filtering and sorting are **client-side**, over whatever pages are currently loaded.
 - Every listing has its own URL (`/auction/:id`). The Worker injects that listing's Open Graph tags (fixed price + derived status) into the page shell, so a shared link previews with the item's title, price and status.
 - A deep link to a listing that no longer exists (deleted, hidden, or never existed) shows a clear "no longer available" notice rather than a blank page.
