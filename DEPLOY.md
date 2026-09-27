@@ -203,7 +203,10 @@ people a reasonable window to place a final bid or walk away before you run it.
 **Supabase dashboard → SQL Editor.** Open `migrations/006_fixed_price_listings.sql`,
 read its header comment in full, copy the whole file, and run it. It is **not purely
 additive** — besides adding `price`, `expires_at` and `sold_at`, adding indexes and
-installing a transitional trigger, it also: rewrites rows that ended with a winner to
+installing a transitional trigger, it also adds a nullable `images_version` column (a
+metadata-only change: Postgres does not rewrite the table to add a nullable column with
+no default, so it is instant however many rows there are; existing rows read as 0 in
+the Worker). It also: rewrites rows that ended with a winner to
 status `'sold'`; drops `NOT NULL` on the bid-era columns the new Worker no longer
 writes; drops any legacy `CHECK` constraint on `auctions.status` before the backfill
 runs (re-adding one, `NOT VALID`, afterwards, so an unexpected legacy status is still
@@ -279,7 +282,12 @@ the database again (step 6). If anything here fails, stop and roll back the Work
 the old Worker.
 
 1. **Browse** — the homepage loads a grid of listings with prices, not a blank page
-   or an error.
+   or an error. Then open the browser's DevTools (F12) → **Network** tab, scroll down
+   the browse page, and confirm the card image requests are
+   `/api/auctions/<id>/images?v=…&first=1` and each returns **200**. This is the check
+   that the Worker's cover-photo-only query (the PostgREST `image_urls->>0` alias
+   select) works against the live database. If those requests return **500**, roll the
+   Worker back (step 8, row 4) before going any further.
 2. **Sign in** — an existing test account signs in successfully.
 3. **Create a listing** — with at least one photo — and it appears on the browse
    grid with the price you set.
@@ -359,7 +367,7 @@ migration file in this repo.
 | --- | --- | --- |
 | 1. Rotate secret key | Creating/setting the new key: yes. Disabling the legacy keys: **effectively no** — you would have to re-enable a key you deliberately revoked, defeating the point | Re-enable the legacy keys in Supabase if something depends on them; otherwise fix the dependency, don't undo the rotation |
 | 2. Backup before 006 | N/A (additive, harmless to leave) | Drop `backup.auctions_pre006` once you're confident you no longer need it |
-| 3. Migration 006 | **Only partly** — the added columns/indexes/trigger can be dropped, but the rows rewritten to `'sold'` (at current highest bid), the dropped `NOT NULL`s and the dropped legacy `CHECK` do **not** come back this way | `drop trigger if exists msa_v1_transition_sync on public.auctions; drop function if exists public.msa_v1_transition_sync(); alter table public.auctions drop column if exists price, drop column if exists expires_at, drop column if exists sold_at;` then drop the indexes it added (see the migration file). For the rewritten data, restore from `backup.auctions_pre006` (step 2) by hand — that backup is the only full restore |
+| 3. Migration 006 | **Only partly** — the added columns/indexes/trigger can be dropped, but the rows rewritten to `'sold'` (at current highest bid), the dropped `NOT NULL`s and the dropped legacy `CHECK` do **not** come back this way | `drop trigger if exists msa_v1_transition_sync on public.auctions; drop function if exists public.msa_v1_transition_sync(); alter table public.auctions drop column if exists price, drop column if exists expires_at, drop column if exists sold_at, drop column if exists images_version;` then drop the indexes it added (see the migration file). For the rewritten data, restore from `backup.auctions_pre006` (step 2) by hand — that backup is the only full restore |
 | 4. Merge to `main` | Yes, immediately for the Worker code. **Not** for the database | Dashboard → Deployments → previous version → **Rollback**. A later merge to `main` (by anyone) redeploys the new code again — if the rollback needs to stick, also revert the merge commit on GitHub. Note: listings created under v1 will show as **Ended** in the old UI after this rollback, since the old client reads `end_time`, which v1 listings never set |
 | 5. Smoke test | N/A (read-only) | — |
 | 6. Backup before 007 | N/A (additive, harmless to leave) | Drop `backup.auctions_pre007` once you're confident you no longer need it |
