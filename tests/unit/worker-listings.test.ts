@@ -376,6 +376,35 @@ describe('GET /api/auctions/:id', () => {
     expect(signedIn.body.auction.phoneNumber).toBe('0100000000');
   });
 
+  it('answers a Bearer token that does not resolve with 401 SESSION_EXPIRED, not as anonymous', async () => {
+    seed([listingRow()]);
+
+    for (const token of ['tok_rotated_by_another_login', '   ']) {
+      const response = await worker.fetch(
+        new Request('https://msa-auction.test/api/auctions/auc_1', { headers: { authorization: `Bearer ${token}` } }),
+        ENV,
+      );
+      const body = (await response.json()) as any;
+      expect(response.status, JSON.stringify(token)).toBe(401);
+      expect(body.code).toBe('SESSION_EXPIRED');
+      expect(JSON.stringify(body)).not.toContain('0100000000');
+    }
+  });
+
+  it('treats a request with no Authorization header, or a non-Bearer one, as anonymous', async () => {
+    seed([listingRow()]);
+
+    const none = await call('GET', '/api/auctions/auc_1');
+    expect(none.status).toBe(200);
+
+    const basic = await worker.fetch(
+      new Request('https://msa-auction.test/api/auctions/auc_1', { headers: { authorization: 'Basic abc' } }),
+      ENV,
+    );
+    expect(basic.status).toBe(200);
+    expect(((await basic.json()) as any).auction).not.toHaveProperty('phoneNumber');
+  });
+
   it('still returns a sold listing, with status sold and soldAt', async () => {
     seed([listingRow({ status: 'sold', sold_at: NOW - 500 })]);
 

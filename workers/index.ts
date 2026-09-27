@@ -828,6 +828,28 @@ export default {
       try {
         const auctionId = singleAuctionMatch[1];
 
+        // This route is reachable anonymously: NO Authorization header means an
+        // anonymous visitor. But a Bearer token that is PRESENT and does not
+        // resolve is a dead session - most often because signing in on another
+        // device rotated `users.token` - and is answered 401 SESSION_EXPIRED
+        // rather than silently downgraded to anonymous. Downgrading it made a
+        // signed-in client wait forever for a phone number the server had
+        // decided not to send, with nothing telling it to sign in again.
+        const authHeader = request.headers.get('authorization') ?? '';
+        let requester: any = null;
+        // `Headers` trims values, so "Bearer " + blank arrives as the bare word "Bearer":
+        // still a Bearer header, just one with no usable token.
+        if (authHeader === 'Bearer' || authHeader.startsWith('Bearer ')) {
+          const token = authHeader.slice('Bearer'.length).trim();
+          requester = token ? await getAuthenticatedUser(supabase, token) : null;
+          if (!requester) {
+            return jsonResponse(makeError('Your session has expired. Please sign in again.', 'SESSION_EXPIRED'), {
+              status: 401,
+            });
+          }
+        }
+        const isAdmin = isAdminUser(requester);
+
         // Slim row (no image payload) - see AUCTION_DETAIL_COLUMNS. Any
         // non-hidden listing is returned whatever its status; `status` (with
         // `expired` derived in mapListingRow) tells the UI Sold / Expired.
@@ -840,22 +862,6 @@ export default {
 
         if (error) throw error;
         if (!row) return jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 });
-
-        // Resolved once, from the same lookup: whether the caller is an admin
-        // (for the hidden-listing check below) and whether they are signed in
-        // at all (for whether phoneNumber goes on the wire). A missing or dead
-        // token resolves both to false
-        // rather than an error, exactly like isBearerTokenAdmin, since this
-        // route is intentionally reachable by an anonymous visitor.
-        const authHeader = request.headers.get('authorization') ?? '';
-        let requester: any = null;
-        if (authHeader.startsWith('Bearer ')) {
-          const token = authHeader.slice('Bearer '.length).trim();
-          if (token) {
-            requester = await getAuthenticatedUser(supabase, token);
-          }
-        }
-        const isAdmin = isAdminUser(requester);
 
         // A hidden listing is invisible to everyone but an admin - it must not
         // survive a takedown via its direct link. Reported the same as an

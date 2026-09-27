@@ -206,6 +206,58 @@ describe('AuctionDetailModal', () => {
       expect(mockedApiFetch).toHaveBeenCalledTimes(2);
     });
 
+    it('a dead session (401 SESSION_EXPIRED) asks the buyer to sign in again instead of spinning', async () => {
+      const full = makeAuction();
+      mockedApiFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        json: async () => ({ error: 'Your session has expired. Please sign in again. [Code: SESSION_EXPIRED]', code: 'SESSION_EXPIRED' }),
+      } as Response);
+
+      const onPromptAuth = vi.fn();
+      const props = { auction: withoutPhone(full), onClose: vi.fn(), onPromptAuth, onAuctionUpdated: vi.fn() };
+      const { rerender } = render(<AuctionDetailModal {...props} user={buyer} />);
+
+      expect(await screen.findByText(/your session has expired/i)).toBeInTheDocument();
+      expect(screen.queryByText(/loading the seller's contact details/i)).toBeNull();
+
+      await userEvent.setup().click(screen.getByRole('button', { name: /sign in again/i }));
+      expect(onPromptAuth).toHaveBeenCalledTimes(1);
+
+      // Signing in again hands the modal a new token, which re-runs the one detail fetch.
+      mockedApiFetch.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ auction: full }) } as Response);
+      rerender(<AuctionDetailModal {...props} user={{ ...buyer, token: 'tok_fresh' }} />);
+
+      expect(await screen.findByRole('link', { name: /message the seller on whatsapp/i })).toBeInTheDocument();
+      expect(mockedApiFetch).toHaveBeenLastCalledWith(`/api/auctions/${full.id}`, {
+        headers: { Authorization: 'Bearer tok_fresh' },
+      });
+    });
+
+    it('a 401 without an auth code is treated as a plain failure with a retry', async () => {
+      mockedApiFetch.mockResolvedValueOnce({ ok: false, status: 401, json: async () => ({}) } as Response);
+
+      renderModal(withoutPhone(makeAuction()), buyer);
+
+      expect(await screen.findByRole('button', { name: /try again/i })).toBeInTheDocument();
+    });
+
+    it('a signed-in 200 that carries no phone number shows a clear state, never an endless spinner', async () => {
+      const full = makeAuction();
+      mockedApiFetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ auction: withoutPhone(full) }),
+      } as Response);
+
+      renderModal(withoutPhone(full), buyer);
+
+      expect(await screen.findByText(/contact details aren't available for this listing/i)).toBeInTheDocument();
+      expect(screen.queryByText(/loading the seller's contact details/i)).toBeNull();
+      expect(document.getElementById('contact-whatsapp-btn')).toBeNull();
+      expect(mockedApiFetch).toHaveBeenCalledTimes(1);
+    });
+
     it('shows "no longer available" when the listing has been taken down since the grid loaded (404)', async () => {
       mockedApiFetch.mockResolvedValue({ ok: false, status: 404, json: async () => ({ error: 'Not found' }) } as Response);
 
