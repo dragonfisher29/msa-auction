@@ -11,4 +11,4 @@ bun.lock
 .claude
 test-results/
 playwright-report/
-brag-output
+brag-output*/
