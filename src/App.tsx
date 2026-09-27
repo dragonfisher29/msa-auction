@@ -21,7 +21,7 @@ import { ListingUnavailableNotice } from './components/ListingUnavailableNotice'
 import { apiFetch, apiFetchAuthed } from './lib/api';
 import { startPolling } from './lib/realtime';
 import { CATEGORIES } from './lib/categories';
-import { INVALID_CURSOR, readErrorCode } from './lib/apiErrors';
+import { AUTH_ERROR_CODES, INVALID_CURSOR, readErrorCode } from './lib/apiErrors';
 import { isListingAvailable } from './lib/listing';
 import { SITE_NAME } from './lib/site';
 
@@ -215,6 +215,14 @@ function AppShell() {
     }
   }
 
+  // Drops a session the server has refused (expired or unknown token): the header falls back to
+  // "Sign In" and nothing keeps sending the dead token. Quiet by design -- the visitor did
+  // nothing wrong, and the next thing they try that needs a session will ask them to sign in.
+  function clearStoredSession() {
+    setUser(null);
+    localStorage.removeItem('msa_auction_user');
+  }
+
   // Load user session & watchlist from localStorage on start
   useEffect(() => {
     let savedUser: User | null = null;
@@ -254,8 +262,7 @@ function AppShell() {
       try {
         const res = await apiFetchAuthed('/api/auth/me', savedUser!.token);
         if (res.status === 401) {
-          setUser(null);
-          localStorage.removeItem('msa_auction_user');
+          clearStoredSession();
         }
       } catch (err) {
         console.warn('Could not verify the stored session:', err);
@@ -467,8 +474,22 @@ function AppShell() {
         // a signed-in caller (see mapAuctionDetailRow in workers/index.ts), so a signed-in
         // visitor opening a shared link can contact the seller straight away, and the detail
         // modal has no reason to fetch the same row a second time.
-        const res = await apiFetchAuthed(`/api/auctions/${selectedAuctionId}`, user?.token);
+        const token = user?.token;
+        const res = await apiFetchAuthed(`/api/auctions/${selectedAuctionId}`, token);
         if (cancelled) return;
+        // A stored token the server no longer accepts (401 SESSION_EXPIRED / UNAUTHORIZED) says
+        // nothing about the listing itself. Drop the dead session, exactly as the startup
+        // /api/auth/me check does; that clears `user?.token`, which re-runs this effect once
+        // WITHOUT a token -- the anonymous retry -- so the listing still opens (minus the phone
+        // number) instead of the "couldn't load" notice. The `token` guard means an anonymous
+        // request can never loop here.
+        if (token && res.status === 401) {
+          const code = readErrorCode(await res.json().catch(() => null));
+          if (code && AUTH_ERROR_CODES.has(code)) {
+            clearStoredSession();
+            return;
+          }
+        }
         if (!res.ok) {
           setDeepLinkError(res.status === 404 ? 'missing' : 'failed');
           return;

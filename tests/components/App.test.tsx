@@ -174,6 +174,54 @@ describe('App routing', () => {
     expect(screen.getByText('On The Grid')).toBeInTheDocument();
   });
 
+  it('on a 401 SESSION_EXPIRED for a deep link, drops the stored session and retries anonymously once', async () => {
+    const deepLinked = makeAuction({ id: 'auc_deep_link', title: 'Shared In The Group Chat' });
+    feedOf([]);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(storedUser));
+
+    mockedApiFetchAuthed.mockImplementation(async (url: string, token?: string | null) => {
+      if (url === '/api/auth/me') {
+        // Keep the startup check out of the way: a network blip leaves the session alone, so
+        // only the deep-link 401 can be what clears it.
+        throw new Error('network blip');
+      }
+      if (url === `/api/auctions/${deepLinked.id}`) {
+        if (token) {
+          return {
+            ok: false,
+            status: 401,
+            json: async () => ({ error: 'Your session has expired. [Code: SESSION_EXPIRED]', code: 'SESSION_EXPIRED' }),
+          } as Response;
+        }
+        return { ok: true, status: 200, json: async () => ({ auction: deepLinked }) } as Response;
+      }
+      throw new Error(`Unexpected apiFetchAuthed call: ${url}`);
+    });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    window.history.pushState({}, '', `/auction/${deepLinked.id}`);
+    render(<App />);
+
+    // The listing opens -- as a signed-out visitor sees it -- rather than "couldn't load".
+    expect(await screen.findByRole('dialog', { name: 'Shared In The Group Chat' })).toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: /couldn't load this listing/i })).toBeNull();
+    expect(screen.getByRole('button', { name: /sign in to contact the seller/i })).toBeInTheDocument();
+
+    // The dead session is gone, from state and from storage.
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+    expect(screen.getAllByRole('button', { name: /^sign in$/i }).length).toBeGreaterThan(0);
+
+    // Exactly one authed attempt, followed by exactly one anonymous retry. (A tokenless call can
+    // also precede it: on the very first render the stored session has not been read yet, and
+    // that superseded lookup is cancelled -- it is not part of the retry.)
+    const tokens = mockedApiFetchAuthed.mock.calls
+      .filter(([url]) => url === `/api/auctions/${deepLinked.id}`)
+      .map(([, token]) => token);
+    const authedIndex = tokens.indexOf(storedUser.token);
+    expect(tokens.filter((t) => t === storedUser.token)).toHaveLength(1);
+    expect(tokens.slice(authedIndex + 1)).toEqual([undefined]);
+  });
+
   it('says it could not load (not "gone") when the deep-link lookup itself fails', async () => {
     feedOf([]);
     mockedApiFetchAuthed.mockRejectedValue(new Error('offline'));
