@@ -1,314 +1,131 @@
 /**
- * Logic shared by the Cloudflare Worker (`workers/index.ts`) and the local
- * Express dev server (`server.ts`).
+ * Logic used by the Cloudflare Worker (`workers/index.ts`).
  *
- * Anything in here must stay runtime-agnostic: no Node built-ins, no Express,
- * no Socket.io. The Supabase client is always passed in by the caller so the
- * same code runs on Workers and on Node.
+ * Anything in here must stay runtime-agnostic: no Node built-ins. The Supabase
+ * client is always passed in by the caller, which is what lets the unit tests
+ * drive these helpers against an in-memory fake.
+ *
+ * PRODUCT MODEL (v1). MSA Auction is a fixed-price classifieds board, not an
+ * auction: a listing has one asking `price`, stays on the browse page until the
+ * seller marks it sold, cancels it, or `LISTING_TTL_DAYS` pass since creation,
+ * and buyers contact the seller on WhatsApp. There is no bidding, no settlement
+ * and no winner. The table is still called `auctions` and the wire type is still
+ * `AuctionItem` purely to limit churn.
  */
 
-export interface ActivityBid {
-  userId: string;
-  userName: string;
-  amount: number;
-  timestamp: number;
-}
+/* -------------------------------------------------------------------------- */
+/* Listing status                                                              */
+/* -------------------------------------------------------------------------- */
 
 /**
- * The minimal camelCase auction shape the shared helpers need. Both
- * `mapAuctionRow` (Worker) and `sanitizeAuction` (dev server) produce a
- * superset of this, so each file keeps using its own row mapper.
- */
-export interface ActivityAuction {
-  id: string;
-  title: string;
-  sellerId: string;
-  status: string;
-  currentPrice: number;
-  highestBidderId: string | null;
-  endTime: number;
-  createdAt: number;
-  bids: ActivityBid[];
-  winnerId?: string | null;
-  winningBid?: number | null;
-}
-
-/**
- * The slim shape `GET /api/auctions` returns. Deliberately carries NO image
- * payload: shipping images to every polling client was the single largest
- * source of traffic on the site. Clients read `imageCount` and fetch the
- * references from `GET /api/auctions/:id/images` when they need to paint them.
+ * The values the `auctions.status` column may hold (after migration 007).
  *
- * `image_urls` holds base64 `data:` URLs today - R2 is implemented but switched
- * off, see the image storage section below - so the bytes themselves come out
- * of Postgres and this omission is worth a great deal. It stays worth keeping
- * even if R2 is switched on and the column shrinks to `/images/<key>` paths:
- * the list endpoint is polled continuously and has no reason to carry images in
- * either form.
- */
-export interface AuctionSummary {
-  id: string;
-  title: string;
-  description: string;
-  /**
-   * Absent on `GET /api/auctions` (the unauthenticated public list) - a phone number is not
-   * something a scraper should be able to harvest by paging through every listing. Present when
-   * this shape backs `GET /api/users/me/activity` (authenticated, own data only), via
-   * `AUCTION_DETAIL_COLUMNS`.
-   */
-  phoneNumber?: string;
-  startingPrice: number;
-  currentPrice: number;
-  sellerId: string;
-  sellerName: string;
-  highestBidderId: string | null;
-  highestBidderName: string | null;
-  durationMinutes: number;
-  startTime: number;
-  endTime: number;
-  status: string;
-  category: string;
-  imageCount: number;
-  bids: ActivityBid[];
-  winnerId: string | null;
-  winnerName: string | null;
-  winningBid: number | null;
-  createdAt: number;
-}
-
-export interface NotificationItem {
-  id: string;
-  type: 'outbid' | 'won' | 'lost' | 'sold';
-  auctionId: string;
-  auctionTitle: string;
-  amount: number;
-  timestamp: number;
-}
-
-export interface SettleOptions {
-  /** Injectable clock, mainly for tests. */
-  now?: number;
-  /** Restrict the sweep to a single auction (used by GET /api/auctions/:id). */
-  auctionId?: string;
-}
-
-/**
- * The four values the `auctions.status` column is allowed to hold.
- *
- * `cancelled` is a SOFT delete by the seller: the row (and its bid history)
- * stays readable by id forever, it is hidden from the default list, and
- * settlement ignores it.
+ * `cancelled` is a SOFT delete by the seller: the row stays readable by id, it
+ * is hidden from the browse list.
  *
  * `hidden` is the same shape of soft-hide, applied by an ADMIN instead of the
- * seller (`POST /api/admin/auctions/:id/hide`). It behaves exactly like
- * `cancelled` for the list and for settlement; it is a separate value purely so
- * a takedown is distinguishable from a seller withdrawing their own listing.
+ * seller (`POST /api/admin/auctions/:id/hide`). Unlike `cancelled` it is also
+ * invisible by id to everyone but an admin - see `isAuctionVisible`.
+ *
+ * `sold` is set by the seller through `POST /api/auctions/:id/sold`.
+ *
+ * `expired` is NOT in this map on purpose: it is never stored. A row is expired
+ * when it is stored `active` and its `expires_at` has passed - see
+ * `deriveListingStatus`, the one place that decision is made in JS, and the
+ * `status = 'active' AND expires_at > now` predicate that mirrors it in SQL.
  */
 export const AUCTION_STATUS = {
   active: 'active',
-  ended: 'ended',
+  sold: 'sold',
   cancelled: 'cancelled',
   hidden: 'hidden',
 } as const;
 
+/** The derived status. Never written to the database. */
+export const EXPIRED_STATUS = 'expired' as const;
+
 /**
- * Statuses kept out of `GET /api/auctions`. Both stay fetchable by id so a
- * bidder keeps their history and an admin can still review a takedown.
+ * The value the pre-v1 settlement cron wrote. Migration 006 converts every
+ * such row, but the OLD worker keeps settling auctions until the new one is
+ * deployed, so a handful can appear between 006 and 007. 007 converts those
+ * too; until then `deriveListingStatus` reads them as sold/expired.
  */
-export const LIST_EXCLUDED_STATUSES = [AUCTION_STATUS.cancelled, AUCTION_STATUS.hidden] as const;
+export const LEGACY_ENDED_STATUS = 'ended';
 
-function toBidArray(value: unknown): ActivityBid[] {
-  if (Array.isArray(value)) {
-    return value as ActivityBid[];
-  }
+export type ListingStatus = 'active' | 'sold' | 'expired' | 'cancelled' | 'hidden';
 
-  if (typeof value === 'string') {
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? (parsed as ActivityBid[]) : [];
-    } catch {
-      return [];
-    }
-  }
+/** Default lifetime of a listing, overridable with the `LISTING_TTL_DAYS` [vars] entry. */
+export const DEFAULT_LISTING_TTL_DAYS = 30;
+const MAX_LISTING_TTL_DAYS = 365;
+export const DAY_MS = 24 * 60 * 60 * 1000;
 
-  return [];
+/**
+ * `LISTING_TTL_DAYS` from the Worker env, in milliseconds. A missing, non-integer
+ * or out-of-range value falls back to the default rather than producing a
+ * listing that expires instantly or never.
+ */
+export function listingTtlMs(env: Record<string, any> | undefined | null): number {
+  const parsed = Number(env?.LISTING_TTL_DAYS);
+  const days =
+    Number.isInteger(parsed) && parsed >= 1 && parsed <= MAX_LISTING_TTL_DAYS ? parsed : DEFAULT_LISTING_TTL_DAYS;
+  return days * DAY_MS;
 }
 
 /**
- * Winner of an auction, derived from its bid history. The highest amount wins;
- * ties go to whoever placed the bid first. Auctions with no bids have no
- * winner and keep null winner columns.
+ * Epoch-millisecond columns (`created_at`, `expires_at`, `sold_at`) are
+ * `bigint`, which PostgREST may serialise as a JSON number or - for values
+ * beyond 2^53, which ours never are - a string. Either way this lands on a
+ * number, or null for NULL / garbage.
  */
-export function resolveWinner(row: any): {
-  winnerId: string | null;
-  winnerName: string | null;
-  winningBid: number | null;
-} {
-  const bids = toBidArray(row?.bids);
-
-  let best: ActivityBid | null = null;
-  for (const bid of bids) {
-    const amount = Number(bid?.amount);
-    if (!Number.isFinite(amount)) {
-      continue;
-    }
-
-    if (
-      !best ||
-      amount > Number(best.amount) ||
-      (amount === Number(best.amount) && Number(bid.timestamp) < Number(best.timestamp))
-    ) {
-      best = bid;
-    }
+export function toEpochMs(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') {
+    return null;
   }
-
-  const fallbackId = row?.highest_bidder_id ?? row?.highestBidderId ?? null;
-
-  if (best) {
-    // A prior bid-race bug could clobber an entry out of `bids` while `current_price` kept
-    // the higher value it was last written with. When that value beats the top of the bid
-    // array and a highest bidder is on record, the column is the authoritative one -- trust
-    // it over the damaged array instead of settling the wrong winner.
-    const currentPrice = Number(row?.current_price ?? row?.currentPrice);
-    if (fallbackId && Number.isFinite(currentPrice) && currentPrice > Number(best.amount)) {
-      return {
-        winnerId: fallbackId,
-        winnerName: row?.highest_bidder_name ?? row?.highestBidderName ?? null,
-        winningBid: currentPrice,
-      };
-    }
-
-    return {
-      winnerId: best.userId ?? null,
-      winnerName: best.userName ?? null,
-      winningBid: Number(best.amount),
-    };
-  }
-
-  // Defensive fallback for legacy rows that recorded a highest bidder without a
-  // bid history. No bidder at all means no winner.
-  if (fallbackId) {
-    const fallbackPrice = Number(row?.current_price ?? row?.currentPrice);
-    return {
-      winnerId: fallbackId,
-      winnerName: row?.highest_bidder_name ?? row?.highestBidderName ?? null,
-      winningBid: Number.isFinite(fallbackPrice) ? fallbackPrice : null,
-    };
-  }
-
-  return { winnerId: null, winnerName: null, winningBid: null };
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
 }
 
-/** Rows this many oldest-ended auctions are settled per call, so one lazy settle behind a hot
- *  detail/bid request (or one cron tick after an outage) can never turn into an unbounded scan. */
-const SETTLE_BATCH_LIMIT = 20;
-
 /**
- * The columns settlement actually reads: `resolveWinner` needs `bids`,
- * `current_price` and the `highest_bidder_*` pair; the bid-lock guard needs
- * `bid_version`. No image columns, no seller/bidder display names beyond what
- * `resolveWinner` uses - `select('*')` here was pulling the base64 image
- * payload for every ended row on every settle sweep.
- */
-// 'bid_version' is spelled out rather than referencing `BID_VERSION_COLUMN` -
-// that constant is declared further down the file (next to the rest of the
-// bid-lock helpers) and this is a module-scope `const`, evaluated immediately
-// on load, so a forward reference to it here would throw.
-const SETTLE_READ_COLUMNS = ['id', 'status', 'end_time', 'bids', 'current_price', 'bid_version', 'highest_bidder_id', 'highest_bidder_name'].join(',');
-
-/**
- * THE settle path. Used by the Worker cron trigger, by the lazy settle on the
- * single-auction detail route and the bid route, and by the dev server's
- * interval sweep, so dev and prod cannot drift.
+ * THE status derivation. `expired` is computed here from the stored status and
+ * `expires_at`; it is the JS mirror of the browse query's
+ * `status = 'active' AND expires_at > now` predicate, so a row this calls
+ * `active` is exactly a row the browse list shows.
  *
- * Every UPDATE is guarded on `status = 'active'` so two concurrent settlers
- * cannot both write a winner. Returns the rows this call actually settled.
+ * A stored-active row with a NULL `expires_at` is treated as expired, matching
+ * SQL (`NULL > now` is not true). Migration 006's trigger means that should not
+ * happen, but the two sides must agree if it ever does.
  */
-export async function settleEndedAuctions(supabase: any, options: SettleOptions = {}): Promise<any[]> {
-  const now = options.now ?? Date.now();
+export function deriveListingStatus(row: any, now: number = Date.now()): ListingStatus {
+  const stored = String(row?.status ?? '');
 
-  // `.eq('status', 'active')` is what keeps CANCELLED and HIDDEN listings out of
-  // settlement: such a row is neither selected here nor matched by the guarded
-  // UPDATE below, so it can never be handed a winner. Do not relax this filter.
-  //
-  // Ordered oldest end_time first and capped at SETTLE_BATCH_LIMIT: a lazy
-  // settle rides along on a normal read request, so it must stay cheap even if
-  // a missed cron tick has left a large backlog - the oldest rows are the ones
-  // a bidder or seller is most likely to be looking at right now.
-  let query = supabase
-    .from('auctions')
-    .select(SETTLE_READ_COLUMNS)
-    .eq('status', AUCTION_STATUS.active)
-    .lte('end_time', now)
-    .order('end_time', { ascending: true })
-    .limit(SETTLE_BATCH_LIMIT);
-  if (options.auctionId) {
-    query = query.eq('id', options.auctionId);
+  if (stored === AUCTION_STATUS.active) {
+    const expiresAt = toEpochMs(row?.expires_at ?? row?.expiresAt);
+    return expiresAt !== null && expiresAt > now ? 'active' : EXPIRED_STATUS;
   }
 
-  const { data, error } = await query;
-  if (error) {
-    throw error;
+  if (stored === AUCTION_STATUS.sold || stored === AUCTION_STATUS.cancelled || stored === AUCTION_STATUS.hidden) {
+    return stored;
   }
 
-  const settled: any[] = [];
-
-  for (const row of data ?? []) {
-    const { winnerId, winnerName, winningBid } = resolveWinner(row);
-    const patch = {
-      status: 'ended',
-      winner_id: winnerId,
-      winner_name: winnerName,
-      winning_bid: winningBid,
-      // Bumped here too, exactly like a bid: a bid read before settlement lands
-      // (see readBidLock/applyBidLock) must lose its optimistic lock, not
-      // overwrite the ended row with a stale bids array. `startingPrice` is
-      // irrelevant to the version bump itself, so 0 is passed as a placeholder.
-      ...bidLockUpdate(readBidLock(row, 0)),
-    };
-
-    // Caught PER ROW rather than left to propagate: this runs oldest-end_time-first (see the
-    // `.order()` above), so one row that keeps failing its UPDATE - a stuck lock, bad data,
-    // whatever the cause - must not re-throw and abort the whole batch on every single cron tick
-    // and lazy settle forever after. Skip it, log it, and let every other row in the batch still
-    // get its winner.
-    let updated: any[] | null = null;
-    try {
-      const { data, error: updateError } = await supabase
-        .from('auctions')
-        .update(patch)
-        .eq('id', row.id)
-        .eq('status', AUCTION_STATUS.active)
-        .select('id');
-
-      if (updateError) {
-        throw updateError;
-      }
-      updated = data;
-    } catch (rowError) {
-      console.error(`Settle failed for auction ${row.id}:`, rowError);
-      continue;
-    }
-
-    // Zero rows means another settler (cron vs. a concurrent read) got there
-    // first. Leave their write alone.
-    if (!Array.isArray(updated) || updated.length === 0) {
-      continue;
-    }
-
-    settled.push({ ...row, ...patch });
+  if (stored === LEGACY_ENDED_STATUS) {
+    return toEpochMs(row?.sold_at ?? row?.soldAt) !== null ? AUCTION_STATUS.sold : EXPIRED_STATUS;
   }
 
-  return settled;
+  // Unknown value: not live, and not a takedown. Never shown on browse.
+  return EXPIRED_STATUS;
+}
+
+/** True when the listing is on the browse page right now: stored active AND not expired. */
+export function isLiveListing(row: any, now: number = Date.now()): boolean {
+  return deriveListingStatus(row, now) === AUCTION_STATUS.active;
 }
 
 /* -------------------------------------------------------------------------- */
-/* Stale image cleanup - shared between the Worker's daily cron and the local  */
-/* dev server (`maintenance.ts`, which re-exports these).                     */
+/* Stale image cleanup - run by the Worker's daily cron                        */
 /* -------------------------------------------------------------------------- */
 
 /**
- * The gate. Only the exact string `true` turns the sweep on, in either runtime.
+ * The gate. Only the exact string `true` turns the sweep on.
  *
  * Deliberately strict rather than truthy: `ENABLE_STALE_IMAGE_CLEANUP=false`,
  * `=0` and `=no` must all mean off, and anyone who typed one of those was
@@ -316,19 +133,17 @@ export async function settleEndedAuctions(supabase: any, options: SettleOptions 
  */
 export const STALE_IMAGE_CLEANUP_ENV = 'ENABLE_STALE_IMAGE_CLEANUP';
 
-/** A listing is in scope once this long has passed since its `end_time`. */
-export const STALE_IMAGE_GRACE_MS = 30 * 24 * 60 * 60 * 1000;
+/** A finished listing is in scope once this long has passed since its `expires_at`. */
+export const STALE_IMAGE_GRACE_MS = 30 * DAY_MS;
 
 /**
  * Per-run cap on how many listings one sweep blanks, so a large backlog cannot turn one cron
- * tick (or one dev-server startup sweep) into an unbounded UPDATE.
+ * tick into an unbounded UPDATE.
  *
  * Kept well under what would risk an over-long request URL: the UPDATE below matches by
  * `.in('id', ids)`, and PostgREST puts that id list in the URL's query string rather than the
- * body, so a large enough batch could bump into a URL length limit somewhere in the request path
- * (proxies, browsers-as-clients, etc). 100 ids of this project's `auc_<millis>_<base36>` id shape
- * keeps that URL well short of any such limit, and at once a day that is still ample throughput
- * for a ~300-member community's listing volume.
+ * body. 100 ids of this project's `auc_<millis>_<base36>` id shape keeps that URL well short of
+ * any limit, and at once a day that is ample throughput for a ~300-member community.
  */
 export const STALE_IMAGE_CLEANUP_BATCH_LIMIT = 100;
 
@@ -337,16 +152,27 @@ export function isStaleImageCleanupEnabled(env: Record<string, string | undefine
 }
 
 /**
- * Blanks `image_url`/`image_urls` on every ENDED, CANCELLED or HIDDEN listing whose `end_time`
- * is more than `STALE_IMAGE_GRACE_MS` ago and that still has at least one image. IRREVERSIBLE:
- * images are base64 inside Postgres, so the row is the only copy and there is no backup.
+ * Blanks `image_url`/`image_urls` on every FINISHED listing - sold, cancelled, admin-hidden, or
+ * expired - whose `expires_at` is more than `STALE_IMAGE_GRACE_MS` in the past and that still has
+ * at least one image. IRREVERSIBLE: images are base64 inside Postgres, so the row is the only
+ * copy and there is no backup.
  *
- * An ACTIVE listing is never touched, regardless of age - `.neq('status', AUCTION_STATUS.active)`
- * is what keeps it out of both the SELECT and the UPDATE below.
+ * WHY ONE `expires_at` PREDICATE COVERS EVERY FINISHED STATUS, AND NEVER A LIVE LISTING.
+ *   - A live listing (stored active, not expired) has `expires_at > now`, which can never also be
+ *     `< now - 30 days`. So a live listing is excluded by construction, not by a status filter
+ *     someone could later loosen.
+ *   - An expired listing is stored `active` with a past `expires_at`, so a `status <> 'active'`
+ *     filter - what the pre-v1 sweep used - would wrongly skip it forever.
+ *   - A sold / cancelled / hidden listing always has an `expires_at` too (set at creation; set by
+ *     migration 006 to the old `end_time` for pre-v1 rows). It is never EARLIER than the moment the
+ *     listing finished (you cannot sell or cancel a listing after it expires), so measuring the
+ *     grace period from it is never more aggressive than the owner-approved "30 days after the
+ *     listing ended" retention - at worst it keeps photos a little longer.
  *
  * Deliberately reads no image column. The first query selects only `id`, and the UPDATE writes
- * blindly by that id list - the whole point of this sweep is to stop spending egress on images
- * nobody can see any more, so the sweep itself must not spend any reading them.
+ * by that id list - the whole point of this sweep is to stop spending egress on images nobody can
+ * see any more. The UPDATE also re-asserts the `expires_at` cutoff, so a row whose expiry somehow
+ * moved between the two statements is left alone.
  */
 export async function cleanupStaleImages(supabase: any, now: number = Date.now()): Promise<number> {
   try {
@@ -355,12 +181,16 @@ export async function cleanupStaleImages(supabase: any, now: number = Date.now()
     const { data, error } = await supabase
       .from('auctions')
       .select('id')
-      .neq('status', AUCTION_STATUS.active)
-      .lt('end_time', cutoff)
+      .lt('expires_at', cutoff)
       .gt('image_count', 0)
       .limit(STALE_IMAGE_CLEANUP_BATCH_LIMIT);
 
-    if (error || !Array.isArray(data) || data.length === 0) {
+    if (error) {
+      console.error('Failed to find stale images:', error);
+      return 0;
+    }
+
+    if (!Array.isArray(data) || data.length === 0) {
       return 0;
     }
 
@@ -372,14 +202,15 @@ export async function cleanupStaleImages(supabase: any, now: number = Date.now()
     const { error: updateError } = await supabase
       .from('auctions')
       .update({ image_url: null, image_urls: [] })
-      .in('id', ids);
+      .in('id', ids)
+      .lt('expires_at', cutoff);
 
     if (updateError) {
       console.error('Failed to clean up stale images:', updateError);
       return 0;
     }
 
-    console.log(`[Maintenance] Cleaned stale images for ${ids.length} auction(s) ended more than 30 days ago.`);
+    console.log(`[Maintenance] Cleaned stale images for ${ids.length} listing(s) finished more than 30 days ago.`);
     return ids.length;
   } catch (err) {
     console.error('Failed to clean up stale images:', err);
@@ -387,136 +218,228 @@ export async function cleanupStaleImages(supabase: any, now: number = Date.now()
   }
 }
 
-function latestOwnBidTimestamp(auction: ActivityAuction, userId: string): number | null {
-  let latest: number | null = null;
-  for (const bid of auction.bids ?? []) {
-    if (bid?.userId !== userId) {
-      continue;
-    }
-    const timestamp = Number(bid.timestamp);
-    if (!Number.isFinite(timestamp)) {
-      continue;
-    }
-    if (latest === null || timestamp > latest) {
-      latest = timestamp;
-    }
-  }
-  return latest;
-}
+/* -------------------------------------------------------------------------- */
+/* Listing input validation                                                    */
+/* -------------------------------------------------------------------------- */
 
-function hasBidFrom(auction: ActivityAuction, userId: string): boolean {
-  return (auction.bids ?? []).some((bid) => bid?.userId === userId);
-}
+/** Server-side length caps on listing text. Enforced on trimmed values. */
+export const LISTING_LIMITS = {
+  title: 100,
+  description: 2000,
+  phoneNumber: 30,
+} as const;
 
-/** Auctions a user listed, bid on, and won. */
-export function selectActivity<T extends ActivityAuction>(
-  auctions: T[],
-  userId: string,
-): { listings: T[]; bids: T[]; wins: T[] } {
-  const listings = auctions
-    .filter((auction) => auction.sellerId === userId)
-    .sort((a, b) => Number(b.createdAt) - Number(a.createdAt));
+/** Server-side length caps on account fields. Enforced on trimmed values. */
+export const ACCOUNT_LIMITS = {
+  name: 60,
+  username: 32,
+  password: 200,
+} as const;
 
-  const bids = auctions
-    .filter((auction) => hasBidFrom(auction, userId))
-    .sort((a, b) => (latestOwnBidTimestamp(b, userId) ?? 0) - (latestOwnBidTimestamp(a, userId) ?? 0));
-
-  const wins = auctions
-    .filter((auction) => auction.status === 'ended' && auction.winnerId === userId)
-    .sort((a, b) => Number(b.endTime) - Number(a.endTime));
-
-  return { listings, bids, wins };
-}
-
-const MAX_NOTIFICATIONS = 50;
+/** Highest asking price accepted, in GBP. */
+export const MAX_LISTING_PRICE = 100_000;
 
 /**
- * Notifications are derived on every request from the auction rows themselves
- * - there is no notifications table and no read/unread column. Ids are stable
- * for a given event so the client can keep dismissed ids in localStorage.
+ * The categories a listing may be saved with.
+ *
+ * A deliberate MIRROR of `SELECTABLE_CATEGORIES` in `src/lib/categories.ts` (every entry there
+ * except the `All` filter pseudo-category). It is duplicated rather than imported because that
+ * module imports `lucide-react` icon components, which have no business in the Worker bundle.
+ * Drift is loud: a category the server does not know comes straight back as a 400
+ * INVALID_CATEGORY.
  */
-export function buildNotifications(auctions: ActivityAuction[], userId: string): NotificationItem[] {
-  const notifications: NotificationItem[] = [];
+export const LISTING_CATEGORIES = [
+  'Electronics',
+  'Vehicles',
+  'Collectibles',
+  'Art & Antiques',
+  'Books & Media',
+  'Fashion',
+  'General',
+] as const;
 
-  for (const auction of auctions) {
-    const isSeller = auction.sellerId === userId;
-    const didBid = hasBidFrom(auction, userId);
-    const ended = auction.status === 'ended';
-    const winnerId = auction.winnerId ?? null;
-    const winningBid = Number(auction.winningBid ?? 0);
+export const DEFAULT_LISTING_CATEGORY = 'General';
 
-    if (!ended && didBid && auction.highestBidderId && auction.highestBidderId !== userId) {
-      const mine = latestOwnBidTimestamp(auction, userId);
-      const sortedBids = [...(auction.bids ?? [])].sort((a, b) => Number(a.timestamp) - Number(b.timestamp));
-      // The bid that actually overtook me: the first one placed by someone else
-      // after my most recent bid. Picking the *first* such bid (rather than the
-      // newest) keeps the notification id stable as later bids arrive.
-      const outbiddingBid =
-        sortedBids.find((bid) => bid.userId !== userId && mine !== null && Number(bid.timestamp) > mine) ??
-        sortedBids[sortedBids.length - 1];
-
-      if (outbiddingBid) {
-        notifications.push({
-          id: `outbid_${auction.id}_${Number(outbiddingBid.timestamp)}`,
-          type: 'outbid',
-          auctionId: auction.id,
-          auctionTitle: auction.title,
-          amount: Number(auction.currentPrice),
-          timestamp: Number(outbiddingBid.timestamp),
-        });
-      }
-    }
-
-    if (ended && winnerId && winnerId === userId) {
-      notifications.push({
-        id: `won_${auction.id}`,
-        type: 'won',
-        auctionId: auction.id,
-        auctionTitle: auction.title,
-        amount: winningBid,
-        timestamp: Number(auction.endTime),
-      });
-    }
-
-    if (ended && didBid && winnerId && winnerId !== userId) {
-      notifications.push({
-        id: `lost_${auction.id}`,
-        type: 'lost',
-        auctionId: auction.id,
-        auctionTitle: auction.title,
-        amount: winningBid,
-        timestamp: Number(auction.endTime),
-      });
-    }
-
-    if (ended && isSeller && winnerId) {
-      notifications.push({
-        id: `sold_${auction.id}`,
-        type: 'sold',
-        auctionId: auction.id,
-        auctionTitle: auction.title,
-        amount: winningBid,
-        timestamp: Number(auction.endTime),
-      });
-    }
+/**
+ * Parses an asking price. Accepts a JSON number or a numeric string (PostgREST returns
+ * `numeric(12,2)` as a string, and `mergeAuctionEdit` feeds the stored value back through here).
+ * Returns the price rounded to exact pence, or null when it is not > 0, is over
+ * `MAX_LISTING_PRICE`, or is not a whole number of pence.
+ *
+ * The pence check uses an epsilon rather than `Number.isInteger(price * 100)`: 19.99 * 100 is
+ * 1998.9999999999998 in binary floating point, and a user who typed 19.99 did enter whole pence.
+ */
+export function parseListingPrice(raw: unknown): number | null {
+  let value: number;
+  if (typeof raw === 'number') {
+    value = raw;
+  } else if (typeof raw === 'string' && raw.trim() !== '') {
+    value = Number(raw.trim());
+  } else {
+    return null;
   }
 
-  return notifications.sort((a, b) => b.timestamp - a.timestamp).slice(0, MAX_NOTIFICATIONS);
+  if (!Number.isFinite(value) || value <= 0 || value > MAX_LISTING_PRICE) {
+    return null;
+  }
+
+  const pence = value * 100;
+  const wholePence = Math.round(pence);
+  if (Math.abs(pence - wholePence) > 1e-6) {
+    return null;
+  }
+
+  return wholePence / 100;
+}
+
+/** The validated, normalised fields of a listing create or edit. */
+export interface ValidatedListing {
+  title: string;
+  description: string;
+  phoneNumber: string;
+  category: string;
+  price: number;
+  imageUrls: string[];
+}
+
+/**
+ * The values already stored on the listing being edited. A submitted field that is IDENTICAL to
+ * its stored value is exempt from the length / category / price-range checks, so a listing
+ * created before those checks existed never becomes uneditable because of a field the seller is
+ * not even touching. Required-ness is still enforced. `undefined` on create.
+ */
+export interface ListingBaseline {
+  title?: unknown;
+  description?: unknown;
+  phoneNumber?: unknown;
+  category?: unknown;
+  price?: unknown;
+  imageUrls?: string[];
+}
+
+function sameStoredValue(value: string, stored: unknown): boolean {
+  return typeof stored === 'string' && stored.trim() === value;
+}
+
+/**
+ * THE listing validator, used by both `POST /api/auctions` and (over `mergeAuctionEdit`'s row +
+ * patch merge) `PATCH /api/auctions/:id`.
+ */
+export function validateListingInput(raw: any, baseline?: ListingBaseline): SharedResult<ValidatedListing> {
+  if (!raw || typeof raw !== 'object') {
+    return fail(400, 'Invalid listing payload.', 'INVALID_PAYLOAD');
+  }
+
+  const title = typeof raw.title === 'string' ? raw.title.trim() : '';
+  const description = typeof raw.description === 'string' ? raw.description.trim() : '';
+  const phoneNumber = typeof raw.phoneNumber === 'string' ? raw.phoneNumber.trim() : '';
+
+  if (!title || !description || !phoneNumber) {
+    return fail(400, 'Title, description, and phone number are required.', 'MISSING_FIELDS');
+  }
+
+  if (title.length > LISTING_LIMITS.title && !sameStoredValue(title, baseline?.title)) {
+    return fail(400, `Keep the title under ${LISTING_LIMITS.title} characters.`, 'TITLE_TOO_LONG');
+  }
+
+  if (description.length > LISTING_LIMITS.description && !sameStoredValue(description, baseline?.description)) {
+    return fail(400, `Keep the description under ${LISTING_LIMITS.description} characters.`, 'DESCRIPTION_TOO_LONG');
+  }
+
+  if (phoneNumber.length > LISTING_LIMITS.phoneNumber && !sameStoredValue(phoneNumber, baseline?.phoneNumber)) {
+    return fail(400, `Keep the phone number under ${LISTING_LIMITS.phoneNumber} characters.`, 'PHONE_TOO_LONG');
+  }
+
+  const rawCategory = typeof raw.category === 'string' ? raw.category.trim() : '';
+  const category = rawCategory || DEFAULT_LISTING_CATEGORY;
+  if (!(LISTING_CATEGORIES as readonly string[]).includes(category) && !sameStoredValue(category, baseline?.category)) {
+    return fail(400, `Pick a category from: ${LISTING_CATEGORIES.join(', ')}.`, 'INVALID_CATEGORY');
+  }
+
+  let price = parseListingPrice(raw.price);
+  if (price === null && baseline && raw.price !== undefined && raw.price !== null && raw.price !== '') {
+    // Exempt an unchanged stored price that predates the range/pence rules.
+    const stored = Number(baseline.price);
+    const submitted = Number(raw.price);
+    if (Number.isFinite(stored) && stored > 0 && submitted === stored) {
+      price = stored;
+    }
+  }
+  if (price === null) {
+    return fail(
+      400,
+      `Price must be more than £0 and at most £${MAX_LISTING_PRICE.toLocaleString('en-GB')}, in whole pence.`,
+      'INVALID_PRICE',
+    );
+  }
+
+  const normalizedImageUrls: string[] = Array.isArray(raw.imageUrls)
+    ? raw.imageUrls
+        .filter((value: unknown): value is string => typeof value === 'string')
+        .map((value: string) => value.trim())
+        .filter((value: string) => value.length > 0)
+    : [];
+
+  const fallbackImage = typeof raw.imageUrl === 'string' ? raw.imageUrl.trim() : '';
+  if (fallbackImage && normalizedImageUrls.length === 0) {
+    normalizedImageUrls.push(fallbackImage);
+  }
+
+  if (normalizedImageUrls.length === 0) {
+    return fail(400, 'Please upload at least one image for the listing.', 'MISSING_IMAGES');
+  }
+
+  if (normalizedImageUrls.length > 3) {
+    return fail(400, 'You can upload up to 3 images per listing.', 'TOO_MANY_IMAGES');
+  }
+
+  // Each entry must be an image this site itself holds: an inline `data:` URL, or an
+  // `/images/<key>` path from `POST /api/images`. An arbitrary external URL is refused.
+  //
+  // BOTH FORMS ARE ACCEPTED UNCONDITIONALLY, and must stay that way. R2 is off today, so every
+  // new listing arrives as `data:` URLs; if it is switched on, new listings arrive as paths while
+  // old rows keep their `data:` URLs, and a single listing can hold a mixture of the two.
+  if (!normalizedImageUrls.every((value: string) => isAllowedImageRef(value))) {
+    return fail(400, 'Listing images must be uploaded through this site.', 'INVALID_IMAGE_URL');
+  }
+
+  // Shape/size guard on a NEW inline image. An entry byte-identical to one already stored on this
+  // listing is exempt, so editing an old listing never gets blocked by its own existing photos.
+  const newImageFailure = validateNewInlineImages(normalizedImageUrls, baseline?.imageUrls ?? []);
+  if (newImageFailure) {
+    return fail(400, newImageFailure.message, newImageFailure.code);
+  }
+
+  return succeed({ title, description, phoneNumber, category, price, imageUrls: normalizedImageUrls });
+}
+
+/**
+ * Account-field length caps shared by registration and password reset. Returns the failure, or
+ * null when every supplied field fits.
+ */
+export function validateAccountFieldLengths(fields: {
+  name?: string;
+  username?: string;
+  password?: string;
+}): SharedFailure | null {
+  if (fields.username !== undefined && fields.username.length > ACCOUNT_LIMITS.username) {
+    return fail(400, `Keep the username under ${ACCOUNT_LIMITS.username} characters.`, 'USERNAME_TOO_LONG');
+  }
+  if (fields.name !== undefined && fields.name.length > ACCOUNT_LIMITS.name) {
+    return fail(400, `Keep the display name under ${ACCOUNT_LIMITS.name} characters.`, 'NAME_TOO_LONG');
+  }
+  if (fields.password !== undefined && fields.password.length > ACCOUNT_LIMITS.password) {
+    return fail(400, `Keep the password under ${ACCOUNT_LIMITS.password} characters.`, 'PASSWORD_TOO_LONG');
+  }
+  return null;
 }
 
 /* -------------------------------------------------------------------------- */
-/* Listing edit / cancel                                                       */
+/* Listing edit                                                                */
 /* -------------------------------------------------------------------------- */
 
 /** Fields a seller may change after the listing is live. Nothing else is writable. */
-export const EDITABLE_AUCTION_FIELDS = [
-  'title',
-  'description',
-  'phoneNumber',
-  'category',
-  'imageUrls',
-  'startingPrice',
-] as const;
+export const EDITABLE_AUCTION_FIELDS = ['title', 'description', 'phoneNumber', 'category', 'imageUrls', 'price'] as const;
 
 export type EditableAuctionField = (typeof EDITABLE_AUCTION_FIELDS)[number];
 
@@ -538,11 +461,10 @@ export function toStringArray(value: unknown): string[] {
 }
 
 /**
- * Merges a PATCH body over the stored row so the SAME `validateAuctionInput`
- * that guards listing creation can validate a partial edit. Only the fields in
- * `EDITABLE_AUCTION_FIELDS` are taken from the body; everything else (notably
- * `durationMinutes`, which would move `end_time` and break the list's keyset
- * cursor) comes from the row and is therefore unchangeable.
+ * Merges a PATCH body over the stored row so the SAME `validateListingInput` that guards listing
+ * creation can validate a partial edit. Only the fields in `EDITABLE_AUCTION_FIELDS` are taken
+ * from the body; everything else - notably `expires_at`, which an edit must never extend - comes
+ * from the row and is therefore unchangeable.
  */
 export function mergeAuctionEdit(row: any, body: any): Record<string, unknown> {
   const patch = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
@@ -552,86 +474,174 @@ export function mergeAuctionEdit(row: any, body: any): Record<string, unknown> {
     title: has('title') ? patch.title : row.title,
     description: has('description') ? patch.description : row.description,
     phoneNumber: has('phoneNumber') ? patch.phoneNumber : (row.phone_number ?? row.phoneNumber),
-    category: has('category') ? patch.category : (row.category ?? 'General'),
+    category: has('category') ? patch.category : (row.category ?? DEFAULT_LISTING_CATEGORY),
     imageUrls: has('imageUrls') ? patch.imageUrls : toStringArray(row.image_urls ?? row.imageUrls),
-    startingPrice: has('startingPrice') ? patch.startingPrice : (row.starting_price ?? row.startingPrice),
-    // Not editable - carried over purely so the shared validator is satisfied.
-    durationMinutes: Number(row.duration_minutes ?? row.durationMinutes),
+    price: has('price') ? patch.price : row.price,
+  };
+}
+
+/** The stored values `validateListingInput` exempts on an edit - see `ListingBaseline`. */
+export function listingBaselineFromRow(row: any): ListingBaseline {
+  return {
+    title: row?.title,
+    description: row?.description,
+    phoneNumber: row?.phone_number ?? row?.phoneNumber,
+    category: row?.category,
+    price: row?.price,
+    imageUrls: toStringArray(row?.image_urls ?? row?.imageUrls),
   };
 }
 
 /* -------------------------------------------------------------------------- */
-/* Auction list: slim columns + keyset pagination                              */
+/* Column lists                                                                */
 /* -------------------------------------------------------------------------- */
 
 /**
  * Explicit column list for `GET /api/auctions`.
  *
- * `image_url` and `image_urls` are absent ON PURPOSE - see `AuctionSummary`.
- * `image_count` is a STORED GENERATED column added by
- * `migrations/001_listing_lifecycle_and_list_payload.sql`; that migration must
- * be applied before this build is deployed or the list query will fail with
- * Postgres 42703 (undefined column).
+ * `image_url` and `image_urls` are absent ON PURPOSE: shipping images to every polling client was
+ * the single largest source of traffic on the site. Clients read `image_count` (a STORED
+ * GENERATED column from migration 001) and fetch the references from
+ * `GET /api/auctions/:id/images` when they need to paint them.
  *
- * `phone_number` is also absent ON PURPOSE: this is the unauthenticated public
- * list, paged through by anyone, and a phone number is not something a scraper
- * should be able to harvest one page at a time. See `AUCTION_DETAIL_COLUMNS`
- * for the routes that are allowed to carry it.
+ * `phone_number` is also absent ON PURPOSE: this is the unauthenticated public list, paged
+ * through by anyone, and a phone number is not something a scraper should be able to harvest
+ * one page at a time. See `AUCTION_DETAIL_COLUMNS` for the routes allowed to carry it.
+ *
+ * `price`, `expires_at` and `sold_at` come from migration 006, which must run before this build
+ * is deployed or this query fails with Postgres 42703 (undefined column).
  */
 export const AUCTION_LIST_COLUMNS = [
   'id',
   'title',
   'description',
-  'starting_price',
-  'current_price',
+  'price',
   'seller_id',
   'seller_name',
-  'highest_bidder_id',
-  'highest_bidder_name',
-  'duration_minutes',
-  'start_time',
-  'end_time',
   'status',
   'category',
   'image_count',
-  'bids',
-  'winner_id',
-  'winner_name',
-  'winning_bid',
   'created_at',
+  'expires_at',
+  'sold_at',
 ].join(',');
 
 /**
- * Explicit column list for `GET /api/auctions/:id` (single-item detail) and
- * `GET /api/users/me/activity`. Same shape as `AUCTION_LIST_COLUMNS` - still no
- * `image_url`/`image_urls`, see `mapAuctionSummaryRow` and `AuctionCard` for how
- * a client gets real image data instead - but WITH `phone_number` added back:
- * the detail route only puts it on the wire for an authenticated caller (see
- * the route in `workers/index.ts`), and the activity route is authenticated
- * end to end, so neither is the anyone-can-page-through exposure that keeps
- * `phone_number` off `AUCTION_LIST_COLUMNS`.
+ * `GET /api/auctions/:id` and `GET /api/users/me/activity`: the list columns plus
+ * `phone_number`. The detail route only puts the number on the wire for an authenticated caller,
+ * and the activity route is authenticated end to end and own-data only.
  */
 export const AUCTION_DETAIL_COLUMNS = `${AUCTION_LIST_COLUMNS},phone_number`;
 
 /**
- * Explicit column list for `GET /api/notifications`. Only what
- * `buildNotifications` actually reads off an `ActivityAuction` - no image
- * columns, and no seller/bidder display names either, since notifications
- * carry no name of their own.
+ * The seller's own write paths (PATCH, and the row they get back): everything, including the
+ * image payload, because the edit validator needs the stored images to exempt unchanged ones and
+ * the response hands the edited listing straight back to the edit form.
  */
-export const NOTIFICATION_COLUMNS = [
-  'id',
-  'title',
-  'seller_id',
-  'status',
-  'current_price',
-  'highest_bidder_id',
-  'end_time',
-  'created_at',
-  'bids',
-  'winner_id',
-  'winning_bid',
-].join(',');
+export const AUCTION_OWNER_COLUMNS = `${AUCTION_DETAIL_COLUMNS},image_url,image_urls`;
+
+/** What the ownership / state checks on DELETE and mark-sold need, and nothing heavier. */
+export const AUCTION_STATE_COLUMNS = 'id,seller_id,status,expires_at';
+
+/* -------------------------------------------------------------------------- */
+/* Row mapping                                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Coerces a money column to a number, preserving NULL as null.
+ *
+ * PostgREST serialises a Postgres `numeric` as a JSON **string** ("400.00"), not a number, so
+ * every money field is coerced at this mapping boundary and `src/` never sees the raw row.
+ * `Number('')` is 0, so a non-finite result falls back to null rather than inventing a zero.
+ */
+export function toNullableMoney(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+/**
+ * The camelCase listing shape every route returns (`AuctionItem` on the client).
+ *
+ * `phoneNumber` is present only when the caller passed `includePhone` - see `mapListingRow`.
+ * `imageUrl` / `imageUrls` are present only with `includeImages`; every read route carries
+ * `imageCount` instead.
+ */
+export interface AuctionSummary {
+  id: string;
+  title: string;
+  description: string;
+  phoneNumber?: string;
+  price: number;
+  sellerId: string;
+  sellerName: string;
+  status: ListingStatus;
+  category: string;
+  imageCount: number;
+  imageUrl?: string;
+  imageUrls?: string[];
+  createdAt: number;
+  expiresAt: number;
+  soldAt: number | null;
+}
+
+export interface MapListingOptions {
+  /** Clock used to derive `expired`. */
+  now?: number;
+  /**
+   * Whether `phoneNumber` goes on the wire. The CALLER decides, from the route and the request's
+   * authentication - never from whether the row happens to carry the column.
+   */
+  includePhone?: boolean;
+  /** Whether `imageUrl` / `imageUrls` go on the wire (create / edit responses only). */
+  includeImages?: boolean;
+}
+
+/** THE row -> `AuctionSummary` mapper. Every route goes through here. */
+export function mapListingRow(row: any, options: MapListingOptions = {}): AuctionSummary {
+  const now = options.now ?? Date.now();
+  const imageUrls = toStringArray(row.image_urls ?? row.imageUrls);
+  const rawCount = row.image_count ?? row.imageCount;
+  const imageCount = rawCount !== null && rawCount !== undefined && Number.isFinite(Number(rawCount))
+    ? Number(rawCount)
+    : imageUrls.length;
+  const createdAt = toEpochMs(row.created_at ?? row.createdAt) ?? 0;
+
+  const mapped: AuctionSummary = {
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    price: toNullableMoney(row.price) ?? 0,
+    sellerId: row.seller_id ?? row.sellerId,
+    sellerName: row.seller_name ?? row.sellerName,
+    status: deriveListingStatus(row, now),
+    category: row.category ?? DEFAULT_LISTING_CATEGORY,
+    imageCount,
+    createdAt,
+    // A NULL expiry (which migration 006's trigger prevents) is reported as the creation time:
+    // consistent with the derived `expired` status such a row gets, rather than a 1970 date.
+    expiresAt: toEpochMs(row.expires_at ?? row.expiresAt) ?? createdAt,
+    soldAt: toEpochMs(row.sold_at ?? row.soldAt),
+  };
+
+  if (options.includePhone) {
+    mapped.phoneNumber = row.phone_number ?? row.phoneNumber;
+  }
+
+  if (options.includeImages) {
+    mapped.imageUrl = row.image_url || imageUrls[0] || undefined;
+    mapped.imageUrls = imageUrls;
+  }
+
+  return mapped;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Browse list: slim columns + keyset pagination                               */
+/* -------------------------------------------------------------------------- */
 
 export const DEFAULT_AUCTION_PAGE_SIZE = 24;
 export const MAX_AUCTION_PAGE_SIZE = 60;
@@ -640,7 +650,7 @@ export const MAX_AUCTION_PAGE_SIZE = 60;
 const AUCTION_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 export interface AuctionCursor {
-  endTime: number;
+  createdAt: number;
   id: string;
 }
 
@@ -661,16 +671,16 @@ function fromBase64Url(value: string): string {
   return atob(padded + '='.repeat((4 - (padded.length % 4)) % 4));
 }
 
-/** Opaque to the client: `<end_time>:<id>`, base64url encoded. */
-export function encodeAuctionCursor(endTime: unknown, id: unknown): string {
-  return toBase64Url(`${Number(endTime)}:${String(id)}`);
+/** Opaque to the client: `<created_at>:<id>`, base64url encoded. */
+export function encodeAuctionCursor(createdAt: unknown, id: unknown): string {
+  return toBase64Url(`${Number(createdAt)}:${String(id)}`);
 }
 
 /**
- * Returns null for anything malformed. The decoded id is pattern-checked
- * because it is interpolated into a PostgREST `or=` filter string, which is
- * parsed as an expression by the server - an unchecked value there is an
- * injection sink.
+ * Returns null for anything malformed. The decoded values are checked because they are
+ * interpolated into a PostgREST `or=` filter string, which the server parses as an expression -
+ * an unchecked value there is an injection sink. `createdAt` must be an integer (it is epoch
+ * millis) and the id must match `AUCTION_ID_PATTERN`.
  */
 export function decodeAuctionCursor(cursor: unknown): AuctionCursor | null {
   if (typeof cursor !== 'string' || cursor.length === 0 || cursor.length > 256) {
@@ -689,73 +699,14 @@ export function decodeAuctionCursor(cursor: unknown): AuctionCursor | null {
     return null;
   }
 
-  const endTime = Number(decoded.slice(0, separator));
+  const createdAt = Number(decoded.slice(0, separator));
   const id = decoded.slice(separator + 1);
 
-  if (!Number.isFinite(endTime) || !id || !AUCTION_ID_PATTERN.test(id)) {
+  if (!Number.isSafeInteger(createdAt) || !id || !AUCTION_ID_PATTERN.test(id)) {
     return null;
   }
 
-  return { endTime, id };
-}
-
-/** Row -> `AuctionSummary`. Mirrors the field names of the full row mappers. */
-/**
- * Coerces a money column to a number, preserving NULL as null.
- *
- * NEEDED BECAUSE OF MIGRATION 004. PostgREST serialises a Postgres `numeric` as
- * a JSON **string** ("400.00"), not a number - JSON numbers cannot carry
- * arbitrary precision, so the wire format keeps the decimal as text. Every
- * other money field here was already wrapped in `Number(...)`; `winning_bid`
- * was not, because as a `double precision` it arrived as a JSON number and the
- * declared `winningBid: number | null` happened to be true by accident.
- *
- * After 004 it stops being true unless it is coerced here. Doing it at the
- * mapping boundary keeps the API contract honest and is why no client change is
- * needed: `src/` never sees the raw row.
- *
- * `?? null` is not enough on its own - it would pass the string straight
- * through. `Number('')` is 0, so a non-finite result falls back to null rather
- * than inventing a zero winning bid.
- */
-export function toNullableMoney(value: unknown): number | null {
-  if (value === null || value === undefined) {
-    return null;
-  }
-
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : null;
-}
-
-export function mapAuctionSummaryRow(row: any): AuctionSummary {
-  const rawCount = row.image_count ?? row.imageCount;
-  const imageCount = Number.isFinite(Number(rawCount))
-    ? Number(rawCount)
-    : toStringArray(row.image_urls ?? row.imageUrls).length;
-
-  return {
-    id: row.id,
-    title: row.title,
-    description: row.description,
-    phoneNumber: row.phone_number ?? row.phoneNumber,
-    startingPrice: Number(row.starting_price ?? row.startingPrice),
-    currentPrice: Number(row.current_price ?? row.currentPrice),
-    sellerId: row.seller_id ?? row.sellerId,
-    sellerName: row.seller_name ?? row.sellerName,
-    highestBidderId: row.highest_bidder_id ?? row.highestBidderId ?? null,
-    highestBidderName: row.highest_bidder_name ?? row.highestBidderName ?? null,
-    durationMinutes: Number(row.duration_minutes ?? row.durationMinutes),
-    startTime: Number(row.start_time ?? row.startTime),
-    endTime: Number(row.end_time ?? row.endTime),
-    status: row.status,
-    category: row.category ?? 'General',
-    imageCount,
-    bids: toBidArray(row.bids),
-    winnerId: row.winner_id ?? row.winnerId ?? null,
-    winnerName: row.winner_name ?? row.winnerName ?? null,
-    winningBid: toNullableMoney(row.winning_bid ?? row.winningBid),
-    createdAt: Number(row.created_at ?? row.createdAt),
-  };
+  return { createdAt, id };
 }
 
 export interface AuctionListPage {
@@ -764,21 +715,22 @@ export interface AuctionListPage {
 }
 
 /**
- * One page of the public auction list, newest-ending first.
+ * One page of the public browse list, newest first.
  *
- * Ordered on `(end_time DESC, id DESC)`: a total order over two values that
- * never change after a listing is created, which is what makes the keyset
- * cursor stable while bids land and auctions settle underneath it. It also
- * keeps already-ended listings at the tail instead of at the head.
+ * ONLY LIVE LISTINGS, filtered in SQL: `status = 'active' AND expires_at > now`. Sold, cancelled,
+ * hidden and expired listings never leave the database on this route. Migration 006 adds the
+ * partial index `(created_at desc, id desc) where status = 'active'` that serves it.
  *
- * Cancelled and admin-hidden listings are excluded here; both stay fetchable by
- * id.
+ * Ordered on `(created_at DESC, id DESC)`: a total order over two values that never change after
+ * a listing is created, which is what keeps the keyset cursor stable while listings sell, expire
+ * or get edited underneath it.
  */
 export async function fetchAuctionListPage(
   supabase: any,
-  options: { limit?: unknown; cursor?: unknown } = {},
+  options: { limit?: unknown; cursor?: unknown; now?: number } = {},
 ): Promise<AuctionListPage> {
   const limit = normalizeAuctionLimit(options.limit);
+  const now = options.now ?? Date.now();
 
   let cursor: AuctionCursor | null = null;
   if (options.cursor !== undefined && options.cursor !== null && options.cursor !== '') {
@@ -788,23 +740,20 @@ export async function fetchAuctionListPage(
     }
   }
 
-  // Two chained `neq`s rather than a `not.in`: PostgREST ANDs them, and the
-  // partial index from migration 001 (`where status <> 'cancelled'`) still
-  // covers the narrower predicate. Migration 003 adds an exact-match index.
   let query = supabase
     .from('auctions')
     .select(AUCTION_LIST_COLUMNS)
-    .neq('status', AUCTION_STATUS.cancelled)
-    .neq('status', AUCTION_STATUS.hidden);
+    .eq('status', AUCTION_STATUS.active)
+    .gt('expires_at', now);
 
   if (cursor) {
-    query = query.or(`end_time.lt.${cursor.endTime},and(end_time.eq.${cursor.endTime},id.lt."${cursor.id}")`);
+    query = query.or(`created_at.lt.${cursor.createdAt},and(created_at.eq.${cursor.createdAt},id.lt."${cursor.id}")`);
   }
 
   // Fetch one extra row: its existence is what tells us another page exists,
   // without a second COUNT query.
   const { data, error } = await query
-    .order('end_time', { ascending: false })
+    .order('created_at', { ascending: false })
     .order('id', { ascending: false })
     .limit(limit + 1);
 
@@ -818,9 +767,64 @@ export async function fetchAuctionListPage(
   const last = page[page.length - 1];
 
   return {
-    auctions: page.map((row: any) => mapAuctionSummaryRow(row)),
-    nextCursor: hasMore && last ? encodeAuctionCursor(last.end_time ?? last.endTime, last.id) : null,
+    auctions: page.map((row: any) => mapListingRow(row, { now })),
+    nextCursor: hasMore && last ? encodeAuctionCursor(last.created_at ?? last.createdAt, last.id) : null,
   };
+}
+
+/* -------------------------------------------------------------------------- */
+/* The caller's own listings                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Upper bound on `GET /api/users/me/activity`. The live-listing cap is `MAX_LISTINGS_PER_USER`,
+ * but finished listings accumulate; this keeps one very long-lived account from turning the
+ * route into an unbounded read. Newest first, so what is cut is the oldest history.
+ */
+export const ACTIVITY_LISTING_LIMIT = 200;
+
+/**
+ * `GET /api/users/me/activity`: the caller's own listings, every status including hidden,
+ * filtered IN SQL on `seller_id` (served by the index migration 006 adds). The pre-v1 route read
+ * every row of the table and filtered in JS.
+ */
+export async function fetchSellerListings(
+  supabase: any,
+  sellerId: string,
+  now: number = Date.now(),
+): Promise<AuctionSummary[]> {
+  const { data, error } = await supabase
+    .from('auctions')
+    .select(AUCTION_DETAIL_COLUMNS)
+    .eq('seller_id', sellerId)
+    .order('created_at', { ascending: false })
+    .order('id', { ascending: false })
+    .limit(ACTIVITY_LISTING_LIMIT);
+
+  if (error) {
+    throw error;
+  }
+
+  return (Array.isArray(data) ? data : []).map((row: any) => mapListingRow(row, { now, includePhone: true }));
+}
+
+/**
+ * How many LIVE listings (active and not expired) a seller has - what `MAX_LISTINGS_PER_USER`
+ * caps. `head: true` returns only the count, never the rows or their images.
+ */
+export async function countLiveListings(supabase: any, sellerId: string, now: number = Date.now()): Promise<number> {
+  const { count, error } = await supabase
+    .from('auctions')
+    .select('id', { count: 'exact', head: true })
+    .eq('seller_id', sellerId)
+    .eq('status', AUCTION_STATUS.active)
+    .gt('expires_at', now);
+
+  if (error) {
+    throw error;
+  }
+
+  return Number(count) || 0;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -861,21 +865,31 @@ function truncate(value: string, limit: number): string {
   return collapsed.length <= limit ? collapsed : `${collapsed.slice(0, limit - 3).trimEnd()}...`;
 }
 
-/** Raw (unescaped) preview values for one auction row. */
-export function buildAuctionMetaTags(row: any, pageUrl: string): AuctionMetaTags {
-  const price = Number(row?.current_price ?? row?.currentPrice);
-  const status = String(row?.status ?? AUCTION_STATUS.active);
-  const priceLabel = Number.isFinite(price) ? `£${price.toLocaleString('en-GB')}` : '';
-  const statusLabel =
-    status === AUCTION_STATUS.ended
-      ? 'Ended'
-      : status === AUCTION_STATUS.cancelled
-        ? 'Withdrawn'
-        : status === AUCTION_STATUS.hidden
-          ? 'Unavailable'
-          : 'Bidding now';
+/** How each derived status reads in a link preview. */
+const META_STATUS_LABELS: Record<ListingStatus, string> = {
+  active: 'For sale',
+  sold: 'Sold',
+  expired: 'No longer listed',
+  cancelled: 'Withdrawn',
+  hidden: 'Unavailable',
+};
 
-  const title = String(row?.title ?? 'Auction');
+/** `£250`, `£12.50`, `£1,200` - whole pounds without a trailing `.00`, pence always as two digits. */
+export function formatPriceLabel(price: number): string {
+  const hasPence = Math.round(price * 100) % 100 !== 0;
+  return `£${price.toLocaleString('en-GB', {
+    minimumFractionDigits: hasPence ? 2 : 0,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+/** Raw (unescaped) preview values for one listing row: its fixed asking price and derived status. */
+export function buildAuctionMetaTags(row: any, pageUrl: string, now: number = Date.now()): AuctionMetaTags {
+  const price = toNullableMoney(row?.price);
+  const priceLabel = price !== null ? formatPriceLabel(price) : '';
+  const statusLabel = META_STATUS_LABELS[deriveListingStatus(row, now)];
+
+  const title = String(row?.title ?? 'Listing');
   // Either column may hold either storage form during the rollout, so the
   // reference is resolved rather than emitted verbatim.
   const reference = String(row?.image_url ?? row?.imageUrl ?? '') || toStringArray(row?.image_urls)[0] || '';
@@ -952,17 +966,16 @@ export function matchAuctionSharePath(pathname: string): string | null {
  * this route is hit by crawlers rather than by the polling clients that
  * dominate the traffic. Revisit it if egress measurement singles this out.
  */
-export const AUCTION_META_COLUMNS = 'id,title,description,current_price,status,image_url';
+export const AUCTION_META_COLUMNS = 'id,title,description,price,status,expires_at,sold_at,image_url';
 
 /* -------------------------------------------------------------------------- */
 /* Result type shared by the route helpers below                               */
 /* -------------------------------------------------------------------------- */
 
 /**
- * The helpers in the rest of this file are called from BOTH entry points, which
- * return errors in different ways (`Response` in the Worker, `res.status().json()`
- * in Express). They therefore return a plain result the caller maps, rather
- * than building a response themselves.
+ * The helpers in this file return a plain result the caller maps onto a
+ * `Response` (see `failureResponse` in `workers/index.ts`), rather than
+ * building a response themselves, so they stay unit-testable on their own.
  */
 export interface SharedFailure {
   ok: false;
@@ -1404,6 +1417,11 @@ export async function resetPasswordWithToken(
 
   if (!token || !password) {
     return fail(400, 'A reset token and a new password are required.', 'MISSING_FIELDS');
+  }
+
+  const lengthFailure = validateAccountFieldLengths({ password });
+  if (lengthFailure) {
+    return lengthFailure;
   }
 
   const tokenHash = await sha256Hex(token);
@@ -1855,9 +1873,9 @@ export interface HideAuctionResult {
  * `POST /api/admin/auctions/:id/hide` - a soft takedown.
  *
  * Sets `status = 'hidden'`, which drops the listing out of `GET /api/auctions`
- * and out of settlement exactly as `'cancelled'` does, while leaving it
- * fetchable by id so an admin (or anyone holding the link) can still see what
- * was taken down. Any open reports on the listing are closed as `actioned` in
+ * exactly as `'cancelled'` does, while leaving it fetchable by id for an admin
+ * only (see `isAuctionVisible`), so the committee can still see what was taken
+ * down. Any open reports on the listing are closed as `actioned` in
  * the same call, so the queue does not grow forever.
  */
 export async function hideAuction(
@@ -1876,7 +1894,7 @@ export async function hideAuction(
 
   const { data: row, error: fetchError } = await supabase
     .from('auctions')
-    .select('id,status,bid_version')
+    .select('id,status')
     .eq('id', options.auctionId)
     .maybeSingle();
 
@@ -1897,10 +1915,6 @@ export async function hideAuction(
       hidden_reason: reason,
       hidden_by: options.adminId,
       hidden_at: now,
-      // Bumped so a bid read before this hide lands loses its optimistic lock
-      // (see readBidLock/applyBidLock) instead of writing a bid onto a listing
-      // an admin just took down.
-      ...bidLockUpdate(readBidLock(row, 0)),
     })
     .eq('id', options.auctionId);
 
@@ -1925,132 +1939,6 @@ export async function hideAuction(
     hiddenReason: reason,
     reportsActioned: Array.isArray(actioned) ? actioned.length : 0,
   });
-}
-
-// ---------------------------------------------------------------------------
-// The bid optimistic lock
-// ---------------------------------------------------------------------------
-
-/**
- * THE bid optimistic lock, shared by the Worker and the dev server so the two
- * cannot drift.
- *
- * WHY THIS IS NOT GUARDED ON THE PRICE ANY MORE. The guard used to be
- * `.eq('current_price', <the value read off the row>)`. `auctions.current_price`
- * was `double precision` on the live database, so that was exact equality on a
- * binary float, asserted across a read -> JSON -> JS number -> PostgREST text
- * filter -> float8 parse round trip. A pence value such as 150.10 has no exact
- * binary representation, and nothing in that chain guarantees identical bits for
- * such a value - it depends on the server's float output precision, on the
- * driver's number formatting, and on whether the value needs all 17 significant
- * digits to round-trip. When it does not reproduce, the UPDATE matches zero
- * rows, all three retries burn, and an entirely uncontended bid answers 409
- * BID_CONFLICT.
- *
- * Migration 004 converts the money columns to `numeric(12,2)`, which fixes the
- * storage. But guarding a lock on a *money value* stays fragile no matter what
- * type holds it, so the guard now rides on `auctions.bid_version`: a monotonic
- * integer, bumped by exactly one per successful bid. Integer equality has no
- * representation to get wrong.
- */
-export const BID_VERSION_COLUMN = 'bid_version';
-
-/**
- * The columns `POST /api/auctions/:id/bids` actually needs off the row it reads
- * before validating and placing a bid: the lock (`bid_version`/`current_price`),
- * the fields the validation checks read (`status`, `end_time`, `seller_id`,
- * `starting_price`), and `bids` itself, which the new bid is appended to.
- * No image columns, no display names beyond what is already on the row.
- */
-export const BID_READ_COLUMNS = [
-  'id',
-  'status',
-  'starting_price',
-  'current_price',
-  'seller_id',
-  'end_time',
-  'bids',
-  BID_VERSION_COLUMN,
-].join(',');
-
-export interface BidLock {
-  /**
-   * True when the row carried a usable `bid_version`, i.e. migration 004 has
-   * run. False means the Worker is deployed ahead of the migration.
-   */
-  hasVersion: boolean;
-  /** The version read off the row. Only meaningful when `hasVersion`. */
-  version: number;
-  /**
-   * The raw `current_price` off the row, kept verbatim for the pre-004 fallback
-   * guard: Postgres `=` never matches NULL, so a null price needs `.is(_, null)`
-   * rather than `.eq(_, null)`.
-   */
-  rawCurrentPrice: unknown;
-  hasCurrentPrice: boolean;
-  /** The price a new bid has to beat. */
-  currentPrice: number;
-}
-
-/**
- * Reads the lock state off a freshly-fetched auction row.
- *
- * `startingPrice` is the fallback for a row that has never been bid on and so
- * carries a NULL `current_price`.
- */
-export function readBidLock(rawAuction: any, startingPrice: number): BidLock {
-  const rawCurrentPrice = rawAuction?.current_price ?? rawAuction?.currentPrice ?? null;
-  const hasCurrentPrice = rawCurrentPrice !== null && rawCurrentPrice !== undefined;
-
-  // A row from before migration 004 has no such property at all; a row from
-  // after it always has an integer, because the column is NOT NULL DEFAULT 0.
-  // Anything else - null, a non-integer, a negative - is treated as absent,
-  // which degrades to the old guard rather than to no guard.
-  const rawVersion = rawAuction?.[BID_VERSION_COLUMN] ?? rawAuction?.bidVersion;
-  const version = Number(rawVersion);
-  const hasVersion =
-    rawVersion !== null && rawVersion !== undefined && Number.isInteger(version) && version >= 0;
-
-  return {
-    hasVersion,
-    version: hasVersion ? version : 0,
-    rawCurrentPrice,
-    hasCurrentPrice,
-    currentPrice: hasCurrentPrice ? Number(rawCurrentPrice) : startingPrice,
-  };
-}
-
-/**
- * The lock's own contribution to the UPDATE payload.
- *
- * When `bid_version` exists it is advanced by one. When it does not, nothing is
- * written - naming a column PostgREST does not know about would fail the whole
- * UPDATE with PGRST204, which is precisely the "deployed before the migration"
- * case this has to survive.
- */
-export function bidLockUpdate(lock: BidLock): Record<string, number> {
-  return lock.hasVersion ? { [BID_VERSION_COLUMN]: lock.version + 1 } : {};
-}
-
-/**
- * Applies the guard predicate to the bid UPDATE.
- *
- * Exactly one predicate is applied on every path - the guard is never dropped:
- *   - `bid_version` present  ->  `.eq('bid_version', <version read>)`
- *   - absent, price non-null ->  `.eq('current_price', <raw value read>)`
- *   - absent, price NULL     ->  `.is('current_price', null)`   (first bid)
- *
- * The second and third are the pre-004 behaviour, kept verbatim so a Worker
- * running ahead of the migration is no worse off than it is today.
- */
-export function applyBidLock(query: any, lock: BidLock): any {
-  if (lock.hasVersion) {
-    return query.eq(BID_VERSION_COLUMN, lock.version);
-  }
-
-  return lock.hasCurrentPrice
-    ? query.eq('current_price', lock.rawCurrentPrice)
-    : query.is('current_price', null);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2090,8 +1978,7 @@ export function applyBidLock(query: any, lock: BidLock): any {
  * Returned by `POST /api/images` with status 503 and code
  * `IMAGE_STORAGE_UNAVAILABLE`. The client keys off that CODE to fall back to
  * inlining a base64 `data:` URL, so the code is load-bearing and the message is
- * only for humans. Both the Worker and the Express dev server return the same
- * pair, so a fallback that works locally works in production.
+ * only for humans.
  */
 export const IMAGE_STORAGE_UNAVAILABLE_MESSAGE =
   'Object storage is not configured, so images cannot be uploaded to it. The listing will store its images inline instead.';
@@ -2322,10 +2209,8 @@ export interface NewInlineImageFailure {
 
 /**
  * The size/shape guard on every NEW inline image in a listing (Fix 1b/1c and the V1 revision
- * that closed the size-cap bypass). Shared between the Worker (`workers/index.ts`) and the local
- * dev server (`server.ts`) so the two never drift - both call this from their own
- * `validateAuctionInput`, over the SAME `normalizedImageUrls` that whitelist check
- * (`isAllowedImageRef`) already accepted.
+ * that closed the size-cap bypass). Called from `validateListingInput`, over the SAME
+ * `normalizedImageUrls` that whitelist check (`isAllowedImageRef`) already accepted.
  *
  * `existingImageUrls` are the images already stored on the listing being edited (empty on
  * create). An entry byte-identical to one of them is exempt from both checks below, so an old
@@ -2639,8 +2524,8 @@ async function migrateOneAuction(supabase: any, bucket: any, row: any): Promise<
   // it was read, so a seller who edited this listing between the read and the
   // write is not silently overwritten with the images they just replaced.
   //
-  // `auctions` has no row-version column that an edit bumps (`bid_version`
-  // tracks bids, not edits), and the value that WOULD be exact - the old
+  // `auctions` has no row-version column that an edit bumps, and the value
+  // that WOULD be exact - the old
   // `image_urls` - is megabytes of base64 and cannot go in a query string. So
   // the guard rides on the two cheap columns an edit does move: the image count
   // and the status.
