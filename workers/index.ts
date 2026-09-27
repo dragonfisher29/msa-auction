@@ -1129,6 +1129,7 @@ export default {
           reporterId: auth.user.id,
           reason: body.reason,
           details: body.details,
+          reporterIsAdmin: isAdminUser(auth.user),
         });
 
         if (isFailure(result)) {

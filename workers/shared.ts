@@ -1756,7 +1756,15 @@ export interface CreateReportResult {
  */
 export async function createAuctionReport(
   supabase: any,
-  options: { auctionId: string; reporterId: string; reason: unknown; details?: unknown; now?: number },
+  options: {
+    auctionId: string;
+    reporterId: string;
+    reason: unknown;
+    details?: unknown;
+    now?: number;
+    /** Resolved from the reporter's DATABASE ROW by the caller. Only an admin may see a hidden listing. */
+    reporterIsAdmin?: boolean;
+  },
 ): Promise<SharedResult<CreateReportResult>> {
   const reason = typeof options.reason === 'string' ? options.reason.trim().toLowerCase() : '';
 
@@ -1771,7 +1779,7 @@ export async function createAuctionReport(
 
   const { data: auction, error: auctionError } = await supabase
     .from('auctions')
-    .select('id,title,seller_id,seller_name')
+    .select('id,title,seller_id,seller_name,status')
     .eq('id', options.auctionId)
     .maybeSingle();
 
@@ -1779,7 +1787,10 @@ export async function createAuctionReport(
     throw auctionError;
   }
 
-  if (!auction) {
+  // A hidden listing answers exactly like one that never existed, for everyone but an admin -
+  // the same rule as the detail route (`isAuctionVisible`). Otherwise this route would confirm a
+  // takedown exists and echo its title and seller back in `report`.
+  if (!auction || !isAuctionVisible(auction, Boolean(options.reporterIsAdmin))) {
     return fail(404, 'Auction not found', 'AUCTION_NOT_FOUND');
   }
 
