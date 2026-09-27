@@ -1,44 +1,49 @@
 import React from 'react';
-import { Ban, Pencil } from 'lucide-react';
+import { Ban, CheckCircle2, Pencil } from 'lucide-react';
 import { AuctionItem } from '../types';
+import { isListingAvailable } from '../lib/listing';
 
 interface ListingActionsProps {
   auction: AuctionItem;
   onEdit: () => void;
+  onMarkSold: () => void;
   onCancel: () => void;
 }
 
-// Mirrors the server's own 409 LISTING_HAS_BIDS message (see the API contract): the UI should
-// not offer an action that cannot succeed, but the reason it's unavailable still has to be
-// visible rather than the control simply vanishing.
-const HAS_BIDS_REASON = 'This listing already has bids and can no longer be edited. You can cancel it instead.';
-
 /**
- * Edit / Cancel controls for a listing the signed-in viewer owns. Rendered from two places:
- * AccountView's "My Listings" section, and AuctionDetailModal when the viewer is the seller.
+ * Edit / Mark as sold / Cancel controls for a listing the signed-in viewer owns. Rendered from
+ * two places: AccountView's "My Listings" section, and AuctionDetailModal when the viewer is the
+ * seller.
  *
- * A listing that is no longer active (ended or already cancelled) has nothing actionable left --
- * the server rejects both PATCH and DELETE on it with LISTING_NOT_EDITABLE -- so this renders
- * nothing at all in that case rather than a pair of buttons that only fail when clicked.
+ * A listing that is no longer available (sold, expired, cancelled or hidden) has nothing
+ * actionable left -- the server answers 409 to an edit, a sale or a cancel on it -- so this
+ * renders nothing at all in that case rather than buttons that only fail when clicked.
  */
-export const ListingActions: React.FC<ListingActionsProps> = ({ auction, onEdit, onCancel }) => {
-  if (auction.status !== 'active') {
+export const ListingActions: React.FC<ListingActionsProps> = ({ auction, onEdit, onMarkSold, onCancel }) => {
+  if (!isListingAvailable(auction)) {
     return null;
   }
 
-  const hasBids = auction.bids.length > 0;
-
   return (
     <div className="p-3 rounded-2xl bg-[#d7e3fc] border border-[#ccdbfd] space-y-2">
+      <button
+        id={`mark-sold-btn-${auction.id}`}
+        type="button"
+        onClick={onMarkSold}
+        aria-label={`Mark ${auction.title} as sold`}
+        className="w-full inline-flex items-center justify-center gap-1.5 px-3 min-h-[44px] rounded-xl bg-emerald-600 hover:bg-emerald-700 text-xs font-extrabold text-white transition-colors cursor-pointer"
+      >
+        <CheckCircle2 className="w-3.5 h-3.5" />
+        <span>Mark as Sold</span>
+      </button>
+
       <div className="flex items-center gap-2">
         <button
           id={`edit-listing-btn-${auction.id}`}
           type="button"
           onClick={onEdit}
-          disabled={hasBids}
-          title={hasBids ? HAS_BIDS_REASON : undefined}
           aria-label={`Edit ${auction.title}`}
-          className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 min-h-[44px] rounded-xl bg-[#edf2fb] hover:bg-[#c1d3fe] border border-[#ccdbfd] text-xs font-bold text-[#1e293b] transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-[#edf2fb] cursor-pointer"
+          className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 min-h-[44px] rounded-xl bg-[#edf2fb] hover:bg-[#c1d3fe] border border-[#ccdbfd] text-xs font-bold text-[#1e293b] transition-colors cursor-pointer"
         >
           <Pencil className="w-3.5 h-3.5" />
           <span>Edit</span>
@@ -55,12 +60,6 @@ export const ListingActions: React.FC<ListingActionsProps> = ({ auction, onEdit,
           <span>Cancel Listing</span>
         </button>
       </div>
-
-      {hasBids && (
-        <p id={`edit-disabled-reason-${auction.id}`} className="text-[11px] text-[#1e293b]/70">
-          {HAS_BIDS_REASON}
-        </p>
-      )}
     </div>
   );
 };

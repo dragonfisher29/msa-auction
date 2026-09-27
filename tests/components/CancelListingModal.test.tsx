@@ -27,6 +27,7 @@ import { apiFetch } from '../../src/lib/api';
 const mockedApiFetch = apiFetch as unknown as ReturnType<typeof vi.fn>;
 
 const NOW = Date.now();
+const DAY = 24 * 60 * 60 * 1000;
 
 const seller: User = {
   id: 'seller_1',
@@ -42,55 +43,40 @@ function makeAuction(overrides: Partial<AuctionItem> = {}): AuctionItem {
     title: 'Vintage Film Camera',
     description: 'A well-loved vintage film camera.',
     phoneNumber: '+44 7700 900000',
-    startingPrice: 100,
-    currentPrice: 100,
+    price: 100,
     sellerId: seller.id,
     sellerName: seller.name,
-    highestBidderId: null,
-    highestBidderName: null,
-    durationMinutes: 60,
-    startTime: NOW - 5 * 60 * 1000,
-    endTime: NOW + 60 * 60 * 1000,
     status: 'active',
+    expiresAt: NOW + 20 * DAY,
+    soldAt: null,
     category: 'Collectibles',
     imageUrls: ['https://example.test/camera.jpg'],
-    bids: [],
-    winnerId: null,
-    winnerName: null,
-    winningBid: null,
     createdAt: NOW - 10 * 60 * 1000,
     ...overrides,
   };
 }
 
+function renderActions(auction: AuctionItem) {
+  return render(<ListingActions auction={auction} onEdit={vi.fn()} onMarkSold={vi.fn()} onCancel={vi.fn()} />);
+}
+
 describe('ListingActions', () => {
-  it('disables Edit and shows the reason once the listing has bids, but still offers Cancel', () => {
-    const auction = makeAuction({
-      bids: [{ id: 'bid_1', auctionId: 'auc_1', userId: 'bidder_1', userName: 'Bea Bidder', amount: 120, timestamp: NOW }],
-    });
+  it('offers Mark as Sold, Edit and Cancel on an active listing', () => {
+    const auction = makeAuction();
+    renderActions(auction);
 
-    render(<ListingActions auction={auction} onEdit={vi.fn()} onCancel={vi.fn()} />);
-
-    const editBtn = screen.getByRole('button', { name: `Edit ${auction.title}` }) as HTMLButtonElement;
-    expect(editBtn).toBeDisabled();
-    expect(screen.getByText(/This listing already has bids and can no longer be edited/i)).toBeInTheDocument();
-
-    const cancelBtn = screen.getByRole('button', { name: `Cancel ${auction.title}` }) as HTMLButtonElement;
-    expect(cancelBtn).not.toBeDisabled();
+    expect(screen.getByRole('button', { name: `Mark ${auction.title} as sold` })).not.toBeDisabled();
+    expect(screen.getByRole('button', { name: `Edit ${auction.title}` })).not.toBeDisabled();
+    expect(screen.getByRole('button', { name: `Cancel ${auction.title}` })).not.toBeDisabled();
   });
 
-  it('enables Edit when the listing has zero bids', () => {
-    const auction = makeAuction({ bids: [] });
-    render(<ListingActions auction={auction} onEdit={vi.fn()} onCancel={vi.fn()} />);
-
-    const editBtn = screen.getByRole('button', { name: `Edit ${auction.title}` }) as HTMLButtonElement;
-    expect(editBtn).not.toBeDisabled();
-    expect(screen.queryByText(/can no longer be edited/i)).not.toBeInTheDocument();
-  });
-
-  it('renders nothing for a listing that has already ended', () => {
-    const auction = makeAuction({ status: 'ended' });
-    const { container } = render(<ListingActions auction={auction} onEdit={vi.fn()} onCancel={vi.fn()} />);
+  it.each([
+    ['sold', { status: 'sold' as const, soldAt: NOW }],
+    ['expired', { status: 'expired' as const }],
+    ['cancelled', { status: 'cancelled' as const }],
+    ['past expiresAt but still "active"', { expiresAt: NOW - 1000 }],
+  ])('renders nothing for a %s listing', (_label, overrides) => {
+    const { container } = renderActions(makeAuction(overrides));
     expect(container).toBeEmptyDOMElement();
   });
 });
@@ -106,18 +92,10 @@ describe('CancelListingModal', () => {
       <CancelListingModal auction={auction} user={seller} onClose={vi.fn()} onCancelled={vi.fn()} />,
     );
 
+    expect(screen.getByRole('dialog', { name: /cancel listing/i })).toBeInTheDocument();
     expect(screen.getByText(/This cannot be undone\./i)).toBeInTheDocument();
     expect(screen.getByText(auction.title, { exact: false })).toBeInTheDocument();
     expect(mockedApiFetch).not.toHaveBeenCalled();
-  });
-
-  it('warns that bidders will still see the listing when it already has bids', () => {
-    const auction = makeAuction({
-      bids: [{ id: 'bid_1', auctionId: 'auc_1', userId: 'bidder_1', userName: 'Bea Bidder', amount: 120, timestamp: NOW }],
-    });
-    render(<CancelListingModal auction={auction} user={seller} onClose={vi.fn()} onCancelled={vi.fn()} />);
-
-    expect(screen.getByText(/Bidders will still be able to see the cancelled listing/i)).toBeInTheDocument();
   });
 
   it('closes without cancelling when "Keep Listing" is clicked', async () => {
@@ -131,7 +109,7 @@ describe('CancelListingModal', () => {
     expect(mockedApiFetch).not.toHaveBeenCalled();
   });
 
-  it('DELETEs the listing and reports the cancelled auction once confirmed', async () => {
+  it('DELETEs the listing and reports the cancelled listing once confirmed', async () => {
     const auction = makeAuction();
     const cancelled = { ...auction, status: 'cancelled' as const };
     mockedApiFetch.mockResolvedValue({
@@ -155,7 +133,7 @@ describe('CancelListingModal', () => {
     expect(onCancelled).toHaveBeenCalledWith(cancelled);
   });
 
-  it('shows a distinct message for LISTING_NOT_EDITABLE rather than a generic failure', async () => {
+  it('shows a distinct message for a 409 (no longer active) rather than a generic failure', async () => {
     mockedApiFetch.mockResolvedValue({
       ok: false,
       status: 409,
@@ -167,6 +145,6 @@ describe('CancelListingModal', () => {
     const user = userEvent.setup();
     await user.click(screen.getByRole('button', { name: 'Yes, Cancel It' }));
 
-    expect(await screen.findByText(/This listing has already ended and can no longer be cancelled\./i)).toBeInTheDocument();
+    expect(await screen.findByText(/no longer active \(it may have sold or expired\)/i)).toBeInTheDocument();
   });
 });

@@ -12,7 +12,6 @@ vi.mock('../../src/lib/api', () => ({
 
 vi.mock('../../src/lib/realtime', () => ({
   startPolling: vi.fn(() => () => {}),
-  checkHealth: vi.fn(async () => true),
 }));
 
 import { apiFetch, apiFetchAuthed } from '../../src/lib/api';
@@ -25,8 +24,8 @@ const STORAGE_KEY = 'msa_auction_user';
 function storeSession(overrides: Partial<User> = {}) {
   const user: User = {
     id: 'user_1',
-    name: 'Alex Bidder',
-    username: 'alex_bidder',
+    name: 'Alex Member',
+    username: 'alex_member',
     token: 'tok_abc',
     createdAt: Date.now() - 60 * 60 * 1000,
     ...overrides,
@@ -68,7 +67,7 @@ describe('/admin route', () => {
     await waitFor(() => expect(window.location.pathname).toBe('/'));
     expect(document.getElementById('admin-view')).not.toBeInTheDocument();
     // The browse view is what they get instead, not a blank screen.
-    expect(screen.getByText(/live bidding dashboard/i)).toBeInTheDocument();
+    expect(screen.getByText(/browse listings/i)).toBeInTheDocument();
   });
 
   it('redirects a signed-out visitor away from /admin', async () => {
@@ -107,7 +106,7 @@ describe('/admin route', () => {
     render(<App />);
 
     // Wait for the session to resolve so this is not just "the header has not rendered yet".
-    await waitFor(() => expect(screen.getByText('Alex Bidder')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('Alex Member')).toBeInTheDocument());
     expect(screen.queryByRole('button', { name: /committee admin/i })).not.toBeInTheDocument();
     expect(document.getElementById('admin-panel-btn')).not.toBeInTheDocument();
   });

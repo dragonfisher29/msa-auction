@@ -239,7 +239,7 @@ export const AdminView: React.FC<AdminViewProps> = ({ user, onClose, onOpenAucti
             className="shrink-0 inline-flex items-center justify-center gap-1.5 px-3.5 py-2 min-h-[44px] rounded-xl bg-[#abc4ff] hover:bg-[#b6ccfe] border border-[#c1d3fe] text-[#1e293b] text-sm font-bold shadow-xs transition-colors cursor-pointer"
           >
             <ArrowLeft className="w-4 h-4" />
-            <span>Back to Auctions</span>
+            <span>Back to Browse</span>
           </button>
         </div>
       </div>

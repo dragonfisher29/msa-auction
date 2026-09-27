@@ -16,6 +16,7 @@ import { apiFetch } from '../../src/lib/api';
 const mockedApiFetch = apiFetch as unknown as ReturnType<typeof vi.fn>;
 
 const NOW = Date.now();
+const DAY = 24 * 60 * 60 * 1000;
 
 function makeListRowAuction(overrides: Partial<AuctionItem> = {}): AuctionItem {
   // Shaped like a row from the paginated `GET /api/auctions` list endpoint: no `imageUrl` /
@@ -24,23 +25,14 @@ function makeListRowAuction(overrides: Partial<AuctionItem> = {}): AuctionItem {
     id: 'auc_1',
     title: 'Vintage Film Camera',
     description: 'A well-loved vintage film camera, fully functional.',
-    phoneNumber: '+44 7700 900000',
-    startingPrice: 100,
-    currentPrice: 150,
+    price: 150,
     sellerId: 'seller_1',
     sellerName: 'Sam Seller',
-    highestBidderId: null,
-    highestBidderName: null,
-    durationMinutes: 60,
-    startTime: NOW - 5 * 60 * 1000,
-    endTime: NOW + 60 * 60 * 1000,
     status: 'active',
+    expiresAt: NOW + 20 * DAY,
+    soldAt: null,
     category: 'Collectibles',
     imageCount: 2,
-    bids: [],
-    winnerId: null,
-    winnerName: null,
-    winningBid: null,
     createdAt: NOW - 10 * 60 * 1000,
     ...overrides,
   };
@@ -77,10 +69,10 @@ describe('AuctionCard image loading', () => {
     });
     expect(mockedApiFetch).toHaveBeenCalledTimes(1);
 
-    // Simulate the 5s list poll: App.tsx hands every card a brand-new auction object each tick.
+    // Simulate the feed refresh: App.tsx hands every card a brand-new listing object each time.
     // A card that re-fetched on every prop change would double (or keep growing) the request
     // count here; the point of the change is that it doesn't.
-    const polledAuction = { ...auction, currentPrice: 999 };
+    const polledAuction = { ...auction, price: 999 };
     rerender(<AuctionCard auction={polledAuction} onSelect={() => {}} />);
     rerender(<AuctionCard auction={{ ...polledAuction }} onSelect={() => {}} />);
 
@@ -149,5 +141,58 @@ describe('AuctionCard image loading', () => {
     const img = await screen.findByAltText(auction.title) as HTMLImageElement;
     expect(img.getAttribute('loading')).toBe('lazy');
     expect(img.getAttribute('decoding')).toBe('async');
+  });
+});
+
+describe('AuctionCard listing details', () => {
+  beforeEach(() => {
+    __resetImageCacheForTests();
+    mockedApiFetch.mockReset();
+  });
+
+  it('shows the price (with pence when it has them), category, seller and listing age', () => {
+    render(
+      <AuctionCard
+        auction={makeListRowAuction({ imageCount: 0, price: 12.5, createdAt: NOW - 3 * DAY - 60 * 1000 })}
+        onSelect={() => {}}
+      />,
+    );
+
+    expect(screen.getByTestId('listing-price-auc_1')).toHaveTextContent('£12.50');
+    expect(screen.getByText('Collectibles')).toBeInTheDocument();
+    expect(screen.getByText('Sam Seller')).toBeInTheDocument();
+    expect(screen.getByText('Listed 3 days ago')).toBeInTheDocument();
+  });
+
+  it('shows no status badge on an active listing, and no bidding language anywhere', () => {
+    render(<AuctionCard auction={makeListRowAuction({ imageCount: 0 })} onSelect={() => {}} />);
+
+    expect(screen.queryByTestId('listing-status-badge-auc_1')).toBeNull();
+    expect(document.body.textContent).not.toMatch(/\bbids?\b|bidder|auction ended|ending soon/i);
+  });
+
+  it('badges a sold listing as Sold', () => {
+    render(<AuctionCard auction={makeListRowAuction({ imageCount: 0, status: 'sold', soldAt: NOW })} onSelect={() => {}} />);
+    expect(screen.getByTestId('listing-status-badge-auc_1')).toHaveTextContent('Sold');
+  });
+
+  it('badges an expired listing as Expired -- including one the server still calls active but whose expiresAt has passed', () => {
+    const { rerender } = render(
+      <AuctionCard auction={makeListRowAuction({ imageCount: 0, status: 'expired' })} onSelect={() => {}} />,
+    );
+    expect(screen.getByTestId('listing-status-badge-auc_1')).toHaveTextContent('Expired');
+
+    rerender(<AuctionCard auction={makeListRowAuction({ imageCount: 0, expiresAt: NOW - 1000 })} onSelect={() => {}} />);
+    expect(screen.getByTestId('listing-status-badge-auc_1')).toHaveTextContent('Expired');
+  });
+
+  it('never points the placeholder at a third-party image host', async () => {
+    // A listing that says it has photos but whose image fetch comes back empty.
+    mockedApiFetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({ imageUrls: [] }) } as Response);
+    render(<AuctionCard auction={makeListRowAuction({ imageCount: 1 })} onSelect={() => {}} />);
+
+    const img = (await screen.findByAltText('Vintage Film Camera')) as HTMLImageElement;
+    expect(img.getAttribute('src')).toMatch(/^data:image\/svg\+xml/);
+    expect(img.getAttribute('src')).not.toMatch(/unsplash/i);
   });
 });

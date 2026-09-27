@@ -1,17 +1,25 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { X, Tag, Phone, PoundSterling, Clock, FileText, AlertCircle, Trash2, Upload, ChevronDown, PencilLine, RefreshCw, RotateCcw } from 'lucide-react';
-import { apiFetch, apiFetchAuthed } from '../lib/api';
+import { X, Tag, Phone, PoundSterling, CalendarClock, FileText, AlertCircle, Trash2, Upload, ChevronDown, PencilLine, RefreshCw, RotateCcw } from 'lucide-react';
+import { apiFetchAuthed } from '../lib/api';
 import { SELECTABLE_CATEGORIES } from '../lib/categories';
 import { User, AuctionItem } from '../types';
 import {
   AUTH_ERROR_CODES,
   IMAGE_STORAGE_UNAVAILABLE,
-  LISTING_HAS_BIDS,
   LISTING_NOT_EDITABLE,
   NOT_LISTING_OWNER,
   readErrorCode,
   stripErrorCode,
 } from '../lib/apiErrors';
+import {
+  DESCRIPTION_MAX_LENGTH,
+  LISTING_LIFETIME_DAYS,
+  parsePrice,
+  PHONE_MAX_LENGTH,
+  PRICE_MAX,
+  PRICE_MIN,
+  TITLE_MAX_LENGTH,
+} from '../lib/listing';
 import {
   ACCEPTED_IMAGE_TYPES_LABEL,
   blobToDataUrl,
@@ -31,7 +39,7 @@ interface CreateListingModalProps {
   onPromptAuth: () => void;
   /** Defaults to 'create'. 'edit' reuses this whole form to PATCH an existing listing instead of
    *  creating a new one -- see the API contract: PATCH is seller-only and only while the listing
-   *  has zero bids, and it does not accept a duration (an auction's schedule cannot be edited). */
+   *  is still active (not sold, expired or cancelled). */
   mode?: 'create' | 'edit';
   /** Required when `mode` is 'edit': the listing being edited, used to prefill the form.
    *  When it lacks `imageUrls` (e.g. a row from `GET /api/users/me/activity`, which ships only
@@ -42,15 +50,6 @@ interface CreateListingModalProps {
   /** Required when `mode` is 'edit': called with the server's updated auction on a successful PATCH. */
   onUpdated?: (auction: AuctionItem) => void;
 }
-
-const PRESET_DURATIONS = [
-  { label: '2 Mins (Fast Test)', minutes: 2 },
-  { label: '5 Mins', minutes: 5 },
-  { label: '6 Hours', minutes: 360 },
-  { label: '24 Hours', minutes: 1440 },
-  { label: '3 Days', minutes: 4320 },
-  { label: '7 Days', minutes: 10080 },
-];
 
 const MAX_IMAGES = 3;
 
@@ -106,9 +105,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [phoneNumber, setPhoneNumber] = useState('');
-  const [startingPrice, setStartingPrice] = useState<string>('150');
-  const [durationMinutes, setDurationMinutes] = useState<number>(5);
-  const [customDuration, setCustomDuration] = useState<string>('');
+  const [price, setPrice] = useState<string>('');
   const [category, setCategory] = useState('Electronics');
   const [imageSlots, setImageSlots] = useState<ImageSlot[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -149,9 +146,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
       setTitle(initialAuction.title);
       setDescription(initialAuction.description);
       setPhoneNumber(initialAuction.phoneNumber ?? '');
-      setStartingPrice(String(initialAuction.startingPrice));
-      setDurationMinutes(5);
-      setCustomDuration('');
+      setPrice(String(initialAuction.price));
       setCategory(initialAuction.category || 'Electronics');
       setImageSlots(
         slotsFromStoredValues(
@@ -170,9 +165,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
     setTitle('');
     setDescription('');
     setPhoneNumber('');
-    setStartingPrice('150');
-    setDurationMinutes(5);
-    setCustomDuration('');
+    setPrice('');
     setCategory('Electronics');
     setImageSlots([]);
     setError(null);
@@ -196,16 +189,16 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
     }
 
     // `imageUrls` is only ever present on a full row (see the doc comment on `imageCount` in
-    // `AuctionItem`); AuctionDetailModal's `auction` is one (it comes from, and is kept fresh by
-    // polling, `GET /api/auctions/:id`), so there is nothing to fetch and no need to touch the
-    // network again.
+    // `AuctionItem`) -- e.g. a listing just created or edited in this session -- so there is
+    // nothing to fetch and no need to touch the network again.
     if (Array.isArray(initialAuction.imageUrls)) {
       setIsLoadingListing(false);
       return;
     }
 
-    // Partial row -- e.g. AccountView's "My Listings", sourced from `/api/users/me/activity`,
-    // which ships `imageCount` instead of real image data. Re-fetch the full listing before the
+    // Partial row -- e.g. AccountView's "My Listings", sourced from `/api/users/me/activity`, or
+    // a browse-feed row opened in the detail modal, both of which ship `imageCount` instead of
+    // real image data. Re-fetch the full listing before the
     // form can be trusted: submitting on the partial row's empty image list would PATCH
     // `imageUrls: []` and get rejected as MISSING_IMAGES.
     let cancelled = false;
@@ -232,7 +225,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
         setTitle(fresh.title);
         setDescription(fresh.description);
         setPhoneNumber(fresh.phoneNumber ?? '');
-        setStartingPrice(String(fresh.startingPrice));
+        setPrice(String(fresh.price));
         setCategory(fresh.category || 'Electronics');
 
         // The detail endpoint no longer ships imageUrls/imageUrl at all (see
@@ -262,11 +255,11 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
     return () => {
       cancelled = true;
     };
-    // Depend on the listing's id, not the `initialAuction` object reference: AuctionDetailModal
-    // passes its polled `auction`, which gets a new object identity every ~3s even when nothing
-    // the user cares about has changed. Keying off identity would re-run this effect (and its
-    // `resetForm()`) on every poll tick, wiping out whatever the user has typed. Keying off `id`
-    // means it only re-runs when the modal opens or is genuinely pointed at a different listing.
+    // Depend on the listing's id, not the `initialAuction` object reference: the parent can hand
+    // over a new object identity (e.g. when its own detail fetch lands) even when nothing the
+    // user cares about has changed. Keying off identity would re-run this effect (and its
+    // `resetForm()`), wiping out whatever the user has typed. Keying off `id` means it only
+    // re-runs when the modal opens or is genuinely pointed at a different listing.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, isEditMode, initialAuction?.id]);
 
@@ -428,6 +421,21 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
       return;
     }
 
+    // The inputs' maxLength already stops typing past these, but a pasted or prefilled value
+    // can still arrive longer, and the server would only refuse it after the round trip.
+    if (trimmedTitle.length > TITLE_MAX_LENGTH) {
+      setError(`Please keep the title to ${TITLE_MAX_LENGTH} characters or fewer.`);
+      return;
+    }
+    if (trimmedDescription.length > DESCRIPTION_MAX_LENGTH) {
+      setError(`Please keep the description to ${DESCRIPTION_MAX_LENGTH} characters or fewer.`);
+      return;
+    }
+    if (trimmedPhoneNumber.length > PHONE_MAX_LENGTH) {
+      setError(`Please keep the phone number to ${PHONE_MAX_LENGTH} characters or fewer.`);
+      return;
+    }
+
     // The WhatsApp contact link is built straight from this value, so it has to be a full
     // international number. A single leading 0 is a local trunk prefix and means the country
     // code is missing; a leading 00 is the ITU international prefix, so it is fine.
@@ -436,6 +444,13 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
       setError('Please enter your full phone number including the country code, for example +44 7700 900123.');
       return;
     }
+
+    const parsedPrice = parsePrice(price);
+    if (parsedPrice.error !== null) {
+      setError(parsedPrice.error);
+      return;
+    }
+    const priceNum = parsedPrice.price;
 
     if (imageSlots.length === 0) {
       setError('Please upload at least one image before publishing the listing.');
@@ -457,24 +472,6 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
       return;
     }
 
-    const priceNum = Number(startingPrice);
-    if (!Number.isFinite(priceNum) || priceNum <= 0) {
-      setError('Starting price must be greater than £0.');
-      return;
-    }
-
-    // The duration field doesn't exist in edit mode at all (a listing's schedule can't be
-    // changed once published), so this validation -- and sending it in the request body below --
-    // only applies to creating a new listing.
-    let finalDuration = 0;
-    if (!isEditMode) {
-      finalDuration = customDuration ? parseInt(customDuration, 10) : durationMinutes;
-      if (!Number.isInteger(finalDuration) || finalDuration <= 0) {
-        setError('Duration must be at least 1 minute.');
-        return;
-      }
-    }
-
     setIsSubmitting(true);
 
     try {
@@ -492,7 +489,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
             phoneNumber: trimmedPhoneNumber,
             category: category.trim() || 'General',
             imageUrls: resolvedImageValues,
-            startingPrice: priceNum,
+            price: priceNum,
           }),
         });
 
@@ -505,16 +502,12 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
             setError('Your session has expired. Please sign in again to save these changes.');
             return;
           }
-          if (code === LISTING_HAS_BIDS) {
-            setError('This listing already has bids and can no longer be edited. You can cancel it instead.');
-            return;
-          }
           if (code === NOT_LISTING_OWNER) {
             setError('You are not the seller of this listing, so it cannot be edited from here.');
             return;
           }
-          if (code === LISTING_NOT_EDITABLE) {
-            setError('This listing is no longer editable (it may have ended or already been cancelled).');
+          if (code === LISTING_NOT_EDITABLE || res.status === 409) {
+            setError('This listing is no longer editable (it may have sold, expired or been cancelled).');
             return;
           }
 
@@ -536,8 +529,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
           title: trimmedTitle,
           description: trimmedDescription,
           phoneNumber: trimmedPhoneNumber,
-          startingPrice: priceNum,
-          durationMinutes: finalDuration,
+          price: priceNum,
           sellerId: user.id,
           sellerName: user.name,
           imageUrls: resolvedImageValues,
@@ -554,7 +546,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
       }
 
       if (!res.ok) {
-        throw new Error(data?.error || `Request failed with status ${res.status}.`);
+        throw new Error(data?.error ? stripErrorCode(data.error) : `Request failed with status ${res.status}.`);
       }
 
       onCreated(data.auction);
@@ -578,10 +570,10 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
             </div>
             <div className="min-w-0">
               <h2 className="text-sm sm:text-lg font-bold text-[#1e293b] leading-tight">
-                {isEditMode ? 'Edit Listing' : 'Create New Auction Listing'}
+                {isEditMode ? 'Edit Listing' : 'Create New Listing'}
               </h2>
               <p className="text-xs text-[#1e293b]/70 hidden sm:block">
-                {isEditMode ? 'Update the details buyers see before any bids come in' : 'Publish an item for real-time live bidding'}
+                {isEditMode ? 'Update the details buyers see' : 'Put an item up for sale to MSA members'}
               </p>
             </div>
           </div>
@@ -602,7 +594,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
             <div className="text-xs">
               <p className="font-bold text-[#1e293b]">Sign in required to create listings</p>
               <p className="text-[#1e293b]/80 mt-0.5">
-                You must be signed in with a username to host an auction.
+                You must be signed in with a username to list an item for sale.
               </p>
               <button
                 type="button"
@@ -639,21 +631,26 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
           )}
 
           {error && (
-            <div className="p-3 rounded-xl bg-red-100/90 border border-red-200 text-red-800 text-xs flex items-center gap-2">
+            <div
+              id="listing-form-error"
+              role="alert"
+              className="p-3 rounded-xl bg-red-100/90 border border-red-200 text-red-800 text-xs flex items-center gap-2"
+            >
               <AlertCircle className="w-4 h-4 shrink-0" />
               <span>{error}</span>
             </div>
           )}
 
           <div>
-            <label className="block text-xs font-bold text-[#1e293b] mb-1">
+            <label htmlFor="listing-title-input" className="block text-xs font-bold text-[#1e293b] mb-1">
               Item Title *
             </label>
             <input
               id="listing-title-input"
               type="text"
               required
-              placeholder="e.g. Sony WH-1000XM5 Wireless Noise Canceling Headphones"
+              maxLength={TITLE_MAX_LENGTH}
+              placeholder="e.g. Casio FX-991EX scientific calculator"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
               className="w-full px-3.5 py-2.5 min-h-[44px] text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-medium placeholder-[#1e293b]/40"
@@ -661,14 +658,18 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
           </div>
 
           <div>
-            <label className="block text-xs font-bold text-[#1e293b] mb-1">
-              Item Description *
+            <label htmlFor="listing-description-input" className="flex items-center justify-between gap-2 text-xs font-bold text-[#1e293b] mb-1">
+              <span>Item Description *</span>
+              <span className="text-[11px] font-normal text-[#1e293b]/60" aria-hidden="true">
+                {description.length}/{DESCRIPTION_MAX_LENGTH}
+              </span>
             </label>
             <textarea
               id="listing-description-input"
               required
               rows={3}
-              placeholder="Provide condition, specifications, accessories included, and pickup/shipping terms..."
+              maxLength={DESCRIPTION_MAX_LENGTH}
+              placeholder="Condition, what's included, and where to pick it up..."
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               className="w-full px-3.5 py-2.5 text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-medium placeholder-[#1e293b]/40 resize-none"
@@ -677,29 +678,34 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-bold text-[#1e293b] mb-1">
-                Starting Price (£) *
+              <label htmlFor="listing-price-input" className="block text-xs font-bold text-[#1e293b] mb-1">
+                Price (£) *
               </label>
               <div className="relative">
                 <PoundSterling className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-[#1e293b]/50" />
                 <input
-                  id="listing-starting-price-input"
+                  id="listing-price-input"
                   type="number"
-                  step="any"
-                  min="0.01"
+                  inputMode="decimal"
+                  step="0.01"
+                  min={PRICE_MIN}
+                  max={PRICE_MAX}
                   required
-                  placeholder="100"
-                  value={startingPrice}
-                  onChange={(e) => setStartingPrice(e.target.value)}
+                  placeholder="25"
+                  aria-describedby="listing-price-hint"
+                  value={price}
+                  onChange={(e) => setPrice(e.target.value)}
                   className="w-full pl-9 pr-3.5 py-2.5 min-h-[44px] text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-bold"
                 />
               </div>
-              <p className="text-[11px] text-[#1e293b]/60 mt-1">Must be greater than £0</p>
+              <p id="listing-price-hint" className="text-[11px] text-[#1e293b]/60 mt-1">
+                The fixed price buyers will pay, e.g. 25 or 12.50.
+              </p>
             </div>
 
             <div>
-              <label className="block text-xs font-bold text-[#1e293b] mb-1">
-                Contact Phone Number *
+              <label htmlFor="listing-phone-input" className="block text-xs font-bold text-[#1e293b] mb-1">
+                WhatsApp Phone Number *
               </label>
               <div className="relative">
                 <Phone className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-[#1e293b]/50" />
@@ -707,58 +713,33 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
                   id="listing-phone-input"
                   type="tel"
                   required
+                  maxLength={PHONE_MAX_LENGTH}
                   placeholder="+44 7700 900123"
+                  aria-describedby="listing-phone-hint"
                   value={phoneNumber}
                   onChange={(e) => setPhoneNumber(e.target.value)}
                   className="w-full pl-9 pr-3.5 py-2.5 min-h-[44px] text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b] font-medium"
                 />
               </div>
-              <p className="text-[11px] text-[#1e293b]/60 mt-1">Include your country code (e.g. +44). Used for the WhatsApp contact button.</p>
+              <p id="listing-phone-hint" className="text-[11px] text-[#1e293b]/60 mt-1">
+                Include your country code (e.g. +44). Only signed-in members can see it.
+              </p>
             </div>
           </div>
 
-          {/* An auction's schedule can't be edited once published (see the PATCH contract), so
-              this whole section only applies to creating a new listing. */}
+          {/* The listing's lifetime is fixed server-side; say so here so a listing vanishing
+              from the browse page a month later is never a surprise. */}
           {!isEditMode && (
-          <div>
-            <label className="block text-xs font-bold text-[#1e293b] mb-1.5 flex items-center flex-wrap justify-between gap-x-2 gap-y-0.5">
-              <span>Auction Duration *</span>
-              <span className="text-[11px] font-normal text-[#1e293b]/70">
-                Selected: {customDuration ? `${customDuration} minutes` : `${durationMinutes} minutes`}
+            <p
+              id="listing-lifetime-note"
+              className="p-3 rounded-xl bg-[#d7e3fc] border border-[#ccdbfd] text-[11px] text-[#1e293b]/80 flex items-start gap-2"
+            >
+              <CalendarClock className="w-4 h-4 shrink-0 mt-px" aria-hidden="true" />
+              <span>
+                Listings automatically expire {LISTING_LIFETIME_DAYS} days after you post them. Mark yours as
+                sold as soon as it goes, so nobody messages you about it.
               </span>
-            </label>
-            {/* 2 up on a phone, 3 up from `sm`: at 6 across, labels like "2 Mins (Fast Test)"
-                had ~80px of cell and wrapped mid-phrase. */}
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-              {PRESET_DURATIONS.map((preset) => (
-                <button
-                  key={preset.minutes}
-                  type="button"
-                  onClick={() => {
-                    setDurationMinutes(preset.minutes);
-                    setCustomDuration('');
-                  }}
-                  className={`py-2 px-2 min-h-[44px] text-xs font-semibold leading-tight rounded-xl border text-center transition-all ${
-                    durationMinutes === preset.minutes && !customDuration
-                      ? 'bg-[#abc4ff] border-[#b6ccfe] text-[#1e293b] shadow-xs'
-                      : 'bg-[#edf2fb] border-[#ccdbfd] text-[#1e293b]/80 hover:bg-[#d7e3fc]'
-                  }`}
-                >
-                  {preset.label}
-                </button>
-              ))}
-            </div>
-            <input
-              id="listing-custom-duration-input"
-              type="number"
-              min="1"
-              step="1"
-              placeholder="Or enter custom minutes"
-              value={customDuration}
-              onChange={(e) => setCustomDuration(e.target.value)}
-              className="mt-2 w-full px-3.5 py-2 min-h-[44px] text-sm rounded-xl bg-[#edf2fb] border border-[#ccdbfd] focus:border-[#abc4ff] focus:outline-hidden text-[#1e293b]"
-            />
-          </div>
+            </p>
           )}
 
           <div>
@@ -863,7 +844,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
           </div>
 
           <div>
-            <label className="block text-xs font-bold text-[#1e293b] mb-1">
+            <label htmlFor="listing-category-input" className="block text-xs font-bold text-[#1e293b] mb-1">
               Category
             </label>
             <div className="relative">
@@ -901,7 +882,7 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
               disabled={isSubmitting || !user || hasUploadInProgress || (isEditMode && (isLoadingListing || !!loadListingError))}
               className="px-4 sm:px-5 py-2.5 min-h-[44px] rounded-xl bg-[#abc4ff] hover:bg-[#b6ccfe] border border-[#c1d3fe] text-xs font-extrabold text-[#1e293b] shadow-xs transition-colors cursor-pointer disabled:opacity-60 flex items-center justify-center gap-2 text-center"
             >
-              {isEditMode ? <PencilLine className="w-4 h-4 shrink-0" /> : <Clock className="w-4 h-4 shrink-0" />}
+              {isEditMode ? <PencilLine className="w-4 h-4 shrink-0" /> : <Tag className="w-4 h-4 shrink-0" />}
               <span>
                 {isEditMode
                   ? isLoadingListing
@@ -914,8 +895,8 @@ export const CreateListingModal: React.FC<CreateListingModalProps> = ({
                   : hasUploadInProgress
                   ? 'Uploading...'
                   : isSubmitting
-                  ? 'Starting Auction...'
-                  : 'Publish Live Auction'}
+                  ? 'Publishing...'
+                  : 'Publish Listing'}
               </span>
             </button>
           </div>

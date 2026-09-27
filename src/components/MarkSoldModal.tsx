@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { AlertCircle, Ban, X } from 'lucide-react';
+import { AlertCircle, CheckCircle2, X } from 'lucide-react';
 import { AuctionItem, User } from '../types';
 import { apiFetchAuthed } from '../lib/api';
 import {
@@ -10,20 +10,20 @@ import {
   stripErrorCode,
 } from '../lib/apiErrors';
 
-interface CancelListingModalProps {
+interface MarkSoldModalProps {
   auction: AuctionItem;
   user: User;
   onClose: () => void;
-  /** Called with the server's updated (now-cancelled) auction once the DELETE succeeds. */
-  onCancelled: (updated: AuctionItem) => void;
+  /** Called with the server's updated (now-sold) listing once `POST /sold` succeeds. */
+  onSold: (updated: AuctionItem) => void;
 }
 
 /**
- * A confirmation step for cancelling a listing -- it is not undoable, so a click on "Cancel
- * Listing" in ListingActions opens this rather than firing the DELETE straight away. Names the
- * listing explicitly so the seller can see which one they are about to take down.
+ * A confirmation step for marking a listing sold. Like cancelling, it cannot be undone (the
+ * server refuses every later edit with a 409), and it takes the listing off the browse page at
+ * once, so one stray tap on "Mark as Sold" must not be enough on its own.
  */
-export const CancelListingModal: React.FC<CancelListingModalProps> = ({ auction, user, onClose, onCancelled }) => {
+export const MarkSoldModal: React.FC<MarkSoldModalProps> = ({ auction, user, onClose, onSold }) => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -32,38 +32,36 @@ export const CancelListingModal: React.FC<CancelListingModalProps> = ({ auction,
     setError(null);
 
     try {
-      const res = await apiFetchAuthed(`/api/auctions/${auction.id}`, user.token, { method: 'DELETE' });
+      const res = await apiFetchAuthed(`/api/auctions/${auction.id}/sold`, user.token, { method: 'POST' });
       const data = await res.json().catch(() => null);
 
       if (!res.ok) {
         const code = readErrorCode(data);
 
         if (code && AUTH_ERROR_CODES.has(code)) {
-          setError('Your session has expired. Please sign in again to cancel this listing.');
+          setError('Your session has expired. Please sign in again to mark this listing as sold.');
           return;
         }
         if (code === NOT_LISTING_OWNER) {
-          setError('You are not the seller of this listing, so it cannot be cancelled from here.');
+          setError('You are not the seller of this listing, so it cannot be marked as sold from here.');
           return;
         }
         if (code === LISTING_NOT_EDITABLE || res.status === 409) {
-          setError('This listing is no longer active (it may have sold or expired), so it cannot be cancelled.');
+          setError('This listing is no longer active (it may already be sold, expired or cancelled).');
           return;
         }
 
-        setError(data?.error ? stripErrorCode(data.error) : 'Unable to cancel this listing. Please try again.');
+        setError(data?.error ? stripErrorCode(data.error) : 'Unable to mark this listing as sold. Please try again.');
         return;
       }
 
-      // The server is expected to return the updated (cancelled) auction, matching the
-      // convention every other write endpoint in this app follows. Fall back to patching the
-      // status locally if a response body wasn't provided, so the UI still reflects the
-      // cancellation even if that convention isn't followed exactly.
-      const updated: AuctionItem = data?.auction ?? { ...auction, status: 'cancelled' };
-      onCancelled(updated);
+      // Every other write endpoint answers `{ auction }`; fall back to patching the status
+      // locally if this one ever does not, so the UI still reflects the sale.
+      const updated: AuctionItem = data?.auction ?? { ...auction, status: 'sold', soldAt: Date.now() };
+      onSold(updated);
     } catch (err) {
-      console.error('Failed to cancel listing:', err);
-      setError('Network error while cancelling this listing. Please try again.');
+      console.error('Failed to mark listing as sold:', err);
+      setError('Network error while marking this listing as sold. Please try again.');
     } finally {
       setIsSubmitting(false);
     }
@@ -74,13 +72,13 @@ export const CancelListingModal: React.FC<CancelListingModalProps> = ({ auction,
       <div
         role="dialog"
         aria-modal="true"
-        aria-labelledby="cancel-listing-heading"
+        aria-labelledby="mark-sold-heading"
         className="relative w-full max-w-sm bg-[#e2eafc] border border-[#ccdbfd] rounded-2xl shadow-2xl overflow-hidden text-[#1e293b]"
       >
         <div className="flex items-center justify-between gap-2 px-4 py-3 border-b border-[#ccdbfd] bg-[#d7e3fc]">
-          <h2 id="cancel-listing-heading" className="text-sm font-extrabold flex items-center gap-2">
-            <Ban className="w-4 h-4 text-red-600" />
-            Cancel Listing
+          <h2 id="mark-sold-heading" className="text-sm font-extrabold flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+            Mark as Sold
           </h2>
           <button
             type="button"
@@ -94,7 +92,8 @@ export const CancelListingModal: React.FC<CancelListingModalProps> = ({ auction,
 
         <div className="p-4 space-y-3">
           <p className="text-sm text-[#1e293b]">
-            Cancel <strong className="font-bold break-words">"{auction.title}"</strong>? This cannot be undone.
+            Mark <strong className="font-bold break-words">"{auction.title}"</strong> as sold? It will be
+            removed from the browse page straight away. This cannot be undone.
           </p>
 
           {error && (
@@ -106,22 +105,22 @@ export const CancelListingModal: React.FC<CancelListingModalProps> = ({ auction,
 
           <div className="flex items-center gap-2 pt-1">
             <button
-              id="cancel-listing-keep-btn"
+              id="mark-sold-keep-btn"
               type="button"
               onClick={onClose}
               className="flex-1 inline-flex items-center justify-center px-3 min-h-[44px] rounded-xl bg-[#d7e3fc] hover:bg-[#c1d3fe] text-xs font-bold text-[#1e293b] transition-colors"
             >
-              Keep Listing
+              Not Yet
             </button>
             <button
-              id="cancel-listing-confirm-btn"
+              id="mark-sold-confirm-btn"
               type="button"
               onClick={handleConfirm}
               disabled={isSubmitting}
-              className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 min-h-[44px] rounded-xl bg-red-600 hover:bg-red-700 text-xs font-extrabold text-white transition-colors disabled:opacity-60 cursor-pointer"
+              className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 min-h-[44px] rounded-xl bg-emerald-600 hover:bg-emerald-700 text-xs font-extrabold text-white transition-colors disabled:opacity-60 cursor-pointer"
             >
-              <Ban className="w-3.5 h-3.5" />
-              <span>{isSubmitting ? 'Cancelling...' : 'Yes, Cancel It'}</span>
+              <CheckCircle2 className="w-3.5 h-3.5" />
+              <span>{isSubmitting ? 'Saving...' : 'Yes, It Sold'}</span>
             </button>
           </div>
         </div>

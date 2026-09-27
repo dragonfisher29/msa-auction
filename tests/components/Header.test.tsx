@@ -2,15 +2,16 @@ import React from 'react';
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { Header } from '../../src/components/Header';
+import { SITE_NAME } from '../../src/lib/site';
 
 function renderHeader(overrides: Partial<React.ComponentProps<typeof Header>> = {}) {
   const props: React.ComponentProps<typeof Header> = {
     user: null,
-    isConnected: true,
+    isAccountViewOpen: false,
     onOpenAuth: vi.fn(),
     onOpenCreate: vi.fn(),
     onLogout: vi.fn(),
-    onQuickSwitchUser: vi.fn(),
+    onToggleAccountView: vi.fn(),
     ...overrides,
   };
 
@@ -19,24 +20,26 @@ function renderHeader(overrides: Partial<React.ComponentProps<typeof Header>> = 
 }
 
 describe('Header', () => {
-  describe('connection status', () => {
-    it('renders "Live" in the connection-status pill when isConnected is true', () => {
-      renderHeader({ isConnected: true });
-      expect(screen.getByTestId('connection-status')).toHaveTextContent('Live');
-      expect(screen.queryByText('Reconnecting...')).not.toBeInTheDocument();
+  describe('copy', () => {
+    it('renders the site name from the single SITE_NAME constant', () => {
+      renderHeader();
+      expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent(SITE_NAME);
     });
 
-    it('renders "Reconnecting..." in the connection-status pill when isConnected is false', () => {
-      renderHeader({ isConnected: false });
-      expect(screen.getByTestId('connection-status')).toHaveTextContent('Reconnecting...');
+    it('makes no real-time / bidding claims and has no connection indicator', () => {
+      renderHeader();
+      expect(document.body.textContent).not.toMatch(/real-time|bi-directional|bidding|reconnecting|socket\.io/i);
+      expect(screen.queryByTestId('connection-status')).toBeNull();
     });
   });
 
-  describe('regression guard', () => {
-    it('never renders the string "Socket.io"', () => {
-      renderHeader({ isConnected: true });
-      expect(screen.queryByText(/Socket\.io/i)).not.toBeInTheDocument();
-      expect(document.body.textContent).not.toMatch(/Socket\.io/i);
+  describe('signed-in controls', () => {
+    it('shows no notification bell', () => {
+      renderHeader({
+        user: { id: 'u1', name: 'Alex', username: 'alex', token: 't', createdAt: 0 },
+      });
+      expect(screen.queryByRole('button', { name: /notification/i })).toBeNull();
+      expect(screen.getByRole('button', { name: /my account/i })).toBeInTheDocument();
     });
   });
 

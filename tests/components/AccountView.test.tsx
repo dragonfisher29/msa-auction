@@ -1,6 +1,6 @@
 import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { AccountView } from '../../src/components/AccountView';
 import { AuctionItem, User, UserActivity } from '../../src/types';
@@ -16,11 +16,12 @@ import { apiFetchAuthed } from '../../src/lib/api';
 const mockedApiFetchAuthed = apiFetchAuthed as unknown as ReturnType<typeof vi.fn>;
 
 const NOW = Date.now();
+const DAY = 24 * 60 * 60 * 1000;
 
 const signedInUser: User = {
   id: 'user_1',
-  name: 'Alex Bidder',
-  username: 'alex_bidder',
+  name: 'Alex Seller',
+  username: 'alex_seller',
   token: 'tok_abc',
   createdAt: NOW - 60 * 60 * 1000,
 };
@@ -31,58 +32,37 @@ function makeAuction(overrides: Partial<AuctionItem> = {}): AuctionItem {
     title: 'Vintage Film Camera',
     description: 'A well-loved vintage film camera.',
     phoneNumber: '+44 7700 900000',
-    startingPrice: 100,
-    currentPrice: 150,
-    sellerId: 'seller_1',
-    sellerName: 'Sam Seller',
-    highestBidderId: 'user_1',
-    highestBidderName: 'Alex Bidder',
-    durationMinutes: 60,
-    startTime: NOW - 5 * 60 * 1000,
-    endTime: NOW + 60 * 60 * 1000,
+    price: 150,
+    sellerId: signedInUser.id,
+    sellerName: signedInUser.name,
     status: 'active',
+    expiresAt: NOW + 20 * DAY,
+    soldAt: null,
     category: 'Collectibles',
     imageUrl: 'https://picsum.photos/seed/camera/800/600',
     imageUrls: ['https://picsum.photos/seed/camera/800/600'],
-    bids: [],
-    winnerId: null,
-    winnerName: null,
-    winningBid: null,
-    createdAt: NOW - 10 * 60 * 1000,
+    createdAt: NOW - 10 * DAY,
     ...overrides,
   };
 }
 
-const MY_LISTING = makeAuction({
-  id: 'auc_listing',
-  title: 'My Old Textbooks',
-  sellerId: signedInUser.id,
-  sellerName: signedInUser.name,
-});
-
-const MY_BID = makeAuction({ id: 'auc_bid', title: 'Mechanical Keyboard' });
-
-const MY_WIN = makeAuction({
-  id: 'auc_win',
-  title: 'Desk Lamp',
-  status: 'ended',
-  endTime: NOW - 60 * 1000,
-  currentPrice: 42.5,
-  winningBid: 42.5,
-  winnerId: signedInUser.id,
-  winnerName: signedInUser.name,
-  sellerName: 'Sam Seller',
-  phoneNumber: '+44 7700 900111',
-});
+const FOR_SALE = makeAuction({ id: 'auc_live', title: 'My Old Textbooks' });
+const SOLD = makeAuction({ id: 'auc_sold', title: 'Desk Lamp', status: 'sold', soldAt: NOW - DAY });
+const EXPIRED = makeAuction({ id: 'auc_expired', title: 'Kettle', status: 'expired', expiresAt: NOW - DAY });
 
 const ACTIVITY: UserActivity = {
-  listings: [MY_LISTING],
-  bids: [MY_BID],
-  wins: [MY_WIN],
+  listings: [FOR_SALE, SOLD, EXPIRED],
 };
 
 function mockActivity(result: UserActivity | 'not_found' | 'unauthorized') {
-  mockedApiFetchAuthed.mockImplementation(async (path: string) => {
+  mockedApiFetchAuthed.mockImplementation(async (path: string, _token?: string, init?: RequestInit) => {
+    if (path === `/api/auctions/${FOR_SALE.id}/sold` && init?.method === 'POST') {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ auction: { ...FOR_SALE, status: 'sold', soldAt: NOW } }),
+      } as Response;
+    }
     if (path !== '/api/users/me/activity') {
       throw new Error(`Unexpected apiFetchAuthed call: ${path}`);
     }
@@ -105,6 +85,7 @@ function renderAccountView() {
   const onClose = vi.fn();
   const onPromptAuth = vi.fn();
   const onToggleWatchlist = vi.fn();
+  const onAuctionUpdated = vi.fn();
 
   render(
     <AccountView
@@ -114,10 +95,11 @@ function renderAccountView() {
       onSelectAuction={onSelectAuction}
       onClose={onClose}
       onPromptAuth={onPromptAuth}
+      onAuctionUpdated={onAuctionUpdated}
     />,
   );
 
-  return { onSelectAuction, onClose, onPromptAuth, onToggleWatchlist };
+  return { onSelectAuction, onClose, onPromptAuth, onToggleWatchlist, onAuctionUpdated };
 }
 
 describe('AccountView', () => {
@@ -125,23 +107,47 @@ describe('AccountView', () => {
     mockedApiFetchAuthed.mockReset();
   });
 
-  describe('the three sections', () => {
-    it('renders My Listings, My Bids and My Wins with the items from the activity endpoint', async () => {
+  describe('my listings', () => {
+    it('splits the seller\'s listings into For Sale and Sold & Past, with no bids or wins sections', async () => {
       mockActivity(ACTIVITY);
       renderAccountView();
 
-      expect(await screen.findByRole('heading', { name: /My Listings/ })).toBeInTheDocument();
-      expect(screen.getByRole('heading', { name: /My Bids/ })).toBeInTheDocument();
-      expect(screen.getByRole('heading', { name: /My Wins/ })).toBeInTheDocument();
+      expect(await screen.findByRole('heading', { name: /For Sale/ })).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: /Sold & Past Listings/ })).toBeInTheDocument();
+      expect(screen.queryByRole('heading', { name: /My Bids|My Wins/ })).toBeNull();
 
-      expect(screen.getByTestId('account-count-listings')).toHaveTextContent('1');
-      expect(screen.getByTestId('account-count-bids')).toHaveTextContent('1');
-      expect(screen.getByTestId('account-count-wins')).toHaveTextContent('1');
+      expect(screen.getByTestId('account-count-active')).toHaveTextContent('1');
+      expect(screen.getByTestId('account-count-past')).toHaveTextContent('2');
 
-      // Each section renders the shared AuctionCard, identified by the card's own id scheme.
-      expect(document.getElementById('auction-card-auc_listing')).toBeInTheDocument();
-      expect(document.getElementById('auction-card-auc_bid')).toBeInTheDocument();
-      expect(document.getElementById('auction-card-auc_win')).toBeInTheDocument();
+      const active = document.getElementById('account-section-active') as HTMLElement;
+      const past = document.getElementById('account-section-past') as HTMLElement;
+      expect(within(active).getByText('My Old Textbooks')).toBeInTheDocument();
+      expect(within(past).getByText('Desk Lamp')).toBeInTheDocument();
+      expect(within(past).getByText('Kettle')).toBeInTheDocument();
+      expect(screen.getByTestId('listing-status-badge-auc_sold')).toHaveTextContent('Sold');
+      expect(screen.getByTestId('listing-status-badge-auc_expired')).toHaveTextContent('Expired');
+    });
+
+    it('offers owner actions only on the listing still for sale', async () => {
+      mockActivity(ACTIVITY);
+      renderAccountView();
+
+      expect(await screen.findByRole('button', { name: 'Mark My Old Textbooks as sold' })).toBeInTheDocument();
+      expect(document.getElementById('mark-sold-btn-auc_sold')).toBeNull();
+      expect(document.getElementById('cancel-listing-btn-auc_expired')).toBeNull();
+    });
+
+    it('marks a listing sold after confirming, and moves it to Sold & Past', async () => {
+      mockActivity(ACTIVITY);
+      const { onAuctionUpdated } = renderAccountView();
+      const user = userEvent.setup();
+
+      await user.click(await screen.findByRole('button', { name: 'Mark My Old Textbooks as sold' }));
+      await user.click(document.getElementById('mark-sold-confirm-btn') as HTMLButtonElement);
+
+      await waitFor(() => expect(screen.getByTestId('account-count-past')).toHaveTextContent('3'));
+      expect(screen.getByTestId('account-count-active')).toHaveTextContent('0');
+      expect(onAuctionUpdated).toHaveBeenCalledWith(expect.objectContaining({ id: FOR_SALE.id, status: 'sold' }));
     });
 
     it('sends the session bearer token with the activity request', async () => {
@@ -156,72 +162,37 @@ describe('AccountView', () => {
       );
     });
 
-    it('keeps each section visible with its own empty copy when there is no activity', async () => {
-      mockActivity({ listings: [], bids: [], wins: [] });
+    it('keeps both sections visible with their own empty copy when there are no listings', async () => {
+      mockActivity({ listings: [] });
       renderAccountView();
 
-      expect(await screen.findByText(/You haven't listed anything yet/)).toBeInTheDocument();
-      expect(screen.getByText(/You haven't bid on anything yet/)).toBeInTheDocument();
-      expect(screen.getByText(/You haven't won an auction yet/)).toBeInTheDocument();
-
-      expect(screen.getByTestId('account-count-wins')).toHaveTextContent('0');
+      expect(await screen.findByText(/You have nothing for sale right now/)).toBeInTheDocument();
+      expect(screen.getByText(/Listings you mark as sold, cancel, or that expire will show up here/)).toBeInTheDocument();
     });
 
-    it('opens the auction detail modal through the same callback the grid uses', async () => {
+    it('opens the listing detail modal through the same callback the grid uses', async () => {
       mockActivity(ACTIVITY);
       const { onSelectAuction } = renderAccountView();
 
-      // The first render is the loading state, so wait for the card itself to arrive.
       await waitFor(() =>
-        expect(document.getElementById('view-auction-btn-auc_bid')).toBeInTheDocument(),
+        expect(document.getElementById('view-auction-btn-auc_live')).toBeInTheDocument(),
       );
-      const viewBtn = document.getElementById('view-auction-btn-auc_bid') as HTMLButtonElement;
 
       const user = userEvent.setup();
-      await user.click(viewBtn);
+      await user.click(document.getElementById('view-auction-btn-auc_live') as HTMLButtonElement);
 
-      expect(onSelectAuction).toHaveBeenCalledWith(MY_BID);
-    });
-  });
-
-  describe('My Wins handover details', () => {
-    it('shows the winning amount and the seller contact routes', async () => {
-      mockActivity(ACTIVITY);
-      renderAccountView();
-
-      expect(await screen.findByTestId('win-amount-auc_win')).toHaveTextContent('£42.50');
-
-      const callLink = screen.getByRole('link', {
-        name: 'Call Sam Seller on +44 7700 900111',
-      }) as HTMLAnchorElement;
-      expect(callLink.getAttribute('href')).toBe('tel:+44 7700 900111');
-
-      const whatsAppLink = screen.getByRole('link', {
-        name: /Message Sam Seller on WhatsApp about Desk Lamp/,
-      }) as HTMLAnchorElement;
-      expect(whatsAppLink.getAttribute('href')).toContain('https://wa.me/447700900111');
-      expect(whatsAppLink.rel).toBe('noopener noreferrer');
-    });
-
-    it('adds no contact panel to listings or bids', async () => {
-      mockActivity(ACTIVITY);
-      renderAccountView();
-
-      await screen.findByTestId('win-amount-auc_win');
-      expect(screen.queryByTestId('win-amount-auc_listing')).not.toBeInTheDocument();
-      expect(screen.queryByTestId('win-amount-auc_bid')).not.toBeInTheDocument();
+      expect(onSelectAuction).toHaveBeenCalledWith(FOR_SALE);
     });
   });
 
   describe('degrading when the endpoint is not there yet', () => {
-    it('shows a calm message on 404 and still renders the three sections', async () => {
+    it('shows a calm message on 404 and still renders both sections', async () => {
       mockActivity('not_found');
       renderAccountView();
 
-      expect(await screen.findByText(/Account activity is not available yet/)).toBeInTheDocument();
-      expect(screen.getByRole('heading', { name: /My Listings/ })).toBeInTheDocument();
-      expect(screen.getByRole('heading', { name: /My Bids/ })).toBeInTheDocument();
-      expect(screen.getByRole('heading', { name: /My Wins/ })).toBeInTheDocument();
+      expect(await screen.findByText(/Your listings are not available yet/)).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: /For Sale/ })).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: /Sold & Past Listings/ })).toBeInTheDocument();
     });
 
     it('surfaces a sign-in path on 401 rather than a generic failure', async () => {
