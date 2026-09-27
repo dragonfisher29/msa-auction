@@ -47,9 +47,10 @@ The product changed from a live auction to a fixed-price classifieds board — s
 README for the full feature list. For deployment, the load-bearing differences are:
 
 - Two new migrations, `006_fixed_price_listings.sql` (adds columns and backfills —
-  and, per the owner's decision, converts live auctions with bids to sold at their
-  current highest bid, which is not reversible from inside the database — see section
-  5 step 3) and `007_drop_bid_columns.sql` (destructive, irreversible).
+  and, per the owner's decision, sets a live auction's price to its current highest
+  bid while keeping it live, and converts an already-ended auction with a winner to
+  sold at the winning bid, which is not reversible from inside the database — see
+  section 5 step 3) and `007_drop_bid_columns.sql` (destructive, irreversible).
 - The Worker's cron triggers drop from two (`* * * * *` settlement, `0 3 * * *`
   cleanup) to one (`0 3 * * *` cleanup only) — `wrangler.toml` already reflects this.
 - A new `LISTING_TTL_DAYS` plaintext var controls how long a listing stays live.
@@ -169,8 +170,9 @@ Cloudflare.
 ### Step 2 — Back up `auctions` before migration 006
 
 Migration 006 is not reversible from inside the database once it runs (see step 3's
-"Reversible?" note) — per the owner's decision, it converts live auctions that already
-have a bid to `'sold'` at their current highest bid. Take a backup first, in the
+"Reversible?" note) — per the owner's decision, it sets a live auction's price to its
+current highest bid (keeping it live) and converts an already-ended auction with a
+winner to `'sold'` at the winning bid. Take a backup first, in the
 **Supabase SQL Editor**, using the same backup-schema-with-RLS pattern migration 007's
 own header uses for `backup.auctions_pre007` (step 6):
 
@@ -196,9 +198,10 @@ and a copy sitting in `public` with RLS off would be readable by anyone holding 
 
 **Before you run this**, bidding on the live site is ending for good. Post a notice
 (society WhatsApp/social channels) telling sellers and bidders of live auctions that
-bidding is closing and that every live listing with at least one bid will convert to
-**sold, at its current highest bid** the moment this migration runs — see below. Give
-people a reasonable window to place a final bid or walk away before you run it.
+bidding is closing and that every live listing will stay live, converting to a
+fixed-price listing **at its current highest bid** if it has one (otherwise its
+starting price) the moment this migration runs — see below. Give people a reasonable
+window to place a final bid or walk away before you run it.
 
 **Supabase dashboard → SQL Editor.** Open `migrations/006_fixed_price_listings.sql`,
 read its header comment in full, copy the whole file, and run it. It is **not purely
@@ -213,8 +216,9 @@ runs (re-adding one, `NOT VALID`, afterwards, so an unexpected legacy status is 
 backfilled rather than aborting the migration); and, per the owner's decision, converts
 every **live** auction to a fixed-price listing as follows:
 
-- A live auction that already has at least one bid converts to `status = 'sold'`, at
-  its **current highest bid** (not the original starting price).
+- A live auction that already has at least one bid stays a live listing
+  (`status = 'active'`), at its **current highest bid** (not the original starting
+  price).
 - A live auction with no bids converts to a live listing at its **starting price**.
 - Every live auction — bid or no bid — gets a **fresh 30-day expiry** from the moment
   006 runs, regardless of how long it had been live before.
@@ -367,7 +371,7 @@ migration file in this repo.
 | --- | --- | --- |
 | 1. Rotate secret key | Creating/setting the new key: yes. Disabling the legacy keys: **effectively no** — you would have to re-enable a key you deliberately revoked, defeating the point | Re-enable the legacy keys in Supabase if something depends on them; otherwise fix the dependency, don't undo the rotation |
 | 2. Backup before 006 | N/A (additive, harmless to leave) | Drop `backup.auctions_pre006` once you're confident you no longer need it |
-| 3. Migration 006 | **Only partly** — the added columns/indexes/trigger can be dropped, but the rows rewritten to `'sold'` (at current highest bid), the dropped `NOT NULL`s and the dropped legacy `CHECK` do **not** come back this way | `drop trigger if exists msa_v1_transition_sync on public.auctions; drop function if exists public.msa_v1_transition_sync(); alter table public.auctions drop column if exists price, drop column if exists expires_at, drop column if exists sold_at, drop column if exists images_version;` then drop the indexes it added (see the migration file). For the rewritten data, restore from `backup.auctions_pre006` (step 2) by hand — that backup is the only full restore |
+| 3. Migration 006 | **Only partly** — the added columns/indexes/trigger can be dropped, but the rows rewritten to `'sold'` (at the winning bid), the dropped `NOT NULL`s and the dropped legacy `CHECK` do **not** come back this way | `drop trigger if exists msa_v1_transition_sync on public.auctions; drop function if exists public.msa_v1_transition_sync(); alter table public.auctions drop column if exists price, drop column if exists expires_at, drop column if exists sold_at, drop column if exists images_version;` then drop the indexes it added (see the migration file). For the rewritten data, restore from `backup.auctions_pre006` (step 2) by hand — that backup is the only full restore |
 | 4. Merge to `main` | Yes, immediately for the Worker code. **Not** for the database | Dashboard → Deployments → previous version → **Rollback**. A later merge to `main` (by anyone) redeploys the new code again — if the rollback needs to stick, also revert the merge commit on GitHub. Note: listings created under v1 will show as **Ended** in the old UI after this rollback, since the old client reads `end_time`, which v1 listings never set |
 | 5. Smoke test | N/A (read-only) | — |
 | 6. Backup before 007 | N/A (additive, harmless to leave) | Drop `backup.auctions_pre007` once you're confident you no longer need it |
