@@ -47,7 +47,7 @@
 --
 -- KEPT: everything the new Worker reads - id, title, description,
 -- phone_number, price, seller_id, seller_name, status, category, image_url,
--- image_urls, image_count, created_at, expires_at, sold_at, and the
+-- image_urls, image_count, images_version, created_at, expires_at, sold_at, and the
 -- hidden_reason / hidden_by / hidden_at takedown record.
 --
 -- NO DATABASE FUNCTIONS are dropped other than 006's trigger function: no

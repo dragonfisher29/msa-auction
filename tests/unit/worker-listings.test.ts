@@ -92,6 +92,7 @@ const READ_KEYS = [
   'expiresAt',
   'id',
   'imageCount',
+  'imagesVersion',
   'price',
   'sellerId',
   'sellerName',
@@ -485,7 +486,7 @@ describe('GET /api/auctions/:id', () => {
 });
 
 describe('GET /api/auctions/:id/images', () => {
-  it('returns the images with a public cache header and no auth', async () => {
+  it('returns every image, with no auth, and only the short cache when the request is unversioned', async () => {
     seed([listingRow()]);
 
     const response = await call('GET', '/api/auctions/auc_1/images');
@@ -497,6 +498,71 @@ describe('GET /api/auctions/:id/images', () => {
     });
   });
 
+  it('?first=1 returns only the first image, extracted by the select - image_urls itself is never read', async () => {
+    const db = seed([listingRow()]);
+
+    const response = await call('GET', '/api/auctions/auc_1/images?first=1');
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ imageUrls: ['data:image/png;base64,aaa'] });
+
+    const columns = (db.selectColumns('auctions')[0] ?? '').split(',');
+    expect(columns).toContain('first_image:image_urls->>0');
+    // Only the aliased element - never the whole jsonb array.
+    expect(columns).not.toContain('image_urls');
+    expect(columns).not.toContain('image_url');
+  });
+
+  it('?first=1 on a listing with no images returns an empty list', async () => {
+    seed([listingRow({ image_url: null, image_urls: [], image_count: 0 })]);
+
+    const result = await callJson('GET', '/api/auctions/auc_1/images?first=1');
+
+    expect(result.body).toEqual({ imageUrls: [] });
+  });
+
+  it('caches for a day only when ?v= names the CURRENT images_version', async () => {
+    seed([listingRow({ images_version: 1_700_000_000_000 })]);
+
+    for (const [query, expected] of [
+      ['?v=1700000000000', 'public, max-age=86400'],
+      ['?first=1&v=1700000000000', 'public, max-age=86400'],
+      ['?v=1699999999999', 'public, max-age=300'],
+      ['?first=1&v=abc', 'public, max-age=300'],
+      ['?first=1', 'public, max-age=300'],
+    ] as const) {
+      const response = await call('GET', `/api/auctions/auc_1/images${query}`);
+      expect(response.headers.get('Cache-Control'), query).toBe(expected);
+    }
+  });
+
+  it('treats a listing never re-imaged since v1 (NULL images_version) as version 0', async () => {
+    seed([listingRow({ images_version: null })]);
+
+    expect((await call('GET', '/api/auctions/auc_1/images?first=1&v=0')).headers.get('Cache-Control')).toBe(
+      'public, max-age=86400',
+    );
+    expect((await callJson('GET', '/api/auctions')).body.auctions[0].imagesVersion).toBe(0);
+  });
+
+  it('a hidden listing 404s for everyone but an admin - with or without first=1 - and is never cached', async () => {
+    const ADMIN = { id: 'usr_admin', name: 'Admin', username: 'admin', token: 'tok_admin', role: 'admin' };
+    mocks.client = createFakeSupabase({ users: [SELLER, OTHER, ADMIN], auctions: [listingRow({ status: 'hidden' })] });
+
+    for (const query of ['', '?first=1', '?first=1&v=0']) {
+      const anonymous = await callJson('GET', `/api/auctions/auc_1/images${query}`);
+      expect(anonymous.status, query).toBe(404);
+      expect(anonymous.body.code).toBe('AUCTION_NOT_FOUND');
+
+      const member = await callJson('GET', `/api/auctions/auc_1/images${query}`, { token: OTHER.token });
+      expect(member.status, query).toBe(404);
+
+      const admin = await call('GET', `/api/auctions/auc_1/images${query}`, { token: ADMIN.token });
+      expect(admin.status, query).toBe(200);
+      expect(admin.headers.get('Cache-Control')).toBe('private, no-store');
+    }
+  });
+
   it('404s for an unknown listing', async () => {
     seed([listingRow()]);
 
@@ -504,6 +570,38 @@ describe('GET /api/auctions/:id/images', () => {
 
     expect(result.status).toBe(404);
     expect(result.body.code).toBe('AUCTION_NOT_FOUND');
+  });
+});
+
+describe('images_version', () => {
+  it('is set on create and returned on the list', async () => {
+    const db = seed([]);
+
+    const created = await callJson('POST', '/api/auctions', { token: SELLER.token, body: NEW_LISTING });
+
+    expect(created.body.auction.imagesVersion).toBe(created.body.auction.createdAt);
+    expect(db.rows('auctions')[0].images_version).toBe(created.body.auction.createdAt);
+  });
+
+  it('moves when an edit changes the photos, and stays put for a title or price edit', async () => {
+    const db = seed([listingRow({ images_version: 111 })]);
+
+    await callJson('PATCH', '/api/auctions/auc_1', { token: SELLER.token, body: { title: 'Renamed', price: 120 } });
+    expect(db.rows('auctions')[0].images_version).toBe(111);
+
+    // Reordering changes the cover photo, so it counts as a change.
+    await callJson('PATCH', '/api/auctions/auc_1', {
+      token: SELLER.token,
+      body: { imageUrls: ['data:image/png;base64,bbb', 'data:image/png;base64,aaa'] },
+    });
+    const moved = db.rows('auctions')[0].images_version;
+    expect(moved).toBeGreaterThan(111);
+
+    const withNew = await callJson('PATCH', '/api/auctions/auc_1', {
+      token: SELLER.token,
+      body: { imageUrls: ['data:image/png;base64,bbb', 'data:image/png;base64,ccc'] },
+    });
+    expect(withNew.body.auction.imagesVersion).toBeGreaterThanOrEqual(moved);
   });
 });
 

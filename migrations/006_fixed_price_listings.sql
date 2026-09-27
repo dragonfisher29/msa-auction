@@ -6,8 +6,9 @@
 -- WHAT THIS DOES (ADDITIVE - nothing is dropped, no bid data is touched)
 --   1. Preflight: stops with a clear error, changing nothing, if the live
 --      `auctions` table does not look the way this file assumes.
---   2. Adds `auctions.price numeric(12,2)`, `auctions.expires_at bigint` and
---      `auctions.sold_at bigint`. Timestamps are epoch MILLISECONDS in a bigint,
+--   2. Adds `auctions.price numeric(12,2)`, `auctions.expires_at bigint`,
+--      `auctions.sold_at bigint` and `auctions.images_version bigint`.
+--      Timestamps are epoch MILLISECONDS in a bigint,
 --      matching every other timestamp in this schema (`created_at`, `end_time`,
 --      `hidden_at`, `users.reset_token_expires` - see 002 and 003).
 --   3. Drops NOT NULL (only where it exists) on the bid-era columns the new
@@ -135,6 +136,14 @@ alter table public.auctions add column if not exists expires_at bigint;
 
 -- sold_at: epoch ms, set when the seller marks the listing sold. NULL otherwise.
 alter table public.auctions add column if not exists sold_at bigint;
+
+-- images_version: epoch ms of the last change to image_urls, set by the new
+-- Worker on create, on an edit that changes the images, and when the cleanup
+-- sweep blanks them. Clients put it in the image URL (`?v=`), so a browser may
+-- cache a listing's images for a day and still sees an edit immediately.
+-- NULL = unchanged since v1 (reported as 0). Nullable with no default, so
+-- adding it is metadata-only: no table rewrite, no backfill.
+alter table public.auctions add column if not exists images_version bigint;
 
 -- ---------------------------------------------------------------------------
 -- 3. Relax NOT NULL on the bid-era columns the new Worker does not write

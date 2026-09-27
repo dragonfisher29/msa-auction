@@ -315,6 +315,41 @@ function matchesFilter(row: any, filter: RecordedFilter): boolean {
   return Number(actual) <= Number(filter.value);
 }
 
+/**
+ * PostgREST's JSON-operator select with an alias - `alias:column->>0` (text) or
+ * `alias:column->0` (json) - evaluated the way Postgres would: element N of a jsonb array, or
+ * NULL.
+ *
+ * A select that uses one is also PROJECTED to exactly the listed columns, the way PostgREST
+ * returns it, so a test can prove the route never saw the whole `image_urls` array. Selects
+ * without an alias still return whole rows, as before.
+ */
+const JSON_ALIAS_PATTERN = /^([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*)->>?(\d+)$/;
+
+function applyJsonAliases(row: any, columns: string | undefined): any {
+  if (!row || !columns) {
+    return row;
+  }
+  const entries = columns.split(',').map((entry) => entry.trim());
+  if (!entries.some((entry) => JSON_ALIAS_PATTERN.test(entry))) {
+    return row;
+  }
+
+  const projected: Record<string, any> = {};
+  for (const entry of entries) {
+    const match = JSON_ALIAS_PATTERN.exec(entry);
+    if (match) {
+      const [, alias, column, index] = match;
+      const source = row[column];
+      const value = Array.isArray(source) ? source[Number(index)] : undefined;
+      projected[alias] = value === undefined ? null : value;
+    } else if (entry in row) {
+      projected[entry] = row[entry];
+    }
+  }
+  return projected;
+}
+
 export class FakeSupabase {
   readonly tables: Record<string, any[]>;
   readonly operations: RecordedOperation[] = [];
@@ -504,7 +539,7 @@ class FakeQuery {
     const matched = rows.filter((row) => this.filters.every((filter) => matchesFilter(row, filter)));
 
     if (this.single) {
-      return { data: matched.length > 0 ? clone(matched[0]) : null, error: null };
+      return { data: matched.length > 0 ? applyJsonAliases(clone(matched[0]), this.columns) : null, error: null };
     }
 
     const ordered = [...matched];
@@ -525,7 +560,11 @@ class FakeQuery {
 
     // PostgREST counts the whole match, before LIMIT; `head: true` returns the
     // count with no rows at all.
-    return { data: this.head ? null : clone(limited), error: null, count: matched.length };
+    return {
+      data: this.head ? null : clone(limited).map((row: any) => applyJsonAliases(row, this.columns)),
+      error: null,
+      count: matched.length,
+    };
   }
 }
 

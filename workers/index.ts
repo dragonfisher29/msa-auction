@@ -1,6 +1,8 @@
 import { createClient } from '@supabase/supabase-js';
 import {
   AUCTION_DETAIL_COLUMNS,
+  AUCTION_FIRST_IMAGE_COLUMNS,
+  AUCTION_IMAGES_COLUMNS,
   AUCTION_META_COLUMNS,
   AUCTION_OWNER_COLUMNS,
   AUCTION_STATE_COLUMNS,
@@ -16,6 +18,8 @@ import {
   fetchSellerListings,
   hashPassword,
   hideAuction,
+  imageCacheControl,
+  imageListChanged,
   IMAGE_BACKFILL_UNAVAILABLE_MESSAGE,
   IMAGE_CACHE_CONTROL,
   IMAGE_PATH_PREFIX,
@@ -793,25 +797,40 @@ export default {
       }
 
       try {
+        // `?first=1` (browse cards): only image 0, extracted in Postgres, so the
+        // rest never leave the database. Without it (the detail gallery): all.
+        const firstOnly = url.searchParams.get('first') === '1';
+
         const { data: row, error } = await supabase
           .from('auctions')
-          .select('id,image_urls,status')
+          .select(firstOnly ? AUCTION_FIRST_IMAGE_COLUMNS : AUCTION_IMAGES_COLUMNS)
           .eq('id', auctionImagesMatch[1])
           .maybeSingle();
 
         if (error) throw error;
         if (!row) return jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 });
 
-        const isAdmin = await isBearerTokenAdmin(supabase, request.headers.get('authorization'));
+        // Only a hidden listing needs the admin lookup, so a normal image fetch
+        // costs one query, not two.
+        const isAdmin =
+          String(row.status) === AUCTION_STATUS.hidden &&
+          (await isBearerTokenAdmin(supabase, request.headers.get('authorization')));
         if (!isAuctionVisible(row, isAdmin)) {
           return jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 });
         }
 
-        // This is the heaviest response the API serves - let clients and the
-        // edge keep it briefly. A seller's image edit shows up within 5 minutes.
+        const imageUrls = firstOnly
+          ? typeof row.first_image === 'string' && row.first_image.trim() !== ''
+            ? [row.first_image]
+            : []
+          : toStringArray(row.image_urls);
+
+        // The heaviest response the API serves. A day in the browser cache when
+        // the request names the current images_version, otherwise 5 minutes -
+        // see imageCacheControl for why that can never serve a stale photo.
         return jsonResponse(
-          { imageUrls: toStringArray(row.image_urls) },
-          { headers: { 'Cache-Control': 'public, max-age=300' } },
+          { imageUrls },
+          { headers: { 'Cache-Control': imageCacheControl(row, url.searchParams.get('v')) } },
         );
       } catch (error) {
         return jsonResponse(getErrorMessageAndCode('Failed to load auction images.', 'FETCH_AUCTION_IMAGES_FAILED', error), {
@@ -936,6 +955,11 @@ export default {
           image_url: imageUrlMirror(validated.data.imageUrls[0]),
           image_urls: validated.data.imageUrls,
           price: validated.data.price,
+          // A new version only when the photos actually changed, so a title or
+          // price edit does not make every viewer re-download the images.
+          ...(imageListChanged(validated.data.imageUrls, toStringArray(row.image_urls ?? row.imageUrls))
+            ? { images_version: now }
+            : {}),
         };
 
         const { data: updated, error: updateError } = await guardLive(
@@ -1108,6 +1132,7 @@ export default {
           // still carries the full first image via `image_urls`.
           image_url: imageUrlMirror(validated.data.imageUrls[0]),
           image_urls: validated.data.imageUrls,
+          images_version: now,
           created_at: now,
           expires_at: now + listingTtlMs(env),
           sold_at: null,

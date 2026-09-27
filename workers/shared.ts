@@ -199,9 +199,11 @@ export async function cleanupStaleImages(supabase: any, now: number = Date.now()
       return 0;
     }
 
+    // images_version is bumped so a browser that cached these images under the old version
+    // stops being served them (see imageCacheControl).
     const { error: updateError } = await supabase
       .from('auctions')
-      .update({ image_url: null, image_urls: [] })
+      .update({ image_url: null, image_urls: [], images_version: now })
       .in('id', ids)
       .lt('expires_at', cutoff);
 
@@ -521,6 +523,7 @@ export const AUCTION_LIST_COLUMNS = [
   'status',
   'category',
   'image_count',
+  'images_version',
   'created_at',
   'expires_at',
   'sold_at',
@@ -539,6 +542,58 @@ export const AUCTION_DETAIL_COLUMNS = `${AUCTION_LIST_COLUMNS},phone_number`;
  * the response hands the edited listing straight back to the edit form.
  */
 export const AUCTION_OWNER_COLUMNS = `${AUCTION_DETAIL_COLUMNS},image_url,image_urls`;
+
+/** `GET /api/auctions/:id/images` - every image, plus what the visibility and cache checks need. */
+export const AUCTION_IMAGES_COLUMNS = 'id,status,images_version,image_urls';
+
+/**
+ * `GET /api/auctions/:id/images?first=1` - the FIRST image only, for a browse card.
+ *
+ * `first_image:image_urls->>0` is PostgREST's JSON-operator select with an alias: Postgres
+ * extracts element 0 of the jsonb array itself, and only that one string crosses the wire. The
+ * other images never leave the database, which is the point - a card shows one photo, and each
+ * inline photo is up to ~400 KB of base64 of Supabase egress.
+ */
+export const AUCTION_FIRST_IMAGE_COLUMNS = 'id,status,images_version,first_image:image_urls->>0';
+
+/** Served for a request whose `?v=` matches the listing's current images_version. */
+export const IMAGE_RESPONSE_CACHE_LONG = 'public, max-age=86400';
+/** Served for an unversioned or out-of-date request: the old 5-minute window. */
+export const IMAGE_RESPONSE_CACHE_SHORT = 'public, max-age=300';
+/** A hidden listing's images (only ever served to an admin) are never stored by any cache. */
+export const IMAGE_RESPONSE_CACHE_PRIVATE = 'private, no-store';
+
+/**
+ * The `Cache-Control` for an images response.
+ *
+ * A browser may keep a listing's images for a DAY only when the request named the listing's
+ * CURRENT images_version (`?v=`). The version changes whenever the images do, and clients read it
+ * off the (uncached) list/detail rows, so the next view after an edit asks for a new URL and a
+ * day-long cache can never pin an old photo. A request with no `v`, a malformed one, or an
+ * out-of-date one gets only the old 5-minute window, so a stale or older client degrades to
+ * today's behaviour rather than to a day of staleness.
+ */
+export function imageCacheControl(row: any, requestedVersion: string | null): string {
+  if (String(row?.status ?? '') === AUCTION_STATUS.hidden) {
+    return IMAGE_RESPONSE_CACHE_PRIVATE;
+  }
+
+  const current = toEpochMs(row?.images_version) ?? 0;
+  if (requestedVersion !== null && /^\d{1,16}$/.test(requestedVersion) && Number(requestedVersion) === current) {
+    return IMAGE_RESPONSE_CACHE_LONG;
+  }
+
+  return IMAGE_RESPONSE_CACHE_SHORT;
+}
+
+/** True when an edit's image list differs from what is stored (order matters: [0] is the cover). */
+export function imageListChanged(next: readonly string[], stored: readonly string[]): boolean {
+  if (next.length !== stored.length) {
+    return true;
+  }
+  // `!==` on two strings of equal length is a memcmp, not a scan per character in JS.
+  return next.some((value, index) => value !== stored[index]);
+}
 
 /** What the ownership / state checks on DELETE and mark-sold need, and nothing heavier. */
 export const AUCTION_STATE_COLUMNS = 'id,seller_id,status,expires_at';
@@ -581,6 +636,12 @@ export interface AuctionSummary {
   status: ListingStatus;
   category: string;
   imageCount: number;
+  /**
+   * Epoch ms of the last change to this listing's images; 0 = unchanged since v1. Clients pass it
+   * as `?v=` to `GET /api/auctions/:id/images` so the response can be cached for a day and still
+   * never be stale - see `imageCacheControl`.
+   */
+  imagesVersion: number;
   imageUrl?: string;
   imageUrls?: string[];
   createdAt: number;
@@ -620,6 +681,7 @@ export function mapListingRow(row: any, options: MapListingOptions = {}): Auctio
     status: deriveListingStatus(row, now),
     category: row.category ?? DEFAULT_LISTING_CATEGORY,
     imageCount,
+    imagesVersion: toEpochMs(row.images_version ?? row.imagesVersion) ?? 0,
     createdAt,
     // A NULL expiry (which migration 006's trigger prevents) is reported as the creation time:
     // consistent with the derived `expired` status such a row gets, rather than a 1970 date.

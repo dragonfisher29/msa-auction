@@ -20,7 +20,7 @@ import { AuctionItem, User } from '../types';
 import { buildWhatsAppUrl, formatExpiresIn, formatListedAgo, formatPrice } from '../lib/formatters';
 import { apiFetchAuthed } from '../lib/api';
 import { AUTH_ERROR_CODES, readErrorCode } from '../lib/apiErrors';
-import { fetchAuctionImages } from '../lib/images';
+import { fetchAuctionImages, imagesVersionOf } from '../lib/images';
 import { getListingStatus, LISTING_STATUS_EXPLANATION, LISTING_STATUS_LABEL } from '../lib/listing';
 import { PLACEHOLDER_IMAGE_URL } from '../lib/placeholder';
 import { SITE_NAME } from '../lib/site';
@@ -191,9 +191,11 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
   // whatever was already resolved alone.
   const [resolvedImages, setResolvedImages] = useState<string[] | null>(() => extractInlineImages(initialAuction));
 
-  // Re-resolves when the listing id changes or when imageCount changes (the clearest signal that
-  // inline data just became unavailable/available). fetchAuctionImages caches by id, so this
-  // stays free once resolved.
+  // Re-resolves when the listing id, its imageCount or its imagesVersion changes (the version is
+  // the server's signal that the photos themselves changed). The gallery needs every photo, so
+  // this fetches the full set; fetchAuctionImages caches on (id, version), so this stays free
+  // once resolved.
+  const imagesVersion = imagesVersionOf(auction);
   useEffect(() => {
     const inline = extractInlineImages(auction);
     if (inline) {
@@ -201,7 +203,7 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
       return;
     }
     let cancelled = false;
-    fetchAuctionImages(auction.id).then((urls) => {
+    fetchAuctionImages(auction.id, { version: imagesVersion }).then((urls) => {
       if (!cancelled) {
         setResolvedImages(urls);
       }
@@ -210,7 +212,7 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [auction.id, auction.imageCount]);
+  }, [auction.id, auction.imageCount, imagesVersion]);
 
   // Gallery source of truth: the resolved images, or the local placeholder when there are none.
   const galleryImages = useMemo(() => {

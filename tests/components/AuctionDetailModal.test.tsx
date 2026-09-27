@@ -450,6 +450,22 @@ describe('AuctionDetailModal', () => {
     // rows mid-backfill -- may still carry a base64 `data:` URL, sometimes both in the same
     // listing. The gallery must render either form with no special-casing: an `<img src>` works
     // for both, so this only guards against code that inspects/slices the string somewhere.
+    it('fetches the FULL image set for the gallery (never ?first=1), versioned by imagesVersion', async () => {
+      const urls = ['https://example.test/a.jpg', 'https://example.test/b.jpg'];
+      mockedApiFetch.mockImplementation(async (url: string) => {
+        if (url === '/api/auctions/auc_1/images?v=42') {
+          return { ok: true, status: 200, json: async () => ({ imageUrls: urls }) } as Response;
+        }
+        throw new Error(`Unexpected apiFetch call: ${url}`);
+      });
+
+      const listRow = { ...makeAuction({ imageUrls: undefined, imageUrl: undefined, imageCount: 2 }), imagesVersion: 42 } as AuctionItem;
+      renderModal(listRow, null);
+
+      await waitFor(() => expect(screen.getAllByRole('img').some((img) => (img as HTMLImageElement).src === urls[1])).toBe(true));
+      expect(mockedApiFetch).toHaveBeenCalledTimes(1);
+    });
+
     it('renders a gallery mixing a legacy data: URL and a stored /images/<key> path', () => {
       const dataUrlImage = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMC';
       const r2PathImage = '/images/img_2f9c8a1b';
