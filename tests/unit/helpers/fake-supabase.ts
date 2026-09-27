@@ -1,10 +1,14 @@
 /**
  * Minimal in-memory stand-in for `@supabase/supabase-js`'s query builder.
  *
- * Only the surface the Worker and dev server actually use is implemented:
- * from().select().eq().is().lte().maybeSingle(), from().update()....select(),
- * and from().insert(). Enough to exercise the optimistic-lock and settle paths
- * without touching a real database.
+ * Only the surface the Worker actually uses is implemented:
+ * from().select().eq().gt().lt().or().order().limit().maybeSingle(),
+ * from().update()....select(), and from().insert(). Enough to exercise the
+ * guarded seller writes (edit / mark sold / cancel), the live-listing browse
+ * filter and the keyset cursor without touching a real database.
+ *
+ * NOT modelled: column projection. `select('a,b')` returns whole rows, so tests
+ * that care which columns a route asks for assert on `selectColumns()` instead.
  */
 
 export type FilterOp = 'eq' | 'is' | 'lte' | 'lt' | 'neq' | 'or' | 'gt' | 'in' | 'like';
@@ -58,7 +62,7 @@ function clone<T>(value: T): T {
  * The money columns on `auctions`. These were `double precision` on the live
  * database until migration 004; see below for why that matters to `eq`.
  */
-export const MONEY_COLUMNS = new Set(['current_price', 'starting_price', 'winning_bid']);
+export const MONEY_COLUMNS = new Set(['price', 'current_price', 'starting_price', 'winning_bid']);
 
 /**
  * WHY THIS EXISTS.

@@ -74,24 +74,16 @@ function auctionRow(overrides: Record<string, any> = {}) {
     title: 'Vintage lamp',
     description: 'A lamp',
     phone_number: '0100000000',
-    starting_price: 100,
-    current_price: 100,
+    price: 100,
     seller_id: SELLER.id,
     seller_name: SELLER.name,
-    highest_bidder_id: null,
-    highest_bidder_name: null,
-    duration_minutes: 60,
-    start_time: NOW - 1000,
-    end_time: FUTURE,
     status: 'active',
     category: 'General',
     image_url: imageUrls[0],
     image_count: imageUrls.length,
-    bids: [],
-    winner_id: null,
-    winner_name: null,
-    winning_bid: null,
     created_at: NOW - 1000,
+    expires_at: FUTURE,
+    sold_at: null,
     ...overrides,
     image_urls: imageUrls,
   };
@@ -425,8 +417,7 @@ describe('listing creation image validation', () => {
           title: 'A thing',
           description: 'Some description',
           phoneNumber: '0100000000',
-          startingPrice: 10,
-          durationMinutes: 60,
+          price: 10,
           imageUrls,
         }),
       }),
@@ -491,8 +482,7 @@ describe('the 300KB cap on a new inline data: image', () => {
           title: 'A thing',
           description: 'Some description',
           phoneNumber: '0100000000',
-          startingPrice: 10,
-          durationMinutes: 60,
+          price: 10,
           imageUrls,
         }),
       }),
@@ -600,8 +590,7 @@ describe('the size-cap bypass via a malformed data: URL (fixed)', () => {
           title: 'A thing',
           description: 'Some description',
           phoneNumber: '0100000000',
-          startingPrice: 10,
-          durationMinutes: 60,
+          price: 10,
           imageUrls,
         }),
       }),
@@ -728,8 +717,7 @@ describe('the image_url mirror column on write', () => {
           title: 'A thing',
           description: 'Some description',
           phoneNumber: '0100000000',
-          startingPrice: 10,
-          durationMinutes: 60,
+          price: 10,
           imageUrls: [PNG_DATA_URL],
         }),
       }),
@@ -754,8 +742,7 @@ describe('the image_url mirror column on write', () => {
           title: 'A thing',
           description: 'Some description',
           phoneNumber: '0100000000',
-          startingPrice: 10,
-          durationMinutes: 60,
+          price: 10,
           imageUrls: [R2_PATH_A],
         }),
       }),
@@ -791,7 +778,7 @@ describe('og:image', () => {
   const PAGE_URL = 'https://msa-auction.test/auction/auc_01';
 
   it('is an absolute https URL when the first image is in R2', () => {
-    const meta = buildAuctionMetaTags({ title: 'Lamp', image_url: R2_PATH_A, current_price: 10 }, PAGE_URL);
+    const meta = buildAuctionMetaTags({ title: 'Lamp', image_url: R2_PATH_A, price: 10 }, PAGE_URL);
 
     expect(meta.image).toBe(`https://msa-auction.test${R2_PATH_A}`);
     expect(injectAuctionMeta('<head></head>', meta)).toContain(
@@ -800,7 +787,7 @@ describe('og:image', () => {
   });
 
   it('falls back to the absolute site logo when the first image is still legacy', () => {
-    const meta = buildAuctionMetaTags({ title: 'Lamp', image_url: PNG_DATA_URL, current_price: 10 }, PAGE_URL);
+    const meta = buildAuctionMetaTags({ title: 'Lamp', image_url: PNG_DATA_URL, price: 10 }, PAGE_URL);
 
     // A base64 data URL can never be emitted - every crawler rejects it. But
     // emitting NOTHING would be a regression: the static shell carries a logo
@@ -1279,8 +1266,7 @@ describe('with no R2 binding (the deployed configuration)', () => {
           title: 'A thing',
           description: 'Some description',
           phoneNumber: '0100000000',
-          startingPrice: 10,
-          durationMinutes: 60,
+          price: 10,
           imageUrls: [PNG_DATA_URL, JPEG_DATA_URL],
         }),
       }),
@@ -1306,8 +1292,7 @@ describe('with no R2 binding (the deployed configuration)', () => {
           title: 'A thing',
           description: 'Some description',
           phoneNumber: '0100000000',
-          startingPrice: 10,
-          durationMinutes: 60,
+          price: 10,
           imageUrls: [R2_PATH_A, PNG_DATA_URL],
         }),
       }),

@@ -2,17 +2,18 @@ import { createClient } from '@supabase/supabase-js';
 import {
   AUCTION_DETAIL_COLUMNS,
   AUCTION_META_COLUMNS,
+  AUCTION_OWNER_COLUMNS,
+  AUCTION_STATE_COLUMNS,
   AUCTION_STATUS,
-  applyBidLock,
   bannedMessage,
-  BID_READ_COLUMNS,
-  bidLockUpdate,
   buildAuctionMetaTags,
-  buildNotifications,
   cleanupStaleImages,
+  countLiveListings,
   createAuctionReport,
   createPasswordResetRequest,
+  deriveListingStatus,
   fetchAuctionListPage,
+  fetchSellerListings,
   hashPassword,
   hideAuction,
   IMAGE_BACKFILL_UNAVAILABLE_MESSAGE,
@@ -21,34 +22,31 @@ import {
   IMAGE_STORAGE_UNAVAILABLE_MESSAGE,
   injectAuctionMeta,
   isAdminUser,
-  isAllowedImageRef,
   isAuctionVisible,
   isBannedUser,
   isBearerTokenAdmin,
   isFailure,
   isStaleImageCleanupEnabled,
   isStoredImagePath,
+  listingBaselineFromRow,
+  listingTtlMs,
   listPendingResetRequests,
   listReportsForAdmin,
-  mapAuctionSummaryRow,
+  mapListingRow,
   matchAuctionSharePath,
   matchImageServePath,
   MAX_IMAGE_BYTES,
   mergeAuctionEdit,
   migrateAuctionImages,
-  NOTIFICATION_COLUMNS,
   putImage,
-  readBidLock,
   resetPasswordWithToken,
-  selectActivity,
   setUserBan,
   setUserEmail,
-  settleEndedAuctions,
-  toNullableMoney,
   toStringArray,
   USER_ROLE,
+  validateAccountFieldLengths,
   validateImageUpload,
-  validateNewInlineImages,
+  validateListingInput,
   validateOptionalEmail,
   verifyAndUpgradePassword,
   type SharedFailure,
@@ -110,27 +108,28 @@ async function getAuthenticatedUser(supabase: any, token: string) {
   return data ?? null;
 }
 
+/**
+ * The body of every 500. The underlying error - a Postgres/PostgREST message, constraint name,
+ * column name, SQLSTATE, or a JS exception - is LOGGED here (Workers observability keeps it) and
+ * never sent to the client: those messages describe the schema and the query, which is exactly
+ * what an attacker probing for injection wants to read. The client gets the route's own generic
+ * message and a stable route-level code it can branch on.
+ */
 function getErrorMessageAndCode(fallbackMessage: string, defaultCode: string, error?: unknown): { error: string; code: string } {
-  if (typeof error === 'object' && error !== null) {
-    const errObj = error as Record<string, any>;
-    const code = String(errObj.code || defaultCode);
-    const detailMsg = errObj.message || errObj.details || errObj.error_description;
-    const baseMsg = detailMsg ? String(detailMsg) : (error instanceof Error ? error.message : fallbackMessage);
-    return {
-      error: `${baseMsg} [Code: ${code}]`,
-      code,
-    };
+  if (error !== undefined) {
+    const detail =
+      typeof error === 'object' && error !== null
+        ? {
+            message: (error as any).message,
+            code: (error as any).code,
+            details: (error as any).details,
+            hint: (error as any).hint,
+          }
+        : error;
+    console.error(`[${defaultCode}] ${fallbackMessage}`, detail);
   }
-  if (error instanceof Error) {
-    return {
-      error: `${error.message} [Code: ${defaultCode}]`,
-      code: defaultCode,
-    };
-  }
-  return {
-    error: `${fallbackMessage} [Code: ${defaultCode}]`,
-    code: defaultCode,
-  };
+
+  return makeError(fallbackMessage, defaultCode);
 }
 
 function makeError(message: string, code: string): { error: string; code: string } {
@@ -138,6 +137,18 @@ function makeError(message: string, code: string): { error: string; code: string
     error: `${message} [Code: ${code}]`,
     code,
   };
+}
+
+/**
+ * The request body as JSON, or null when it is missing or malformed. The listing validator turns
+ * null into a 400 INVALID_PAYLOAD, so a junk body is the caller's error rather than a 500.
+ */
+async function readJsonBody(request: Request): Promise<unknown> {
+  try {
+    return await request.json();
+  } catch {
+    return null;
+  }
 }
 
 /** Maps a `SharedFailure` from `workers/shared.ts` onto the wire format. */
@@ -152,93 +163,12 @@ function failureResponse(failure: SharedFailure): Response {
  * decorative - `buildAuctionMetaTags` resolves the Open Graph image from `AUCTION_META_COLUMNS`,
  * which selects `image_url` alone (no `image_urls`), so an `/images/<key>` path still needs to
  * land here for a listing's share link to preview correctly once R2 is on. A base64 `data:` URL
- * is the opposite case: every reader (`mapAuctionRow` here and `buildAuctionMetaTags`'s own
+ * is the opposite case: every reader (`mapListingRow` and `buildAuctionMetaTags`'s own
  * fallback) already falls back to `image_urls[0]`, and a `data:` URL is never usable as an
  * `og:image` regardless, so writing the full image a second time bought nothing but egress.
  */
 function imageUrlMirror(firstImage: string | undefined): string | null {
   return typeof firstImage === 'string' && isStoredImagePath(firstImage) ? firstImage : null;
-}
-
-/** The single snake_case row -> camelCase Auction mapper used by every route. */
-function mapAuctionRow(row: any) {
-  return {
-    id: row.id,
-    title: row.title,
-    description: row.description,
-    phoneNumber: row.phone_number ?? row.phoneNumber,
-    startingPrice: Number(row.starting_price ?? row.startingPrice),
-    currentPrice: Number(row.current_price ?? row.currentPrice),
-    sellerId: row.seller_id ?? row.sellerId,
-    sellerName: row.seller_name ?? row.sellerName,
-    highestBidderId: row.highest_bidder_id ?? row.highestBidderId ?? null,
-    highestBidderName: row.highest_bidder_name ?? row.highestBidderName ?? null,
-    durationMinutes: Number(row.duration_minutes ?? row.durationMinutes),
-    startTime: Number(row.start_time ?? row.startTime),
-    endTime: Number(row.end_time ?? row.endTime),
-    status: row.status,
-    category: row.category ?? 'General',
-    imageUrl: row.image_url || row.imageUrl || (Array.isArray(row.image_urls) ? row.image_urls[0] : undefined),
-    imageUrls: Array.isArray(row.image_urls) ? row.image_urls : [],
-    bids: Array.isArray(row.bids) ? row.bids : [],
-    winnerId: row.winner_id ?? row.winnerId ?? null,
-    winnerName: row.winner_name ?? row.winnerName ?? null,
-    winningBid: toNullableMoney(row.winning_bid ?? row.winningBid),
-    createdAt: Number(row.created_at ?? row.createdAt),
-  };
-}
-
-/**
- * Row -> Auction shape returned by `GET /api/auctions/:id`.
- *
- * No `imageUrl`/`imageUrls` - the row was fetched with `AUCTION_DETAIL_COLUMNS`,
- * which does not select them, so this endpoint carries `imageCount` instead
- * (mirroring the list endpoint) and the client fetches real image data at most
- * once, from `GET /api/auctions/:id/images`, rather than on every 3s poll.
- *
- * `phoneNumber` is included only when `includePhone` is true - the caller
- * resolves that from the request's `Authorization` header before calling this,
- * so an anonymous visitor viewing a listing cannot harvest a seller's number.
- */
-function mapAuctionDetailRow(row: any, includePhone: boolean) {
-  const rawCount = row.image_count ?? row.imageCount;
-  const imageCount = Number.isFinite(Number(rawCount)) ? Number(rawCount) : 0;
-
-  return {
-    id: row.id,
-    title: row.title,
-    description: row.description,
-    ...(includePhone ? { phoneNumber: row.phone_number ?? row.phoneNumber } : {}),
-    startingPrice: Number(row.starting_price ?? row.startingPrice),
-    currentPrice: Number(row.current_price ?? row.currentPrice),
-    sellerId: row.seller_id ?? row.sellerId,
-    sellerName: row.seller_name ?? row.sellerName,
-    highestBidderId: row.highest_bidder_id ?? row.highestBidderId ?? null,
-    highestBidderName: row.highest_bidder_name ?? row.highestBidderName ?? null,
-    durationMinutes: Number(row.duration_minutes ?? row.durationMinutes),
-    startTime: Number(row.start_time ?? row.startTime),
-    endTime: Number(row.end_time ?? row.endTime),
-    status: row.status,
-    category: row.category ?? 'General',
-    imageCount,
-    bids: Array.isArray(row.bids) ? row.bids : [],
-    winnerId: row.winner_id ?? row.winnerId ?? null,
-    winnerName: row.winner_name ?? row.winnerName ?? null,
-    winningBid: toNullableMoney(row.winning_bid ?? row.winningBid),
-    createdAt: Number(row.created_at ?? row.createdAt),
-  };
-}
-
-/**
- * Lazy settle backstop: a missed cron tick must not strand an ended auction
- * with no winner. A settle failure here must never fail the read.
- */
-async function settleBeforeRead(supabase: any, auctionId?: string) {
-  try {
-    await settleEndedAuctions(supabase, auctionId ? { auctionId } : {});
-  } catch (error) {
-    console.error('Lazy settle failed:', error);
-  }
 }
 
 /**
@@ -308,96 +238,84 @@ async function requireAdmin(supabase: any, request: Request): Promise<AuthResult
   return auth;
 }
 
-/** Optimistic-lock retries before a concurrent bid is reported as a conflict. */
-const MAX_BID_ATTEMPTS = 3;
-
-/** The second `[triggers]` cron in wrangler.toml - see `scheduled()` below. */
+/** The `[triggers]` cron in wrangler.toml - see `scheduled()` below. */
 const STALE_IMAGE_CLEANUP_CRON = '0 3 * * *';
 
+/** Why a listing that is not live can no longer be changed by its seller, per derived status. */
+const NOT_LIVE_MESSAGES: Record<string, string> = {
+  sold: 'This listing has already been marked as sold.',
+  expired: 'This listing has expired and is no longer on the site.',
+  cancelled: 'This listing has already been withdrawn.',
+  hidden: 'This listing has been taken down by the committee.',
+};
+
+function notLiveResponse(status: string): Response {
+  return jsonResponse(
+    makeError(NOT_LIVE_MESSAGES[status] ?? 'This listing is no longer active.', 'LISTING_NOT_EDITABLE'),
+    { status: 409 },
+  );
+}
+
+interface OwnedLiveListing {
+  /** The row, when the caller owns it and it is live. */
+  row: any;
+  /** The 404 / 403 / 409 to send instead, or null. */
+  response: Response | null;
+}
+
 /**
- * `existingImageUrls` are the images already stored on the listing being edited (empty on
- * create), passed straight through to `validateNewInlineImages` in `workers/shared.ts` - see
- * there for the shape/size rules applied to a genuinely NEW image. An entry byte-identical to one
- * already on the row is exempt, so an existing photo already sitting in the database never blocks
- * an otherwise-unrelated edit to the title or price.
+ * The shared precondition of every seller write (edit, mark sold, cancel): the listing exists,
+ * the CALLER (from their token, never the body) is its seller, and it is live - stored active
+ * and not expired. Each route's UPDATE re-asserts `status = 'active' AND expires_at > now` in
+ * SQL anyway, so this read only exists to answer with the right status code; the guarded write
+ * is what actually closes the race.
  */
-function validateAuctionInput(raw: any, existingImageUrls: string[] = []) {
-  if (!raw || typeof raw !== 'object') {
-    return makeError('Invalid auction payload.', 'INVALID_PAYLOAD');
+async function loadOwnedLiveListing(
+  supabase: any,
+  auctionId: string,
+  userId: string,
+  columns: string,
+  verb: string,
+  now: number,
+): Promise<OwnedLiveListing> {
+  const { data: row, error } = await supabase.from('auctions').select(columns).eq('id', auctionId).maybeSingle();
+
+  if (error) throw error;
+  if (!row) {
+    return { row: null, response: jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 }) };
   }
 
-  const title = typeof raw.title === 'string' ? raw.title.trim() : '';
-  const description = typeof raw.description === 'string' ? raw.description.trim() : '';
-  const phoneNumber = typeof raw.phoneNumber === 'string' ? raw.phoneNumber.trim() : '';
-
-  if (!title || !description || !phoneNumber) {
-    return makeError('Title, description, and phone number are required.', 'MISSING_FIELDS');
+  if ((row.seller_id ?? row.sellerId) !== userId) {
+    return {
+      row: null,
+      response: jsonResponse(makeError(`Only the seller can ${verb} this listing.`, 'NOT_LISTING_OWNER'), { status: 403 }),
+    };
   }
 
-  const parsedPrice = Number(raw.startingPrice);
-  if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
-    return makeError('Starting price must be greater than £0.', 'INVALID_PRICE');
+  const status = deriveListingStatus(row, now);
+  if (status !== AUCTION_STATUS.active) {
+    return { row: null, response: notLiveResponse(status) };
   }
 
-  const parsedDuration = Number(raw.durationMinutes);
-  if (!Number.isInteger(parsedDuration) || parsedDuration <= 0) {
-    return makeError('Auction duration must be at least 1 minute.', 'INVALID_DURATION');
-  }
+  return { row, response: null };
+}
 
-  const normalizedImageUrls = Array.isArray(raw.imageUrls)
-    ? raw.imageUrls
-        .filter((value: unknown): value is string => typeof value === 'string')
-        .map((value: string) => value.trim())
-        .filter((value: string) => value.length > 0)
-    : [];
+/**
+ * Applies the "still live" guard to a seller's UPDATE: `status = 'active' AND expires_at > now`.
+ * A listing that sold, was cancelled or hidden, or expired between the read and the write makes
+ * the UPDATE match zero rows, which each route turns into a 409 rather than a silent overwrite.
+ */
+function guardLive(query: any, now: number): any {
+  return query.eq('status', AUCTION_STATUS.active).gt('expires_at', now);
+}
 
-  const fallbackImage = typeof raw.imageUrl === 'string' ? raw.imageUrl.trim() : '';
-  if (fallbackImage && normalizedImageUrls.length === 0) {
-    normalizedImageUrls.push(fallbackImage);
-  }
-
-  if (normalizedImageUrls.length === 0) {
-    return makeError('Please upload at least one image for the listing.', 'MISSING_IMAGES');
-  }
-
-  if (normalizedImageUrls.length > 3) {
-    return makeError('You can upload up to 3 images per listing.', 'TOO_MANY_IMAGES');
-  }
-
-  // Each entry must be an image this site itself holds: an inline `data:` URL,
-  // or an `/images/<key>` path from `POST /api/images`. An arbitrary external
-  // URL is refused - accepting one would let a listing point the site's own
-  // pages at any third-party host.
-  //
-  // BOTH FORMS ARE ACCEPTED UNCONDITIONALLY, and must stay that way. R2 is off
-  // today, so every new listing arrives as `data:` URLs; if it is switched on,
-  // new listings arrive as paths while old rows keep their `data:` URLs, and a
-  // single listing can hold a mixture of the two. Narrowing this to whichever
-  // form happens to be current would make the other kind of listing
-  // uneditable - `mergeAuctionEdit` feeds the stored array back through here on
-  // every PATCH.
-  if (!normalizedImageUrls.every((value: string) => isAllowedImageRef(value))) {
-    return makeError('Listing images must be uploaded through this site.', 'INVALID_IMAGE_URL');
-  }
-
-  // Server-side guard on a NEW inline image's shape and size (Fix 1b/1c, hardened in a later
-  // revision - see `validateNewInlineImages` in `workers/shared.ts` for what this actually
-  // checks and why). An entry byte-identical to one already stored on this listing is exempt, so
-  // editing an old listing never gets blocked by its own existing photos.
-  const newImageFailure = validateNewInlineImages(normalizedImageUrls, existingImageUrls);
-  if (newImageFailure) {
-    return makeError(newImageFailure.message, newImageFailure.code);
-  }
-
-  return {
-    title,
-    description,
-    phoneNumber,
-    parsedPrice,
-    parsedDuration,
-    imageUrls: normalizedImageUrls,
-    category: typeof raw.category === 'string' && raw.category.trim() ? raw.category.trim() : 'General',
-  };
+/**
+ * The status a zero-row guarded UPDATE is reported with: re-read the row's state so the 409
+ * names what actually happened (sold / withdrawn / expired / taken down).
+ */
+async function zeroRowResponse(supabase: any, auctionId: string, now: number): Promise<Response> {
+  const { data } = await supabase.from('auctions').select(AUCTION_STATE_COLUMNS).eq('id', auctionId).maybeSingle();
+  return notLiveResponse(data ? deriveListingStatus(data, now) : 'expired');
 }
 
 /**
@@ -441,6 +359,7 @@ async function renderAuctionShare(
     }
 
     const html = await assetResponse.clone().text();
+    // The fixed asking price and the derived status (For sale / Sold / No longer listed / ...).
     const meta = buildAuctionMetaTags(row, `${url.origin}/auction/${encodeURIComponent(auctionId)}`);
     const injected = injectAuctionMeta(html, meta);
 
@@ -605,6 +524,11 @@ export default {
 
         if (!username || !name || !password) {
           return jsonResponse(makeError('Username, name, and password are required.', 'MISSING_FIELDS'), { status: 400 });
+        }
+
+        const lengthFailure = validateAccountFieldLengths({ username, name, password });
+        if (lengthFailure) {
+          return failureResponse(lengthFailure);
         }
 
         // Optional: an account with no email simply has no way to self-recover.
@@ -845,13 +769,8 @@ export default {
       }
 
       try {
-        // No lazy settle here any more: it rode along on every page of every
-        // poll of the list, which is by far this API's hottest read. Settling
-        // still happens on the single-auction detail route, the bid route, and
-        // the cron trigger (see scheduled() below), so an ended auction still
-        // gets its winner promptly - just not on the list's account any more.
-
-        // Slim rows (no image payload) + keyset page. See fetchAuctionListPage.
+        // Live listings only (active AND not expired, filtered in SQL), slim
+        // rows (no image payload, no phone), keyset page. See fetchAuctionListPage.
         const page = await fetchAuctionListPage(supabase, {
           limit: url.searchParams.get('limit') ?? undefined,
           cursor: url.searchParams.get('cursor') ?? undefined,
@@ -887,8 +806,8 @@ export default {
           return jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 });
         }
 
-        // A listing's images are immutable once it has bids, and this is the
-        // heaviest response the API serves - let clients and the edge keep it.
+        // This is the heaviest response the API serves - let clients and the
+        // edge keep it briefly. A seller's image edit shows up within 5 minutes.
         return jsonResponse(
           { imageUrls: toStringArray(row.image_urls) },
           { headers: { 'Cache-Control': 'public, max-age=300' } },
@@ -909,12 +828,10 @@ export default {
       try {
         const auctionId = singleAuctionMatch[1];
 
-        await settleBeforeRead(supabase, auctionId);
-
-        // Slim row (no image payload) - see mapAuctionDetailRow and
-        // AUCTION_DETAIL_COLUMNS. This route is polled every 3s by an open
-        // detail modal, so it was the single largest source of egress before
-        // images were split out to GET /api/auctions/:id/images.
+        // Slim row (no image payload) - see AUCTION_DETAIL_COLUMNS. Any
+        // non-hidden listing is returned whatever its status; `status` (with
+        // `expired` derived in mapListingRow) tells the UI Sold / Expired.
+        // There is no settlement any more, so this read writes nothing.
         const { data: row, error } = await supabase
           .from('auctions')
           .select(AUCTION_DETAIL_COLUMNS)
@@ -926,8 +843,8 @@ export default {
 
         // Resolved once, from the same lookup: whether the caller is an admin
         // (for the hidden-listing check below) and whether they are signed in
-        // at all (for whether phoneNumber goes on the wire - see
-        // mapAuctionDetailRow). A missing or dead token resolves both to false
+        // at all (for whether phoneNumber goes on the wire). A missing or dead
+        // token resolves both to false
         // rather than an error, exactly like isBearerTokenAdmin, since this
         // route is intentionally reachable by an anonymous visitor.
         const authHeader = request.headers.get('authorization') ?? '';
@@ -947,11 +864,23 @@ export default {
           return jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 });
         }
 
-        return jsonResponse({ auction: mapAuctionDetailRow(row, Boolean(requester)) });
+        // The seller's WhatsApp number goes on the wire only for a signed-in
+        // caller - an anonymous visitor viewing a listing cannot harvest it.
+        return jsonResponse({ auction: mapListingRow(row, { includePhone: Boolean(requester) }) });
       } catch (error) {
         return jsonResponse(getErrorMessageAndCode('Failed to load auction.', 'FETCH_AUCTION_FAILED', error), { status: 500 });
       }
     }
+
+    /* ---------------------------------------------------------------------- */
+    /* Seller writes: edit, mark sold, cancel.                                 */
+    /*                                                                        */
+    /* All three share one precondition (loadOwnedLiveListing: exists, caller  */
+    /* is the seller, listing is live) and one write guard (guardLive: the     */
+    /* UPDATE re-asserts status = 'active' AND expires_at > now, plus the      */
+    /* seller id). A guarded UPDATE that matches zero rows is a 409, never a   */
+    /* silent success.                                                        */
+    /* ---------------------------------------------------------------------- */
 
     if (request.method === 'PATCH' && singleAuctionMatch) {
       if (!supabase) {
@@ -960,103 +889,106 @@ export default {
 
       try {
         const auctionId = singleAuctionMatch[1];
+        const now = Date.now();
 
         const auth = await requireUser(supabase, request, 'Authentication required to edit a listing.');
         if (auth.response) {
           return auth.response;
         }
 
-        const { data: row, error: fetchError } = await supabase
-          .from('auctions')
-          .select('*')
-          .eq('id', auctionId)
-          .maybeSingle();
+        const owned = await loadOwnedLiveListing(supabase, auctionId, auth.user.id, AUCTION_OWNER_COLUMNS, 'edit', now);
+        if (owned.response) {
+          return owned.response;
+        }
+        const row = owned.row;
 
-        if (fetchError) throw fetchError;
-        if (!row) return jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 });
-
-        if ((row.seller_id ?? row.sellerId) !== auth.user.id) {
-          return jsonResponse(makeError('Only the seller can edit this listing.', 'NOT_LISTING_OWNER'), { status: 403 });
+        const rawBody = await readJsonBody(request);
+        // Same validator as listing creation, run over row + patch merged. The stored values are
+        // passed as the baseline, so an unchanged field that predates today's rules (an old,
+        // larger photo; a legacy category) never blocks an unrelated edit.
+        const validated = validateListingInput(mergeAuctionEdit(row, rawBody), listingBaselineFromRow(row));
+        if (isFailure(validated)) {
+          return failureResponse(validated);
         }
 
-        if (row.status !== AUCTION_STATUS.active) {
-          return jsonResponse(
-            makeError('This listing is no longer active and can no longer be edited.', 'LISTING_NOT_EDITABLE'),
-            { status: 409 },
-          );
-        }
-
-        // A row can still read `status = 'active'` after its end_time if the
-        // cron tick that would settle it hasn't run yet - the same gap PATCH's
-        // sibling DELETE guards against below. Editing that window away would
-        // let a seller change the price on a listing that has already, in
-        // effect, ended.
-        if (Date.now() >= Number(row.end_time ?? row.endTime)) {
-          return jsonResponse(
-            makeError('This listing has already ended and can no longer be edited.', 'LISTING_NOT_EDITABLE'),
-            { status: 409 },
-          );
-        }
-
-        // Once money is on the table the terms are frozen - a seller must not be
-        // able to move the price out from under a standing bid.
-        if ((Array.isArray(row.bids) ? row.bids : []).length > 0) {
-          return jsonResponse(
-            makeError(
-              'This listing already has bids and can no longer be edited. You can cancel it instead.',
-              'LISTING_HAS_BIDS',
-            ),
-            { status: 409 },
-          );
-        }
-
-        const rawBody = await request.json();
-        // Same validator as listing creation, run over row + patch merged. The stored images are
-        // passed through too, so an existing (possibly larger, pre-compression) photo that is
-        // carried over unchanged is exempt from the new-upload shape/size checks - see `validateNewInlineImages`.
-        const validated = validateAuctionInput(mergeAuctionEdit(row, rawBody), toStringArray(row.image_urls ?? row.imageUrls));
-        if ('error' in validated) {
-          return jsonResponse(validated, { status: 400 });
-        }
-
+        // `expires_at` is deliberately absent: editing a listing never extends its life.
         const patch = {
-          title: validated.title,
-          description: validated.description,
-          phone_number: validated.phoneNumber,
-          category: validated.category,
-          image_url: imageUrlMirror(validated.imageUrls[0]),
-          image_urls: validated.imageUrls,
-          starting_price: validated.parsedPrice,
-          // No bids exist, so current_price tracks starting_price exactly.
-          current_price: validated.parsedPrice,
+          title: validated.data.title,
+          description: validated.data.description,
+          phone_number: validated.data.phoneNumber,
+          category: validated.data.category,
+          image_url: imageUrlMirror(validated.data.imageUrls[0]),
+          image_urls: validated.data.imageUrls,
+          price: validated.data.price,
         };
 
-        // Optimistic lock: a bid landing between the read above and this write
-        // sets highest_bidder_id, so guarding on it still being NULL means the
-        // edit matches zero rows rather than overwriting a live auction.
-        const { data: updated, error: updateError } = await supabase
-          .from('auctions')
-          .update(patch)
-          .eq('id', auctionId)
-          .eq('status', AUCTION_STATUS.active)
-          .is('highest_bidder_id', null)
-          .select();
+        const { data: updated, error: updateError } = await guardLive(
+          supabase.from('auctions').update(patch).eq('id', auctionId).eq('seller_id', auth.user.id),
+          now,
+        ).select(AUCTION_OWNER_COLUMNS);
 
         if (updateError) throw updateError;
 
         if (!Array.isArray(updated) || updated.length === 0) {
-          return jsonResponse(
-            makeError(
-              'This listing already has bids and can no longer be edited. You can cancel it instead.',
-              'LISTING_HAS_BIDS',
-            ),
-            { status: 409 },
-          );
+          return zeroRowResponse(supabase, auctionId, now);
         }
 
-        return jsonResponse({ auction: mapAuctionRow(updated[0]) });
+        return jsonResponse({ auction: mapListingRow(updated[0], { now, includePhone: true, includeImages: true }) });
       } catch (error) {
         return jsonResponse(getErrorMessageAndCode('Failed to update the listing.', 'UPDATE_LISTING_FAILED', error), {
+          status: 500,
+        });
+      }
+    }
+
+    const soldMatch = url.pathname.match(/^\/api\/auctions\/([^/]+)\/sold$/);
+    if (request.method === 'POST' && soldMatch) {
+      if (!supabase) {
+        return jsonResponse(makeError('Supabase env vars are not configured.', 'CONFIG_ERROR'), { status: 500 });
+      }
+
+      try {
+        const auctionId = soldMatch[1];
+        const now = Date.now();
+
+        const auth = await requireUser(supabase, request, 'Authentication required to mark a listing as sold.');
+        if (auth.response) {
+          return auth.response;
+        }
+
+        const owned = await loadOwnedLiveListing(
+          supabase,
+          auctionId,
+          auth.user.id,
+          AUCTION_STATE_COLUMNS,
+          'mark as sold',
+          now,
+        );
+        if (owned.response) {
+          return owned.response;
+        }
+
+        const { data: updated, error: updateError } = await guardLive(
+          supabase
+            .from('auctions')
+            .update({ status: AUCTION_STATUS.sold, sold_at: now })
+            .eq('id', auctionId)
+            .eq('seller_id', auth.user.id),
+          now,
+        ).select(AUCTION_DETAIL_COLUMNS);
+
+        if (updateError) throw updateError;
+
+        if (!Array.isArray(updated) || updated.length === 0) {
+          return zeroRowResponse(supabase, auctionId, now);
+        }
+
+        return jsonResponse({
+          success: true,
+          auction: mapListingRow(updated[0], { now, includePhone: true }),
+        });
+      } catch (error) {
+        return jsonResponse(getErrorMessageAndCode('Failed to mark the listing as sold.', 'MARK_SOLD_FAILED', error), {
           status: 500,
         });
       }
@@ -1069,65 +1001,40 @@ export default {
 
       try {
         const auctionId = singleAuctionMatch[1];
+        const now = Date.now();
 
         const auth = await requireUser(supabase, request, 'Authentication required to cancel a listing.');
         if (auth.response) {
           return auth.response;
         }
 
-        const { data: row, error: fetchError } = await supabase
-          .from('auctions')
-          .select('*')
-          .eq('id', auctionId)
-          .maybeSingle();
-
-        if (fetchError) throw fetchError;
-        if (!row) return jsonResponse(makeError('Auction not found', 'AUCTION_NOT_FOUND'), { status: 404 });
-
-        if ((row.seller_id ?? row.sellerId) !== auth.user.id) {
-          return jsonResponse(makeError('Only the seller can cancel this listing.', 'NOT_LISTING_OWNER'), { status: 403 });
+        const owned = await loadOwnedLiveListing(supabase, auctionId, auth.user.id, AUCTION_STATE_COLUMNS, 'cancel', now);
+        if (owned.response) {
+          return owned.response;
         }
 
-        // The end_time check catches the same window PATCH now guards: a row
-        // can still read `status = 'active'` after its end_time if the cron
-        // tick that would settle it hasn't run yet, and a seller must not be
-        // able to withdraw a listing out from under a bidder in that window.
-        if (row.status === AUCTION_STATUS.ended || Date.now() >= Number(row.end_time ?? row.endTime)) {
-          return jsonResponse(
-            makeError('This listing has already ended and can no longer be cancelled.', 'LISTING_NOT_EDITABLE'),
-            { status: 409 },
-          );
-        }
-
-        const hadBids = (Array.isArray(row.bids) ? row.bids : []).length > 0;
-
-        // SOFT delete, always. The bids array is the only record a bidder has of
-        // what they offered and when - hard-deleting the row destroys their
-        // history along with the seller's listing.
-        if (row.status === AUCTION_STATUS.active) {
-          const { error: updateError } = await supabase
+        // SOFT delete, always: the row stays readable by id (a buyer holding the link sees
+        // "withdrawn" rather than a dead page), it just leaves the browse list.
+        const { data: updated, error: updateError } = await guardLive(
+          supabase
             .from('auctions')
-            .update({
-              status: AUCTION_STATUS.cancelled,
-              // Bumped so a bid read before this cancel lands loses its
-              // optimistic lock (see readBidLock/applyBidLock) instead of
-              // writing a bid onto a listing the seller just withdrew.
-              ...bidLockUpdate(readBidLock(row, 0)),
-            })
+            .update({ status: AUCTION_STATUS.cancelled })
             .eq('id', auctionId)
-            .eq('status', AUCTION_STATUS.active);
+            .eq('seller_id', auth.user.id),
+          now,
+        ).select(AUCTION_DETAIL_COLUMNS);
 
-          if (updateError) throw updateError;
+        if (updateError) throw updateError;
+
+        // Zero rows: it sold, expired, or was hidden between the read and the write.
+        if (!Array.isArray(updated) || updated.length === 0) {
+          return zeroRowResponse(supabase, auctionId, now);
         }
 
         return jsonResponse({
           success: true,
-          auction: mapAuctionRow({ ...row, status: AUCTION_STATUS.cancelled }),
-          hadBids,
-          bidsPreserved: true,
-          message: hadBids
-            ? 'Listing withdrawn. It no longer appears in the auction list, but everyone who bid can still open it and see their bid history.'
-            : 'Listing withdrawn. It no longer appears in the auction list, but anyone holding a direct link can still open it.',
+          auction: mapListingRow(updated[0], { now, includePhone: true }),
+          message: 'Listing withdrawn. It no longer appears on the site, but anyone holding a direct link can still open it.',
         });
       } catch (error) {
         return jsonResponse(getErrorMessageAndCode('Failed to cancel the listing.', 'CANCEL_LISTING_FAILED', error), {
@@ -1150,93 +1057,57 @@ export default {
         }
 
         const user = auth.user;
+        const now = Date.now();
 
-        const rawBody = await request.json();
-        const validated = validateAuctionInput(rawBody);
-        if ('error' in validated) {
-          return jsonResponse(validated, { status: 400 });
+        const validated = validateListingInput(await readJsonBody(request));
+        if (isFailure(validated)) {
+          return failureResponse(validated);
         }
 
         const maxListingsPerUser = Number(env.MAX_LISTINGS_PER_USER ?? '20');
-        // Counts ACTIVE listings only. Counting every row the user had ever
-        // created meant 20 successful sales locked the account out of the site
-        // permanently. `head: true` also stops this pulling every base64 image
-        // the seller owns just to produce a number.
-        const { count, error: countError } = await supabase
-          .from('auctions')
-          .select('id', { count: 'exact', head: true })
-          .eq('seller_id', user.id)
-          .eq('status', AUCTION_STATUS.active);
-
-        if (countError) throw countError;
-        if ((count ?? 0) >= maxListingsPerUser) {
-          return jsonResponse(makeError(`You have reached the limit of ${maxListingsPerUser} active listings. End or cancel a listing before creating another.`, 'LISTING_LIMIT_REACHED'), { status: 429 });
+        // Counts LIVE listings only (active AND not expired). Sold, withdrawn and expired
+        // listings do not count, so a seller is never locked out by their own history.
+        const liveCount = await countLiveListings(supabase, user.id, now);
+        if (liveCount >= maxListingsPerUser) {
+          return jsonResponse(
+            makeError(
+              `You have reached the limit of ${maxListingsPerUser} active listings. Mark one as sold or withdraw it before creating another.`,
+              'LISTING_LIMIT_REACHED',
+            ),
+            { status: 429 },
+          );
         }
 
-        const now = Date.now();
-        const id = `auc_${now}_${Math.random().toString(36).slice(2, 6)}`;
-        const imageUrls = validated.imageUrls;
-
-        const auction = {
-          id,
-          title: validated.title,
-          description: validated.description,
-          phoneNumber: validated.phoneNumber,
-          startingPrice: validated.parsedPrice,
-          currentPrice: validated.parsedPrice,
-          sellerId: user.id,
-          sellerName: user.name,
-          highestBidderId: null,
-          highestBidderName: null,
-          durationMinutes: validated.parsedDuration,
-          startTime: now,
-          endTime: now + validated.parsedDuration * 60 * 1000,
-          status: 'active',
-          category: validated.category,
-          imageUrl: imageUrls[0],
-          imageUrls,
-          bids: [],
-          winnerId: null,
-          winnerName: null,
-          winningBid: null,
-          createdAt: now,
+        const row = {
+          id: `auc_${now}_${Math.random().toString(36).slice(2, 6)}`,
+          title: validated.data.title,
+          description: validated.data.description,
+          phone_number: validated.data.phoneNumber,
+          price: validated.data.price,
+          seller_id: user.id,
+          seller_name: user.name,
+          status: AUCTION_STATUS.active,
+          category: validated.data.category,
+          // See `imageUrlMirror`: only an `/images/<key>` path is mirrored; the response below
+          // still carries the full first image via `image_urls`.
+          image_url: imageUrlMirror(validated.data.imageUrls[0]),
+          image_urls: validated.data.imageUrls,
+          created_at: now,
+          expires_at: now + listingTtlMs(env),
+          sold_at: null,
         };
 
-        const { error: insertError } = await supabase.from('auctions').insert([
-          {
-            id: auction.id,
-            title: auction.title,
-            description: auction.description,
-            phone_number: auction.phoneNumber,
-            starting_price: auction.startingPrice,
-            current_price: auction.currentPrice,
-            seller_id: auction.sellerId,
-            seller_name: auction.sellerName,
-            highest_bidder_id: auction.highestBidderId,
-            highest_bidder_name: auction.highestBidderName,
-            duration_minutes: auction.durationMinutes,
-            start_time: auction.startTime,
-            end_time: auction.endTime,
-            status: auction.status,
-            category: auction.category,
-            // The client's own copy of the just-created auction (returned below) keeps the full
-            // `imageUrl` it was given; only the persisted row's mirror column is pared down. See
-            // `imageUrlMirror`.
-            image_url: imageUrlMirror(auction.imageUrl),
-            image_urls: auction.imageUrls,
-            bids: auction.bids,
-            winner_id: auction.winnerId,
-            winner_name: auction.winnerName,
-            winning_bid: auction.winningBid,
-            created_at: auction.createdAt,
-          },
-        ]);
-
+        const { error: insertError } = await supabase.from('auctions').insert([row]);
         if (insertError) throw insertError;
 
-        return jsonResponse({ auction }, { status: 201 });
+        return jsonResponse(
+          { auction: mapListingRow(row, { now, includePhone: true, includeImages: true }) },
+          { status: 201 },
+        );
       } catch (error) {
-        return jsonResponse(getErrorMessageAndCode('Failed to create auction.', 'CREATE_AUCTION_FAILED', error), { status: 500 });
+        return jsonResponse(getErrorMessageAndCode('Failed to create the listing.', 'CREATE_AUCTION_FAILED', error), {
+          status: 500,
+        });
       }
     }
 
@@ -1387,146 +1258,6 @@ export default {
       }
     }
 
-    const bidMatch = url.pathname.match(/^\/api\/auctions\/([^/]+)\/bids$/);
-    if (request.method === 'POST' && bidMatch) {
-      if (!supabase) {
-        return jsonResponse(makeError('Supabase env vars are not configured.', 'CONFIG_ERROR'), { status: 500 });
-      }
-
-      try {
-        const auctionId = bidMatch[1];
-
-        // The bidder is whoever holds the token. Any userId/userName in the
-        // request body is ignored outright - trusting it let anyone bid as
-        // anyone and spoof past the own-listing check below.
-        const auth = await requireUser(supabase, request, 'Authentication required to place a bid.');
-        if (auth.response) {
-          return auth.response;
-        }
-
-        const userId = auth.user.id;
-        const userName = auth.user.name;
-
-        const body = await request.json();
-        const { amount } = body as { amount?: unknown };
-
-        // A missed cron tick must not let a bid land on an auction that has
-        // already reached end_time but hasn't been marked 'ended' yet.
-        await settleBeforeRead(supabase, auctionId);
-
-        // Optimistic lock: the UPDATE is guarded on the bid_version we read, so
-        // a bid that lands between our read and our write makes the write match
-        // zero rows instead of silently clobbering its bids array. See
-        // readBidLock/applyBidLock in workers/shared.ts for why the guard is an
-        // integer version rather than the price it used to be.
-        for (let attempt = 0; attempt < MAX_BID_ATTEMPTS; attempt += 1) {
-          // Typed `any`: `.select(BID_READ_COLUMNS)` passes a runtime `string`, not a literal, so
-          // postgrest-js's compile-time column parser (which only understands a literal) falls
-          // back to a `GenericStringError` type it cannot resolve. The rest of this file works
-          // around the same thing by typing a mapper's row parameter `any` (see mapAuctionRow);
-          // there is no such mapper here, so it is annotated directly instead.
-          const { data: rawAuction, error: fetchErr }: { data: any; error: any } = await supabase
-            .from('auctions')
-            .select(BID_READ_COLUMNS)
-            .eq('id', auctionId)
-            .maybeSingle();
-
-          if (fetchErr || !rawAuction) {
-            return jsonResponse(makeError('Auction listing was not found.', 'AUCTION_NOT_FOUND'), { status: 404 });
-          }
-
-          const bids = Array.isArray(rawAuction.bids) ? rawAuction.bids : [];
-          const startingPrice = Number(rawAuction.starting_price ?? rawAuction.startingPrice);
-          const sellerId = rawAuction.seller_id ?? rawAuction.sellerId;
-          const endTime = Number(rawAuction.end_time ?? rawAuction.endTime);
-
-          const lock = readBidLock(rawAuction, startingPrice);
-          const currentPrice = lock.currentPrice;
-
-          // Bids are only accepted on a LIVE listing: 'ended' is covered by the
-          // end_time check below, and this additionally refuses a 'cancelled' or
-          // admin-'hidden' listing, neither of which is ever allowed to take a
-          // new bid regardless of end_time.
-          if (rawAuction.status !== AUCTION_STATUS.active) {
-            return jsonResponse(makeError('This listing is no longer accepting bids.', 'AUCTION_ENDED'), { status: 400 });
-          }
-
-          if (Date.now() >= endTime) {
-            return jsonResponse(makeError('This auction has already ended.', 'AUCTION_ENDED'), { status: 400 });
-          }
-
-          if (sellerId === userId) {
-            return jsonResponse(makeError('You cannot place a bid on your own listing.', 'CANNOT_BID_OWN_LISTING'), { status: 400 });
-          }
-
-          const numericAmount = Number(amount);
-          if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
-            return jsonResponse(makeError('Please enter a valid bid amount.', 'INVALID_BID_AMOUNT'), { status: 400 });
-          }
-
-          if (bids.length === 0) {
-            if (numericAmount < startingPrice) {
-              return jsonResponse(makeError(`Starting bid must be at least £${startingPrice.toLocaleString()}.`, 'BID_TOO_LOW'), { status: 400 });
-            }
-          } else if (numericAmount <= currentPrice) {
-            return jsonResponse(makeError(`Bid must be strictly higher than current bid of £${currentPrice.toLocaleString()}.`, 'BID_TOO_LOW'), { status: 400 });
-          }
-
-          const newBid = {
-            id: `bid_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-            auctionId,
-            userId,
-            userName,
-            amount: numericAmount,
-            timestamp: Date.now(),
-          };
-
-          const updatedBids = [newBid, ...bids];
-
-          // Guarded on status + end_time IN ADDITION to the bid_version/price lock:
-          // a settle or a cancel/hide landing between our read and this write must
-          // also make the UPDATE match zero rows, not just a concurrent bid. Both
-          // settle and hideAuction bump bid_version for exactly this reason, so
-          // the applyBidLock guard alone would already catch a settle - these two
-          // are a second, independent guard against the same race.
-          let updateQuery = supabase
-            .from('auctions')
-            .update({
-              bids: updatedBids,
-              current_price: numericAmount,
-              highest_bidder_id: userId,
-              highest_bidder_name: userName,
-              ...bidLockUpdate(lock),
-            })
-            .eq('id', auctionId)
-            .eq('status', AUCTION_STATUS.active)
-            .gt('end_time', Date.now());
-
-          updateQuery = applyBidLock(updateQuery, lock);
-
-          const { data: updatedRows, error: updateErr } = await updateQuery.select('id');
-
-          if (updateErr) {
-            return jsonResponse(getErrorMessageAndCode('Unable to place the bid right now.', 'BID_UPDATE_FAILED', updateErr), { status: 500 });
-          }
-
-          if (Array.isArray(updatedRows) && updatedRows.length > 0) {
-            return jsonResponse({ success: true, bid: newBid });
-          }
-
-          // Zero rows affected: someone else bid first, or the listing ended/was
-          // cancelled/hidden between the read above and this write. Re-read and
-          // revalidate - the top-of-loop checks above will produce the right
-          // error (AUCTION_ENDED etc.) the next time round for anything other
-          // than a genuine bid race.
-        }
-
-        return jsonResponse(makeError('Another bid landed at the same moment. Please try again.', 'BID_CONFLICT'), { status: 409 });
-      } catch (error) {
-        return jsonResponse(getErrorMessageAndCode('Failed to place bid.', 'PLACE_BID_FAILED', error), { status: 500 });
-      }
-    }
-
     if (request.method === 'GET' && url.pathname === '/api/users/me/activity') {
       if (!supabase) {
         return jsonResponse(makeError('Supabase env vars are not configured.', 'CONFIG_ERROR'), { status: 500 });
@@ -1538,40 +1269,13 @@ export default {
           return auth.response;
         }
 
-        // No lazy settle here - see the comment on GET /api/auctions. This route
-        // is authenticated, own-data-only, so AUCTION_DETAIL_COLUMNS (which
-        // carries phone_number, unlike the public list) is used instead of
-        // AUCTION_LIST_COLUMNS: WinnerContactPanel needs a won listing's
-        // phoneNumber to show the seller's contact details.
-        const { data, error } = await supabase.from('auctions').select(AUCTION_DETAIL_COLUMNS);
-        if (error) throw error;
-
-        const auctions = (data ?? []).map((row: any) => mapAuctionSummaryRow(row));
-        return jsonResponse(selectActivity(auctions, auth.user.id));
+        // The caller's OWN listings, every status including hidden, filtered in
+        // SQL on seller_id (the pre-v1 route read the whole table and filtered
+        // in JS). Own data only, so the phone number is included.
+        const listings = await fetchSellerListings(supabase, auth.user.id);
+        return jsonResponse({ listings });
       } catch (error) {
         return jsonResponse(getErrorMessageAndCode('Failed to load your activity.', 'FETCH_ACTIVITY_FAILED', error), { status: 500 });
-      }
-    }
-
-    if (request.method === 'GET' && url.pathname === '/api/notifications') {
-      if (!supabase) {
-        return jsonResponse(makeError('Supabase env vars are not configured.', 'CONFIG_ERROR'), { status: 500 });
-      }
-
-      try {
-        const auth = await requireUser(supabase, request, 'Authentication required.');
-        if (auth.response) {
-          return auth.response;
-        }
-
-        // No lazy settle here - see the comment on GET /api/auctions.
-        const { data, error } = await supabase.from('auctions').select(NOTIFICATION_COLUMNS);
-        if (error) throw error;
-
-        const auctions = (data ?? []).map((row: any) => mapAuctionRow(row));
-        return jsonResponse(buildNotifications(auctions, auth.user.id));
-      } catch (error) {
-        return jsonResponse(getErrorMessageAndCode('Failed to load notifications.', 'FETCH_NOTIFICATIONS_FAILED', error), { status: 500 });
       }
     }
 
@@ -1579,54 +1283,45 @@ export default {
   },
 
   /**
-   * Cron trigger (see `[triggers]` in wrangler.toml, which now names two
-   * schedules). `event.cron` tells the two apart so each does exactly one job:
+   * Cron trigger (see `[triggers]` in wrangler.toml, which names ONE schedule):
    *
-   *   `* * * * *`  (every minute) -> settlement, as before. Nothing else in
-   *                                  production ends an auction, so without
-   *                                  this every ended listing keeps its null
-   *                                  winner columns forever.
-   *   `0 3 * * *`  (03:00 UTC     -> the stale-image sweep, gated on
-   *    daily)                        `ENABLE_STALE_IMAGE_CLEANUP` (see
-   *                                  `wrangler.toml` and `cleanupStaleImages`
-   *                                  in `workers/shared.ts`). Cloudflare cron
-   *                                  schedules always run in UTC.
+   *   `0 3 * * *`  (03:00 UTC daily) -> the stale-image sweep, gated on
+   *                                     `ENABLE_STALE_IMAGE_CLEANUP` (see
+   *                                     `wrangler.toml` and `cleanupStaleImages`
+   *                                     in `workers/shared.ts`). Cloudflare cron
+   *                                     schedules always run in UTC.
    *
-   * Anything else falls back to settlement too, so a manually-triggered test
-   * cron (which the dashboard lets an admin fire with no `cron` field at all)
-   * still does the safe, idempotent thing rather than nothing.
+   * There is no settlement cron any more: a fixed-price listing needs no
+   * settling, and expiry is derived at read time from `expires_at`.
+   *
+   * Any other `event.cron` (a leftover `* * * * *` trigger from the pre-v1
+   * deploy, or a manual test fire with no `cron` field) does NOTHING. The only
+   * scheduled job is an irreversible delete, and it must not start running
+   * every minute because a stale trigger survived a deploy.
    */
   async scheduled(event: any, env: Record<string, any>, _ctx: any): Promise<void> {
-    const supabase = getSupabaseClient(env);
+    if (event?.cron !== STALE_IMAGE_CLEANUP_CRON) {
+      console.warn(`Scheduled event ignored: no job is registered for cron "${String(event?.cron ?? '')}".`);
+      return;
+    }
 
+    if (!isStaleImageCleanupEnabled(env)) {
+      return;
+    }
+
+    const supabase = getSupabaseClient(env);
     if (!supabase) {
       console.error('Scheduled task skipped: Supabase env vars are not configured.');
       return;
     }
 
-    if (event?.cron === STALE_IMAGE_CLEANUP_CRON) {
-      if (!isStaleImageCleanupEnabled(env)) {
-        return;
-      }
-
-      try {
-        const cleaned = await cleanupStaleImages(supabase);
-        if (cleaned > 0) {
-          console.log(`[Cleanup] Blanked images on ${cleaned} stale auction(s).`);
-        }
-      } catch (error) {
-        console.error('Scheduled stale image cleanup failed:', error);
-      }
-      return;
-    }
-
     try {
-      const settled = await settleEndedAuctions(supabase);
-      if (settled.length > 0) {
-        console.log(`[Settle] Ended ${settled.length} auction(s).`);
+      const cleaned = await cleanupStaleImages(supabase);
+      if (cleaned > 0) {
+        console.log(`[Cleanup] Blanked images on ${cleaned} stale listing(s).`);
       }
     } catch (error) {
-      console.error('Scheduled settle failed:', error);
+      console.error('Scheduled stale image cleanup failed:', error);
     }
   },
 };

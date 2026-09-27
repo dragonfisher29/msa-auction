@@ -75,25 +75,17 @@ function auctionRow(overrides: Record<string, any> = {}) {
     title: 'Vintage lamp',
     description: 'A lamp',
     phone_number: '0100000000',
-    starting_price: 100,
-    current_price: 100,
+    price: 100,
     seller_id: SELLER.id,
     seller_name: SELLER.name,
-    highest_bidder_id: null,
-    highest_bidder_name: null,
-    duration_minutes: 60,
-    start_time: NOW - 1000,
-    end_time: FUTURE,
     status: 'active',
     category: 'General',
     image_url: 'data:image/png;base64,aaa',
     image_urls: ['data:image/png;base64,aaa'],
     image_count: 1,
-    bids: [],
-    winner_id: null,
-    winner_name: null,
-    winning_bid: null,
     created_at: NOW - 1000,
+    expires_at: FUTURE,
+    sold_at: null,
     ...overrides,
   };
 }
@@ -211,9 +203,8 @@ describe('/api/admin/* access control', () => {
 /* ========================================================================== */
 
 describe('banned accounts', () => {
-  it('is refused on bidding, listing creation and the account routes, with 403 ACCOUNT_BANNED', async () => {
+  it('is refused on listing creation, the seller write routes and the account routes, with 403 ACCOUNT_BANNED', async () => {
     const routes: { method: string; path: string; body?: any }[] = [
-      { method: 'POST', path: '/api/auctions/auc_1/bids', body: { amount: 500 } },
       {
         method: 'POST',
         path: '/api/auctions',
@@ -221,20 +212,22 @@ describe('banned accounts', () => {
           title: 'Thing',
           description: 'Desc',
           phoneNumber: '0100000000',
-          startingPrice: 10,
-          durationMinutes: 60,
+          price: 10,
           imageUrls: ['data:image/png;base64,aaa'],
         },
       },
+      { method: 'PATCH', path: '/api/auctions/auc_1', body: { title: 'Renamed' } },
+      { method: 'POST', path: '/api/auctions/auc_1/sold' },
+      { method: 'DELETE', path: '/api/auctions/auc_1' },
       { method: 'GET', path: '/api/users/me/activity' },
-      { method: 'GET', path: '/api/notifications' },
       { method: 'GET', path: '/api/auth/me' },
       { method: 'POST', path: '/api/auth/email', body: { email: 'x@example.com' } },
       { method: 'POST', path: '/api/auctions/auc_1/report', body: { reason: 'scam' } },
     ];
 
     for (const route of routes) {
-      const db = seed();
+      // The banned account OWNS auc_1, so a 403 here is the ban, not an ownership check.
+      const db = seed({ auctions: [auctionRow({ seller_id: BANNED.id, seller_name: BANNED.name })] });
       const result = await callJson(route.method, route.path, { token: BANNED.token, body: route.body });
 
       expect(result.status, `${route.method} ${route.path}`).toBe(403);
@@ -243,7 +236,7 @@ describe('banned accounts', () => {
       expect(result.body.error, `${route.method} ${route.path}`).toContain('Repeated scam listings');
 
       expect(db.rows('auctions')).toHaveLength(1);
-      expect(db.rows('auctions')[0].bids).toHaveLength(0);
+      expect(db.rows('auctions')[0]).toMatchObject({ status: 'active', title: 'Vintage lamp' });
     }
   });
 
@@ -281,7 +274,7 @@ describe('banned accounts', () => {
     expect(banned.body.user).toMatchObject({ id: MEMBER.id, bannedReason: 'Abusive messages' });
     expect(db.rows('users').find((user: any) => user.id === MEMBER.id).banned_at).toBeGreaterThan(0);
 
-    const blocked = await callJson('GET', '/api/notifications', { token: MEMBER.token });
+    const blocked = await callJson('GET', '/api/users/me/activity', { token: MEMBER.token });
     expect(blocked.status).toBe(403);
     expect(blocked.body.code).toBe('ACCOUNT_BANNED');
 
@@ -292,7 +285,7 @@ describe('banned accounts', () => {
     expect(unbanned.status).toBe(200);
     expect(unbanned.body.user.bannedAt).toBeNull();
 
-    const allowed = await callJson('GET', '/api/notifications', { token: MEMBER.token });
+    const allowed = await callJson('GET', '/api/users/me/activity', { token: MEMBER.token });
     expect(allowed.status).toBe(200);
   });
 
@@ -431,7 +424,7 @@ describe('POST /api/auctions/:id/report', () => {
 describe('GET /api/admin/reports', () => {
   it('lists open reports first, each with the listing title and seller', async () => {
     seed({
-      auctions: [auctionRow(), auctionRow({ id: 'auc_2', title: 'Old bike', end_time: FUTURE - 1 })],
+      auctions: [auctionRow(), auctionRow({ id: 'auc_2', title: 'Old bike', created_at: NOW - 2000 })],
       reports: [
         {
           id: 'rep_old',
@@ -481,7 +474,7 @@ describe('GET /api/admin/reports', () => {
 
 describe('POST /api/admin/auctions/:id/hide', () => {
   it('removes the listing from the list but leaves it fetchable by id', async () => {
-    const db = seed({ auctions: [auctionRow(), auctionRow({ id: 'auc_2', end_time: FUTURE - 1000 })] });
+    const db = seed({ auctions: [auctionRow(), auctionRow({ id: 'auc_2', created_at: NOW - 2000 })] });
 
     const hidden = await callJson('POST', '/api/admin/auctions/auc_1/hide', {
       token: ADMIN.token,
@@ -516,9 +509,9 @@ describe('POST /api/admin/auctions/:id/hide', () => {
   it('keeps a hidden listing out of every page of the cursor walk', async () => {
     seed({
       auctions: [
-        auctionRow({ id: 'auc_a', end_time: FUTURE + 3 }),
-        auctionRow({ id: 'auc_b', end_time: FUTURE + 2, status: 'hidden' }),
-        auctionRow({ id: 'auc_c', end_time: FUTURE + 1 }),
+        auctionRow({ id: 'auc_a', created_at: NOW - 1 }),
+        auctionRow({ id: 'auc_b', created_at: NOW - 2, status: 'hidden' }),
+        auctionRow({ id: 'auc_c', created_at: NOW - 3 }),
       ],
     });
 
@@ -530,29 +523,20 @@ describe('POST /api/admin/auctions/:id/hide', () => {
     expect(next.body.nextCursor).toBeNull();
   });
 
-  it('never settles a hidden auction whose end_time has passed', async () => {
-    const db = seed({
-      auctions: [
-        auctionRow({
-          status: 'hidden',
-          end_time: NOW - 5000,
-          current_price: 400,
-          highest_bidder_id: MEMBER.id,
-          highest_bidder_name: MEMBER.name,
-          bids: [{ id: 'bid_1', auctionId: 'auc_1', userId: MEMBER.id, userName: MEMBER.name, amount: 400, timestamp: NOW }],
-        }),
-      ],
-    });
+  it('locks the seller out of a hidden listing: no edit, no mark-sold, no cancel', async () => {
+    for (const route of [
+      { method: 'PATCH', path: '/api/auctions/auc_1', body: { title: 'Back again' } },
+      { method: 'POST', path: '/api/auctions/auc_1/sold' },
+      { method: 'DELETE', path: '/api/auctions/auc_1' },
+    ]) {
+      const db = seed({ auctions: [auctionRow({ status: 'hidden' })] });
 
-    await worker.scheduled({ cron: '* * * * *' }, ENV, { waitUntil: () => {} });
-    await callJson('GET', '/api/auctions');
-    await callJson('GET', '/api/auctions/auc_1');
+      const result = await callJson(route.method, route.path, { token: SELLER.token, body: route.body });
 
-    const row = db.rows('auctions')[0];
-    expect(row.status).toBe('hidden');
-    expect(row.winner_id).toBeNull();
-    expect(row.winner_name).toBeNull();
-    expect(row.winning_bid).toBeNull();
+      expect(result.status, `${route.method} ${route.path}`).toBe(409);
+      expect(result.body.code).toBe('LISTING_NOT_EDITABLE');
+      expect(db.rows('auctions')[0]).toMatchObject({ status: 'hidden', title: 'Vintage lamp', sold_at: null });
+    }
   });
 
   it('closes the open reports on that listing as actioned', async () => {
