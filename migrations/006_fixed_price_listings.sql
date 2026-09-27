@@ -28,6 +28,11 @@
 --   5. Replaces any CHECK constraint on `auctions.status` with one that allows
 --      'sold' AND still allows 'ended' (the old Worker's settlement cron keeps
 --      writing 'ended' until the new Worker is deployed). 007 tightens it.
+--      Any EXISTING status CHECK is dropped in step 3b, BEFORE the backfill,
+--      because the backfill writes 'sold' and an old CHECK would refuse it.
+--      The new CHECK is added only AFTER the backfill, so a row holding some
+--      unexpected legacy status is still backfilled here and then reported
+--      by name by 007, rather than aborting this file.
 --   6. Adds the indexes the new Worker's queries use:
 --        idx_auctions_browse         (created_at desc, id desc) where status = 'active'
 --                                    -> GET /api/auctions
@@ -142,6 +147,30 @@ end
 $$;
 
 -- ---------------------------------------------------------------------------
+-- 3b. Drop any existing status CHECK - BEFORE the backfill
+-- ---------------------------------------------------------------------------
+-- 001 and 003 state that `auctions.status` has NO check constraint. This does
+-- not rely on that: any existing CHECK that mentions `status` is dropped here
+-- and replaced in step 5. It has to go BEFORE step 4, which writes 'sold' - a
+-- value an old CHECK would refuse, aborting the whole migration.
+do $$
+declare
+  constraint_row record;
+begin
+  for constraint_row in
+    select conname
+      from pg_constraint
+     where conrelid = 'public.auctions'::regclass
+       and contype = 'c'
+       and pg_get_constraintdef(oid) ilike '%status%'
+  loop
+    execute format('alter table public.auctions drop constraint %I', constraint_row.conname);
+    raise notice '006: dropped CHECK constraint % on auctions', constraint_row.conname;
+  end loop;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
 -- 4. Backfill
 -- ---------------------------------------------------------------------------
 -- "now" in epoch milliseconds, the unit every timestamp column uses.
@@ -179,26 +208,9 @@ update public.auctions
 -- ---------------------------------------------------------------------------
 -- 5. Status CHECK constraint - allow 'sold', keep 'ended' for now
 -- ---------------------------------------------------------------------------
--- 001 and 003 state that `auctions.status` has NO check constraint. This does
--- not rely on that: any existing CHECK that mentions `status` is dropped and
--- replaced, so the result is the same either way.
-do $$
-declare
-  constraint_row record;
-begin
-  for constraint_row in
-    select conname
-      from pg_constraint
-     where conrelid = 'public.auctions'::regclass
-       and contype = 'c'
-       and pg_get_constraintdef(oid) ilike '%status%'
-  loop
-    execute format('alter table public.auctions drop constraint %I', constraint_row.conname);
-    raise notice '006: dropped CHECK constraint % on auctions', constraint_row.conname;
-  end loop;
-end
-$$;
-
+-- Added AFTER the backfill on purpose: the backfill UPDATEs every row, and a
+-- row holding an unexpected legacy status must not abort this file - 007
+-- reports such a row by name before it validates the tightened CHECK.
 -- NOT VALID: enforced for every new write from now on, without scanning (or
 -- failing on) rows already in the table. 007 validates the tightened version.
 alter table public.auctions
