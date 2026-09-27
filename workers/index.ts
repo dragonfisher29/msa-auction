@@ -801,7 +801,9 @@ export default {
         // rest never leave the database. Without it (the detail gallery): all.
         const firstOnly = url.searchParams.get('first') === '1';
 
-        const { data: row, error } = await supabase
+        // Typed `any`: postgrest-js infers a row type from a literal select string and does not
+        // model the `alias:column->>N` form, so it would not know about `first_image`.
+        const { data: row, error }: { data: any; error: any } = await supabase
           .from('auctions')
           .select(firstOnly ? AUCTION_FIRST_IMAGE_COLUMNS : AUCTION_IMAGES_COLUMNS)
           .eq('id', auctionImagesMatch[1])
@@ -874,7 +876,8 @@ export default {
         // non-hidden listing is returned whatever its status; `status` (with
         // `expired` derived in mapListingRow) tells the UI Sold / Expired.
         // There is no settlement any more, so this read writes nothing.
-        const { data: row, error } = await supabase
+        // Typed `any`: the column list is a computed string, which postgrest-js cannot parse.
+        const { data: row, error }: { data: any; error: any } = await supabase
           .from('auctions')
           .select(AUCTION_DETAIL_COLUMNS)
           .eq('id', auctionId)
