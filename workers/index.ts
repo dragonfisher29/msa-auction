@@ -110,27 +110,28 @@ async function getAuthenticatedUser(supabase: any, token: string) {
   return data ?? null;
 }
 
+/**
+ * The body of every 500. The underlying error - a Postgres/PostgREST message, constraint name,
+ * column name, SQLSTATE, or a JS exception - is LOGGED here (Workers observability keeps it) and
+ * never sent to the client: those messages describe the schema and the query, which is exactly
+ * what an attacker probing for injection wants to read. The client gets the route's own generic
+ * message and a stable route-level code it can branch on.
+ */
 function getErrorMessageAndCode(fallbackMessage: string, defaultCode: string, error?: unknown): { error: string; code: string } {
-  if (typeof error === 'object' && error !== null) {
-    const errObj = error as Record<string, any>;
-    const code = String(errObj.code || defaultCode);
-    const detailMsg = errObj.message || errObj.details || errObj.error_description;
-    const baseMsg = detailMsg ? String(detailMsg) : (error instanceof Error ? error.message : fallbackMessage);
-    return {
-      error: `${baseMsg} [Code: ${code}]`,
-      code,
-    };
+  if (error !== undefined) {
+    const detail =
+      typeof error === 'object' && error !== null
+        ? {
+            message: (error as any).message,
+            code: (error as any).code,
+            details: (error as any).details,
+            hint: (error as any).hint,
+          }
+        : error;
+    console.error(`[${defaultCode}] ${fallbackMessage}`, detail);
   }
-  if (error instanceof Error) {
-    return {
-      error: `${error.message} [Code: ${defaultCode}]`,
-      code: defaultCode,
-    };
-  }
-  return {
-    error: `${fallbackMessage} [Code: ${defaultCode}]`,
-    code: defaultCode,
-  };
+
+  return makeError(fallbackMessage, defaultCode);
 }
 
 function makeError(message: string, code: string): { error: string; code: string } {
