@@ -411,6 +411,27 @@ describe('AuctionDetailModal', () => {
       expect(document.getElementById('gallery-counter')).toHaveTextContent('3 / 3');
     });
 
+    it('shows the whole photo over a blurred fill of the same image, and keeps thumbnails square-cropped', async () => {
+      renderModal(makeAuction({ imageUrls: THREE_IMAGES }), buyer);
+
+      const photo = screen.getByAltText(/image 1 of 3$/i) as HTMLImageElement;
+      expect(photo).toHaveClass('object-contain');
+      expect(photo).not.toHaveClass('object-cover');
+
+      // The fill is a sibling of the photo in the same frame: decorative, and never a second download.
+      const fill = photo.parentElement!.querySelector('img[aria-hidden="true"]') as HTMLImageElement;
+      expect(fill).not.toBeNull();
+      expect(fill.getAttribute('alt')).toBe('');
+      expect(fill).toHaveClass('object-cover', 'blur-xl');
+      expect(fill.src).toBe(photo.src);
+
+      // The fill follows the gallery when it moves on.
+      await userEvent.setup().click(document.getElementById('gallery-next-btn') as HTMLButtonElement);
+      expect(fill.src).toBe(THREE_IMAGES[1]);
+
+      expect(screen.getByAltText('Vintage Film Camera thumbnail 1')).toHaveClass('object-cover');
+    });
+
     it('renders no nav buttons, counter or thumbnails for a single-image listing', () => {
       renderModal(
         makeAuction({ imageUrls: [THREE_IMAGES[0]], imageUrl: THREE_IMAGES[0] }),

@@ -6,6 +6,7 @@ import { fetchAuctionImages } from '../lib/images';
 import { getListingStatus, LISTING_STATUS_LABEL } from '../lib/listing';
 import { PLACEHOLDER_IMAGE_URL } from '../lib/placeholder';
 import { useInViewport } from '../lib/useInViewport';
+import { ListingPhoto } from './ListingPhoto';
 
 interface AuctionCardProps {
   auction: AuctionItem;
@@ -81,13 +82,13 @@ export const AuctionCard: React.FC<AuctionCardProps> = ({
             <span className="text-[10px] font-bold uppercase tracking-wider">No photos</span>
           </div>
         ) : (
-          <img
+          <ListingPhoto
             src={primaryImageSrc}
             alt={auction.title}
-            referrerPolicy="no-referrer"
-            loading="lazy"
-            decoding="async"
-            className={`w-full h-full object-cover group-hover:scale-103 transition-transform duration-300 ${isAvailable ? '' : 'grayscale-[60%]'}`}
+            lazy
+            muted={!isAvailable}
+            className="h-full"
+            photoClassName="group-hover:scale-103 transition-transform duration-300"
           />
         )}
 

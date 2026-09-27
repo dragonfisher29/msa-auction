@@ -25,6 +25,7 @@ import { getListingStatus, LISTING_STATUS_EXPLANATION, LISTING_STATUS_LABEL } fr
 import { PLACEHOLDER_IMAGE_URL } from '../lib/placeholder';
 import { SITE_NAME } from '../lib/site';
 import { ListingActions } from './ListingActions';
+import { ListingPhoto } from './ListingPhoto';
 import { CreateListingModal } from './CreateListingModal';
 import { CancelListingModal } from './CancelListingModal';
 import { MarkSoldModal } from './MarkSoldModal';
@@ -496,15 +497,14 @@ export const AuctionDetailModal: React.FC<AuctionDetailModalProps> = ({
                   onTouchStart={handleTouchStart}
                   onTouchEnd={handleTouchEnd}
                 >
-                  <img
+                  <ListingPhoto
                     src={galleryImages[activeImageIndex] ?? galleryImages[0]}
                     alt={
                       hasMultipleImages
                         ? `${auction.title} - image ${activeImageIndex + 1} of ${galleryImages.length}`
                         : auction.title
                     }
-                    referrerPolicy="no-referrer"
-                    className="w-full h-52 sm:h-72 object-cover"
+                    className="h-52 sm:h-72"
                   />
 
                   {hasMultipleImages && (

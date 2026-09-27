@@ -170,6 +170,51 @@ describe('AuctionCard image loading', () => {
   });
 });
 
+describe('AuctionCard photo framing', () => {
+  beforeEach(() => {
+    __resetImageCacheForTests();
+    mockedApiFetch.mockReset();
+  });
+
+  function renderWithInlinePhoto(overrides: Partial<AuctionItem> = {}) {
+    const auction = makeListRowAuction({
+      imageCount: undefined,
+      imageUrls: ['https://example.test/portrait.jpg'],
+      ...overrides,
+    });
+    render(<AuctionCard auction={auction} onSelect={() => {}} />);
+    const photo = screen.getByAltText(auction.title) as HTMLImageElement;
+    const fill = photo.parentElement!.querySelector('img[aria-hidden="true"]') as HTMLImageElement;
+    return { photo, fill };
+  }
+
+  it('shows the whole photo (object-contain) over a decorative blurred fill of the same src', () => {
+    const { photo, fill } = renderWithInlinePhoto();
+
+    expect(photo).toHaveClass('object-contain', 'w-full', 'h-full');
+    expect(photo).not.toHaveClass('object-cover');
+
+    expect(fill).not.toBeNull();
+    expect(fill.getAttribute('alt')).toBe('');
+    expect(fill).toHaveClass('object-cover', 'blur-xl');
+    // Same URL on both layers, so the browser downloads and decodes it once.
+    expect(fill.src).toBe(photo.src);
+    expect(fill.getAttribute('loading')).toBe('lazy');
+    expect(fill.getAttribute('referrerpolicy')).toBe('no-referrer');
+
+    // The fill is not an image a screen reader should announce.
+    expect(screen.getAllByRole('img')).toEqual([photo]);
+    expect(photo).not.toHaveClass('grayscale-[60%]');
+  });
+
+  it('desaturates both layers for a listing that is no longer for sale', () => {
+    const { photo, fill } = renderWithInlinePhoto({ status: 'sold', soldAt: NOW });
+
+    expect(photo).toHaveClass('grayscale-[60%]');
+    expect(fill).toHaveClass('grayscale-[60%]');
+  });
+});
+
 describe('AuctionCard listing details', () => {
   beforeEach(() => {
     __resetImageCacheForTests();
